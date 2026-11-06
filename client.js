@@ -1,0 +1,2676 @@
+/**
+ * dsh-low-integrity-check 的浏览器半侧：把「文件完整性检查」注册成 DSH 右侧栏的一种标签页。
+ *
+ * 结构：
+ * - 模块包装：window.__ModuleLoader__.load({ id, factory })；factory 内只 require('react')，
+ *   用 React.createElement，不写 JSX、不 require 任何平台 UI 包。
+ * - 注册：照抄 dsh-pet 的成熟写法——软取 sidebarRightTabs 注册标签类型（服务缺失时
+ *   20 × 250ms 有界重试后 console.warn 退出，绝不抛错），正文通过
+ *   ctx.slots.inject('sidebar.right.pane.tab') 挂到对应 key 上。
+ * - 面板：解析工作区 → 扫描 → 命中清单分页 → 导出清单 → 一键清除（确认条）→
+ *   运行中 800ms 轮询 → 成功/失败结果 → 生成日志；sessionId 取 slot props，切换会话
+ *   重置并从 sessionStorage['dsh-fi:' + sessionId] 恢复任务。
+ *
+ * Host API 契约（与本文件并行实现的宿主半侧）：
+ *   GET  /health                                   → { ok, version, platform, engine, registry, warnings }
+ *   GET  /diagnostics                              → 诊断对象（本面板不展示，供阶段 0 排查）
+ *   POST /workspace { sessionId }                  → { ok, workspace, sessionCount, liveAgentCount, warnings }
+ *   POST /jobs { action: 'scan'|'repair', sessionId } → { ok, jobId }
+ *   GET  /jobs/:id                                 → { ok, job }
+ *   GET  /jobs/:id/items?offset=&limit=            → { ok, jobId, offset, limit, total, items }
+ *   POST /jobs/:id/cancel | /export | /log         → { ok } / { ok, path }
+ * 所有请求都相对于「文档挂载前缀 + ROUTE_SEGMENT」；ROUTE_SEGMENT 必须与宿主
+ * ctx.webServer.register 的 path 一致。
+ *
+ * 颜色只取 --dsw-alias-* token；样式自注入 style 标签到 document.head 并按引用计数清理。
+ */
+(function () {
+  'use strict';
+
+  //#region 常量
+
+  /** 标签实现身份；同时也是标签类型 id 与正文/标题插槽的 key。 */
+  var TAB_ID = 'dsh-low-integrity-check';
+  /** 标签类型；openTab 按它打开。 */
+  var TAB_KIND = 'low-integrity';
+  /** locale 字典命名空间。 */
+  var NS = 'file-integrity';
+  /**
+   * 宿主 HTTP 路由段。
+   *
+   * 必须与宿主半侧 ctx.webServer.register({ kind: 'prefix', path }) 的 path 完全一致
+   * （Host 已实现为 '/dsh-low-integrity-check'）；浏览器实际请求地址 =
+   * mountPrefixOf(document.baseURI) + 本值（见 routeBaseOf）。
+   */
+  var ROUTE_SEGMENT = '/dsh-low-integrity-check';
+  /** 会话级任务恢复的 sessionStorage 键前缀。 */
+  var STORAGE_PREFIX = 'dsh-fi:';
+  /** 运行中任务轮询间隔（毫秒）。 */
+  var POLL_INTERVAL_MS = 800;
+  /** 命中清单每页条数（首屏与「加载更多」一致）。 */
+  var PAGE_SIZE = 200;
+  /** 右侧栏服务缺失时的有界重试次数与间隔。 */
+  var SIDEBAR_RETRY_TRIES = 20;
+  var SIDEBAR_RETRY_DELAY_MS = 250;
+  /** 复制成功/失败提示的停留时间。 */
+  var NOTICE_MS = 2600;
+  /** 样式标签归属标记。 */
+  var STYLE_KEY = 'dsh-file-integrity-panel';
+  /** 宿主 task/failure 列表最多展示条数（再多只给计数）。 */
+  var MAX_FAILURE_ROWS = 100;
+  /** 日志前缀；所有 console 输出统一带它，便于在页面控制台里筛。 */
+  var LOG_PREFIX = '[dsh-low-integrity-check]';
+
+  /** 宿主错误码 → 本地化文案键的映射（未列出的码走 error.generic）。 */
+  var KNOWN_ERROR_CODES = {
+    'workspace-not-found': true,
+    'path-rejected': true,
+    busy: true,
+    'unsupported-platform': true,
+    'engine-sandboxed': true,
+    'job-not-found': true,
+    'invalid-request': true,
+    'engine-unavailable': true,
+    'internal-error': true,
+    'network-error': true,
+    'bad-response': true,
+    'no-session': true,
+  };
+
+  //#endregion
+
+  //#region 文案
+
+  /** 中文文案（键集真源；en 与它逐键对应）。 */
+  var ZH = {
+    'tab.title': '文件完整性检查',
+    'tab.description': '检查工作区中完整性标签为 Low 的文件与目录，并可一键清除。',
+    'header.subtitle': 'Low 完整性标签检查与清除',
+
+    'badge.readonly': '只读',
+    'badge.running': '运行中',
+
+    'workspace.label': '工作区',
+    'workspace.pathEmpty': '尚未解析到工作区路径',
+    'workspace.sessionCount': '会话 {count}',
+    'workspace.liveAgents': '活跃会话 {count}',
+    'workspace.riskLive': '有 {count} 个活跃会话：清除后这些文件可能被重新写入 Low 完整性标签。',
+    'workspace.warnings': '工作区有 {count} 条提示',
+
+    'action.resolve': '解析工作区',
+    'action.retry': '重试',
+    'action.scan': '开始扫描',
+    'action.rescan': '重新扫描',
+    'action.export': '导出清单',
+    'action.repair': '一键清除',
+    'action.cancel': '取消任务',
+    'action.cancelling': '正在取消…',
+    'action.confirm': '确认清除',
+    'action.dismiss': '取消',
+    'action.loadMore': '加载更多',
+    'action.log': '生成日志',
+    'action.logging': '正在生成日志…',
+    'action.copy': '复制',
+
+    'loading.workspace': '正在解析工作区…',
+    'loading.job': '正在恢复任务…',
+    'loading.items': '正在加载…',
+
+    'readonly.banner': '当前平台（{platform}）不支持修改完整性标签：面板处于只读模式，操作已禁用。',
+    'engine.unavailable': '完整性引擎不可用（{reason}），扫描与清除已禁用。',
+    'engine.restricted': '完整性引擎受限（当前级别 {integrity}）：无法写回 Medium 完整性标签，清除已禁用。',
+    'health.error': '无法读取宿主状态：{message}',
+    'health.version': '宿主 {version}',
+    'health.platform': '平台 {platform}',
+    'health.warnings': '宿主提示 {count} 条：{first}',
+    'health.bad': '宿主状态响应不完整（缺少平台信息）。',
+    'poll.failed': '状态刷新失败：{message}',
+    'footer.engine': '引擎 {integrity}',
+    'footer.registry': '注册表 {count}',
+
+    'intro.hint': '尚未扫描：先解析工作区，再开始扫描。',
+
+    'job.running': '正在{action}…',
+    'job.phase': '阶段：{phase}',
+    'job.scanned': '已扫描 {scanned} / {total}',
+    'job.hits': '命中 {count}',
+    'job.elapsed': '耗时 {duration}',
+    'job.waiting': '正在等待宿主报告进度…',
+    'job.cancelled': '任务已取消',
+    'job.expired': '任务已失效，请重新检查',
+
+    'action.label.scan': '扫描',
+    'action.label.repair': '清除',
+
+    'scan.result.none': '未发现 Low 完整性标签',
+    'scan.result.found': '发现 {count} 个 Low 完整性对象',
+    'scan.result.counts': '显式 {explicit} · 继承 {inherited}',
+    'scan.result.meta': '扫描 {scanned} 项 · 耗时 {duration}',
+    'scan.result.root': '根目录 {rootLabel}',
+    'scan.failed': '扫描失败',
+    'scan.startFailed': '无法启动扫描：{message}',
+
+    'hits.title': '命中清单',
+    'hits.empty': '没有命中项',
+    'hits.shown': '已显示 {shown} / {total}',
+    'hits.more': '还有 {count} 条未加载',
+    'hits.loadFailed': '清单加载失败：{message}',
+    'hits.kind.file': '文件',
+    'hits.kind.dir': '目录',
+    'hits.badge.explicit': '显式',
+    'hits.badge.inherited': '继承',
+    'hits.copyPath': '复制完整路径',
+
+    'repair.confirm.title': '确认清除这些 Low 完整性标签？',
+    'repair.confirm.count': '预计修复 {count} 项',
+    'repair.confirm.backup': '清除前会生成快照 JSON 与 restore 恢复脚本，完成后可复制路径。',
+    'repair.confirm.risk': '当前有 {count} 个 workspace-write 活跃会话；清除后这些文件可能被重新写入 Low 完整性标签。',
+    'repair.confirm.engineLimited': '引擎受限：当前进程可能无法写回 Medium 完整性标签。',
+    'repair.success': '清除成功（{count} 项）',
+    'repair.failed': '清除失败（{count} 项失败）',
+    'repair.partialFixed': '已修复 {count} 项',
+    'repair.rescan.none': '复扫未发现 Low 完整性标签',
+    'repair.rescan.found': '复扫仍发现 {count} 个 Low 完整性对象',
+    'repair.snapshot': '快照文件',
+    'repair.restore': '恢复文件',
+    'repair.pathMissing': '宿主未返回路径',
+    'repair.failures': '失败列表',
+    'repair.failuresMore': '另有 {count} 条失败未显示',
+    'repair.startFailed': '无法启动清除：{message}',
+
+    'artifact.export': '清单文件',
+    'artifact.log': '日志文件',
+    'artifact.copy': '复制路径',
+    'export.ok': '清单已导出',
+    'export.failed': '导出失败：{message}',
+    'log.ok': '日志已生成',
+    'log.failed': '生成日志失败：{message}',
+
+    'notice.copied': '已复制',
+    'notice.copyFailed': '复制失败，请手动选择文本复制',
+
+    'error.workspace-not-found': '未找到当前会话的工作区，请先打开一个工作区',
+    'error.path-rejected': '工作区路径被拒绝（可能超出允许范围）',
+    'error.busy': '已有任务正在运行，请稍后再试',
+    'error.unsupported-platform': '当前平台不支持该操作',
+    'error.engine-sandboxed': '完整性引擎在当前沙箱环境中不可用',
+    'error.engine-unavailable': '完整性引擎不可用或受限',
+    'error.job-not-found': '任务已失效，请重新检查',
+    'error.invalid-request': '请求参数无效',
+    'error.internal-error': '宿主内部错误',
+    'error.network-error': '无法连接宿主服务',
+    'error.bad-response': '宿主返回了无效响应',
+    'error.no-session': '没有可用的会话信息，无法检查工作区',
+    'error.generic': '操作失败：{message}',
+    'error.boundary': '面板渲染出错，已降级显示。',
+  };
+
+  /** 英文字典：与 ZH 逐键对应。 */
+  var EN = {
+    'tab.title': 'File integrity check',
+    'tab.description': 'Inspect files and directories whose integrity label is Low in the workspace, and clear them in one click.',
+    'header.subtitle': 'Low integrity label inspection and repair',
+
+    'badge.readonly': 'Read-only',
+    'badge.running': 'Running',
+
+    'workspace.label': 'Workspace',
+    'workspace.pathEmpty': 'Workspace path not resolved yet',
+    'workspace.sessionCount': 'Sessions {count}',
+    'workspace.liveAgents': 'Live sessions {count}',
+    'workspace.riskLive': '{count} live sessions: files may be rewritten with the Low label after cleanup.',
+    'workspace.warnings': 'Workspace has {count} warnings',
+
+    'action.resolve': 'Resolve workspace',
+    'action.retry': 'Retry',
+    'action.scan': 'Start scan',
+    'action.rescan': 'Rescan',
+    'action.export': 'Export list',
+    'action.repair': 'Clear all',
+    'action.cancel': 'Cancel job',
+    'action.cancelling': 'Cancelling…',
+    'action.confirm': 'Confirm clear',
+    'action.dismiss': 'Cancel',
+    'action.loadMore': 'Load more',
+    'action.log': 'Generate log',
+    'action.logging': 'Generating log…',
+    'action.copy': 'Copy',
+
+    'loading.workspace': 'Resolving workspace…',
+    'loading.job': 'Restoring job…',
+    'loading.items': 'Loading…',
+
+    'readonly.banner': 'This platform ({platform}) cannot modify integrity labels: the panel is read-only and actions are disabled.',
+    'engine.unavailable': 'Integrity engine unavailable ({reason}); scan and clear are disabled.',
+    'engine.restricted': 'Integrity engine restricted (current level {integrity}): cannot write the Medium label back; clear is disabled.',
+    'health.error': 'Cannot read host status: {message}',
+    'health.version': 'Host {version}',
+    'health.platform': 'Platform {platform}',
+    'health.warnings': 'Host warnings ({count}): {first}',
+    'health.bad': 'Host status response is incomplete (missing platform).',
+    'poll.failed': 'Status refresh failed: {message}',
+    'footer.engine': 'Engine {integrity}',
+    'footer.registry': 'Registry {count}',
+
+    'intro.hint': 'Not scanned yet: resolve the workspace, then start a scan.',
+
+    'job.running': '{action} in progress…',
+    'job.phase': 'Phase: {phase}',
+    'job.scanned': 'Scanned {scanned} / {total}',
+    'job.hits': 'Hits {count}',
+    'job.elapsed': 'Elapsed {duration}',
+    'job.waiting': 'Waiting for host progress…',
+    'job.cancelled': 'Job cancelled',
+    'job.expired': 'Job expired, please check again',
+
+    'action.label.scan': 'Scan',
+    'action.label.repair': 'Clear',
+
+    'scan.result.none': 'No Low integrity labels found',
+    'scan.result.found': 'Found {count} Low integrity objects',
+    'scan.result.counts': 'Explicit {explicit} · Inherited {inherited}',
+    'scan.result.meta': 'Scanned {scanned} items · {duration}',
+    'scan.result.root': 'Root {rootLabel}',
+    'scan.failed': 'Scan failed',
+    'scan.startFailed': 'Cannot start scan: {message}',
+
+    'hits.title': 'Hit list',
+    'hits.empty': 'No hits',
+    'hits.shown': 'Showing {shown} / {total}',
+    'hits.more': '{count} more not loaded',
+    'hits.loadFailed': 'Cannot load list: {message}',
+    'hits.kind.file': 'File',
+    'hits.kind.dir': 'Directory',
+    'hits.badge.explicit': 'Explicit',
+    'hits.badge.inherited': 'Inherited',
+    'hits.copyPath': 'Copy full path',
+
+    'repair.confirm.title': 'Clear these Low integrity labels?',
+    'repair.confirm.count': 'Expected to repair {count} items',
+    'repair.confirm.backup': 'A snapshot JSON and a restore script are written before clearing; copy their paths afterwards.',
+    'repair.confirm.risk': '{count} workspace-write live sessions may rewrite these files with the Low label after cleanup.',
+    'repair.confirm.engineLimited': 'Engine restricted: this process may be unable to write the Medium integrity label back.',
+    'repair.success': 'Cleared successfully ({count} items)',
+    'repair.failed': 'Clear failed ({count} items failed)',
+    'repair.partialFixed': 'Repaired {count} items',
+    'repair.rescan.none': 'Rescan found no Low integrity labels',
+    'repair.rescan.found': 'Rescan still finds {count} Low integrity objects',
+    'repair.snapshot': 'Snapshot file',
+    'repair.restore': 'Restore file',
+    'repair.pathMissing': 'Host did not report a path',
+    'repair.failures': 'Failures',
+    'repair.failuresMore': '{count} more failures not shown',
+    'repair.startFailed': 'Cannot start clear: {message}',
+
+    'artifact.export': 'List file',
+    'artifact.log': 'Log file',
+    'artifact.copy': 'Copy path',
+    'export.ok': 'List exported',
+    'export.failed': 'Export failed: {message}',
+    'log.ok': 'Log generated',
+    'log.failed': 'Cannot generate log: {message}',
+
+    'notice.copied': 'Copied',
+    'notice.copyFailed': 'Copy failed; select the text and copy manually',
+
+    'error.workspace-not-found': 'No workspace found for this session; open a workspace first',
+    'error.path-rejected': 'Workspace path rejected (possibly out of the allowed range)',
+    'error.busy': 'Another job is running; try again later',
+    'error.unsupported-platform': 'This operation is not supported on the current platform',
+    'error.engine-sandboxed': 'The integrity engine is unavailable in the current sandbox',
+    'error.engine-unavailable': 'The integrity engine is unavailable or restricted',
+    'error.job-not-found': 'Job expired, please check again',
+    'error.invalid-request': 'Invalid request parameters',
+    'error.internal-error': 'Host internal error',
+    'error.network-error': 'Cannot reach the host service',
+    'error.bad-response': 'The host returned an invalid response',
+    'error.no-session': 'No session information; cannot inspect the workspace',
+    'error.generic': 'Operation failed: {message}',
+    'error.boundary': 'The panel crashed and was degraded.',
+  };
+
+  /** 整包交给 ctx.locale.register；宿主按当前语言取，缺失回退 en。 */
+  var DICTS = { zh: ZH, en: EN };
+
+  //#endregion
+
+  //#region 样式（只写结构与 token，不写字面色值）
+
+  /** 面板样式：选择器前缀 fi-，避免与 DSH 或其它插件撞名。 */
+  var PANEL_CSS = [
+    '.fi-panel{display:flex;flex-direction:column;gap:10px;height:100%;min-height:0;padding:12px;overflow-y:auto;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14);}',
+    '.fi-fatal-holder{display:contents;}',
+    '.fi-fatal{display:flex;flex-direction:column;gap:10px;align-items:flex-start;justify-content:center;height:100%;}',
+    '.fi-fatal-title{color:var(--dsw-alias-state-error-primary);font:var(--dsw-font-s-14);}',
+    '.fi-head{display:flex;align-items:flex-start;gap:8px;flex:0 0 auto;}',
+    '.fi-head-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:2px;}',
+    '.fi-title{font:var(--dsw-font-s-strong-14);color:var(--dsw-alias-label-primary);}',
+    '.fi-sub{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);}',
+    '.fi-card{display:flex;flex-direction:column;gap:6px;flex:0 0 auto;padding:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-module-platform);}',
+    '.fi-card-danger{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-interactive-bg-hover-danger);}',
+    '.fi-label{color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-strong-12);}',
+    '.fi-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}',
+    '.fi-col{display:flex;flex-direction:column;gap:2px;min-width:0;}',
+    '.fi-spacer{flex:1 1 auto;}',
+    '.fi-path{display:block;min-width:0;word-break:break-all;white-space:pre-wrap;color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12);font-family:var(--dsw-font-markdown-code-font-family,monospace);}',
+    '.fi-muted{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);}',
+    '.fi-warn-text{color:var(--dsw-alias-state-warn-label);font:var(--dsw-font-xxs-12);}',
+    '.fi-error-text{color:var(--dsw-alias-state-error-primary);font:var(--dsw-font-xxs-12);}',
+    '.fi-success-text{color:var(--dsw-alias-state-success-primary);font:var(--dsw-font-xxs-12);}',
+    '.fi-btn{flex:0 0 auto;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);padding:5px 10px;font:var(--dsw-font-xxs-12);cursor:pointer;}',
+    '.fi-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);}',
+    '.fi-btn:disabled{opacity:.45;cursor:default;}',
+    '.fi-btn-small{padding:2px 7px;font:var(--dsw-font-xxxs-11);}',
+    '.fi-btn-primary{border:none;background:var(--dsw-alias-button-info-fill);color:var(--dsw-alias-label-primary-foreground);}',
+    '.fi-btn-primary:hover:not(:disabled){background:var(--dsw-alias-button-info-hover);}',
+    '.fi-btn-danger{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);}',
+    '.fi-btn-danger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger);}',
+    '.fi-badges{display:flex;align-items:center;gap:4px;flex-wrap:wrap;flex:0 0 auto;}',
+    '.fi-badge{flex:0 0 auto;border-radius:var(--dsw-radius-xs);padding:0 6px;background:var(--dsw-alias-bg-multi-select);color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxxs-11);}',
+    '.fi-badge-warn{background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-label);}',
+    '.fi-badge-error{background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);}',
+    '.fi-badge-success{background:var(--dsw-alias-state-success-tertiary);color:var(--dsw-alias-state-success-primary);}',
+    '.fi-banners{display:flex;flex-direction:column;gap:6px;flex:0 0 auto;}',
+    '.fi-banner{border-radius:var(--dsw-radius-md);padding:8px 10px;font:var(--dsw-font-xxs-12);}',
+    '.fi-banner-title{font:var(--dsw-font-xxs-strong-12);}',
+    '.fi-banner-text{margin-top:2px;word-break:break-word;}',
+    '.fi-banner-info{background:var(--dsw-alias-bg-multi-select);color:var(--dsw-alias-label-secondary);}',
+    '.fi-banner-warn{background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-label);}',
+    '.fi-banner-error{background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);}',
+    '.fi-banner-success{background:var(--dsw-alias-state-success-tertiary);color:var(--dsw-alias-state-success-primary);}',
+    '.fi-progress-track{height:6px;border-radius:999px;background:var(--dsw-alias-bg-skeleton);overflow:hidden;flex:0 0 auto;}',
+    '.fi-progress-fill{height:100%;border-radius:inherit;background:var(--dsw-alias-state-business-primary);transition:width .2s linear;}',
+    '.fi-kv{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);}',
+    '.fi-kv-value{color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-strong-12);}',
+    '.fi-hits{display:flex;flex-direction:column;gap:2px;flex:0 0 auto;max-height:45vh;overflow-y:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);padding:6px;}',
+    '.fi-hit{display:flex;align-items:flex-start;gap:6px;padding:4px 6px;border-radius:var(--dsw-radius-sm);}',
+    '.fi-hit:hover{background:var(--dsw-alias-interactive-bg-hover);}',
+    '.fi-hit-path{flex:1 1 auto;min-width:0;word-break:break-all;color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12);font-family:var(--dsw-font-markdown-code-font-family,monospace);}',
+    '.fi-list{display:flex;flex-direction:column;gap:4px;flex:0 0 auto;max-height:30vh;overflow-y:auto;}',
+    '.fi-failure{display:flex;flex-direction:column;gap:1px;padding:4px 6px;border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-interactive-bg-hover-danger);}',
+    '.fi-footer{display:flex;flex-direction:column;gap:2px;flex:0 0 auto;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2);}',
+  ].join('\n');
+
+  /** 当前挂载数：多个面板可能同时挂载，靠引用计数决定何时移除 style 标签。 */
+  var mountedCss = 0;
+  /** 已注入的 style 元素（第一个挂载时创建）。 */
+  var styleTag = null;
+
+  /**
+   * 注入面板样式（幂等，按引用计数释放）。
+   *
+   * @returns 释放函数：最后一次释放时才移除 style 标签；重复调用安全。
+   */
+  function injectPanelCss() {
+    if (typeof document === 'undefined' || !document.head) return function () {};
+    mountedCss += 1;
+    if (styleTag === null) {
+      var tag = document.createElement('style');
+      tag.setAttribute('data-dsh-fi-css', STYLE_KEY);
+      tag.textContent = PANEL_CSS;
+      document.head.appendChild(tag);
+      styleTag = tag;
+    }
+    var released = false;
+    return function () {
+      if (released) return;
+      released = true;
+      mountedCss -= 1;
+      if (mountedCss <= 0 && styleTag !== null) {
+        styleTag.remove();
+        styleTag = null;
+        mountedCss = 0;
+      }
+    };
+  }
+
+  //#endregion
+
+  //#region 地址与请求
+
+  /**
+   * 从文档基准地址取出挂载前缀（baseURI 的目录部分）。
+   *
+   * dsh 返回 index 时会在页面里注入一个指向 `./` 的 base 标签，baseURI 因此正是
+   * 「宿主提供 UI 的那个目录」，也是浏览器解析相对请求的基准；反代/应用网关把 UI
+   * 挂在子路径下时，缺的就是这一段前缀。
+   *
+   * @param baseURI - 文档基准地址；缺省或非 http(s) 时按无前缀处理。
+   * @returns 去掉尾部斜杠的目录部分；空串、非法地址一律 ''，且不抛异常。
+   */
+  function mountPrefixOf(baseURI) {
+    if (baseURI === undefined || baseURI === '') return '';
+    try {
+      var url = new URL(baseURI);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+      return url.pathname.replace(/\/+$/, '');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /**
+   * 浏览器侧 API 公共前缀：挂载前缀 + 宿主路由段。
+   *
+   * @param baseURI - 文档基准地址。
+   * @returns 形如 `/app/x/dsh-file-integrity-check` 的前缀。
+   */
+  function routeBaseOf(baseURI) {
+    return mountPrefixOf(baseURI) + ROUTE_SEGMENT;
+  }
+
+  /** 本页 API 前缀；document 缺失（非浏览器环境）时退化为纯路由段。 */
+  var API_BASE = routeBaseOf(typeof document === 'undefined' ? undefined : document.baseURI);
+
+  /**
+   * 取错误对象里的可读消息（任何值都不许抛）。
+   *
+   * @param error - 任意错误值。
+   * @returns 消息字符串。
+   */
+  function errorMessageOf(error) {
+    if (error === null || error === undefined) return '';
+    if (typeof error === 'string') return error;
+    if (typeof error.message === 'string' && error.message !== '') return error.message;
+    try {
+      return String(error);
+    } catch (ignored) {
+      return '';
+    }
+  }
+
+  /**
+   * 发一次 JSON 请求；所有失败（网络、非 2xx、坏 JSON、{ok:false}）都收成统一结果，不抛。
+   *
+   * @param options - { path, method, body, signal }。
+   * @returns Promise<{ ok, status, data?, code?, message?, aborted? }>。
+   */
+  function requestJson(options) {
+    var path = options && typeof options.path === 'string' ? options.path : '';
+    var method = options && typeof options.method === 'string' ? options.method : 'GET';
+    var body = options ? options.body : undefined;
+    var signal = options ? options.signal : undefined;
+    var url = API_BASE + path;
+    var init = { method: method, cache: 'no-store', headers: { accept: 'application/json' } };
+    if (signal !== undefined) init.signal = signal;
+    if (body !== undefined) {
+      init.headers['content-type'] = 'application/json';
+      try {
+        init.body = JSON.stringify(body);
+      } catch (error) {
+        return Promise.resolve(failedResult('bad-response', errorMessageOf(error), 0));
+      }
+    }
+    var request;
+    try {
+      request = fetch(url, init);
+    } catch (error) {
+      return Promise.resolve(failedResult('network-error', errorMessageOf(error), 0));
+    }
+    return request
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var data = null;
+          if (text !== '') {
+            try {
+              data = JSON.parse(text);
+            } catch (error) {
+              data = null;
+            }
+          }
+          if (!response.ok) {
+            if (data && typeof data === 'object' && data.ok === false) {
+              return failedResult(
+                typeof data.code === 'string' ? data.code : 'internal-error',
+                typeof data.message === 'string' ? data.message : '',
+                response.status,
+              );
+            }
+            return failedResult(response.status === 404 ? 'job-not-found' : 'internal-error', '', response.status);
+          }
+          if (data === null || typeof data !== 'object') {
+            return failedResult('bad-response', '', response.status);
+          }
+          if (data.ok === false) {
+            return failedResult(
+              typeof data.code === 'string' ? data.code : 'internal-error',
+              typeof data.message === 'string' ? data.message : '',
+              response.status,
+            );
+          }
+          return { ok: true, status: response.status, data: data };
+        });
+      })
+      .catch(function (error) {
+        if (error && error.name === 'AbortError') {
+          return { ok: false, status: 0, code: 'aborted', message: '', aborted: true };
+        }
+        return failedResult('network-error', errorMessageOf(error), 0);
+      });
+  }
+
+  /**
+   * 造一个失败结果对象。
+   *
+   * @param code - 错误码。
+   * @param message - 原始消息。
+   * @param status - HTTP 状态码（0 表示没发出去）。
+   * @returns 失败结果。
+   */
+  function failedResult(code, message, status) {
+    return {
+      ok: false,
+      status: typeof status === 'number' ? status : 0,
+      code: typeof code === 'string' && code !== '' ? code : 'internal-error',
+      message: typeof message === 'string' ? message : '',
+    };
+  }
+
+  //#endregion
+
+  //#region 数据整形（宿主响应可能缺字段；坏一条不许拖垮整块）
+
+  /**
+   * 安全取字符串。
+   *
+   * @param value - 任意值。
+   * @returns 字符串；非字符串一律 ''。
+   */
+  function asString(value) {
+    return typeof value === 'string' ? value : '';
+  }
+
+  /**
+   * 安全取数字。
+   *
+   * @param value - 任意值。
+   * @returns 有限数字；否则 0。
+   */
+  function asNumber(value) {
+    return typeof value === 'number' && isFinite(value) ? value : 0;
+  }
+
+  /**
+   * 安全取字符串数组（顺手去空、限长）。
+   *
+   * @param value - 任意值。
+   * @returns 字符串数组。
+   */
+  function asStringArray(value) {
+    if (!Array.isArray(value)) return [];
+    var out = [];
+    for (var i = 0; i < value.length && out.length < 20; i++) {
+      if (typeof value[i] === 'string' && value[i] !== '') out.push(value[i]);
+    }
+    return out;
+  }
+
+  /**
+   * 时间字段 → 毫秒时间戳（宿主可能给 number，也可能给 ISO 字符串）。
+   *
+   * @param value - 任意值。
+   * @returns 毫秒时间戳；无法识别时 0。
+   */
+  function toTime(value) {
+    if (typeof value === 'number' && isFinite(value)) return value;
+    if (typeof value === 'string' && value !== '') {
+      var parsed = Date.parse(value);
+      return isFinite(parsed) ? parsed : 0;
+    }
+    return 0;
+  }
+
+  /**
+   * 毫秒 → 人类可读耗时。
+   *
+   * @param ms - 毫秒数。
+   * @returns 形如 `320 ms` / `1.4 s` / `2 m 5 s`。
+   */
+  function formatDuration(ms) {
+    var value = typeof ms === 'number' && isFinite(ms) && ms > 0 ? ms : 0;
+    if (value < 1000) return Math.round(value) + ' ms';
+    var seconds = value / 1000;
+    if (seconds < 60) return seconds.toFixed(1) + ' s';
+    var minutes = Math.floor(seconds / 60);
+    var rest = Math.round(seconds % 60);
+    return minutes + ' m ' + rest + ' s';
+  }
+
+  /**
+   * 归一化一条命中项。
+   *
+   * @param raw - 宿主返回的 item。
+   * @returns { path, relativePath, kind, explicit, label } 或 null（不可用）。
+   */
+  function normalizeItem(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    var path = asString(raw.path);
+    var relativePath = asString(raw.relativePath);
+    if (path === '' && relativePath === '') return null;
+    return {
+      path: path !== '' ? path : relativePath,
+      relativePath: relativePath !== '' ? relativePath : path,
+      kind: raw.kind === 'dir' ? 'dir' : 'file',
+      explicit: raw.explicit === true,
+      label: asString(raw.label) !== '' ? asString(raw.label) : 'Low',
+    };
+  }
+
+  /**
+   * 归一化一组命中项；坏条目直接丢弃。
+   *
+   * @param raw - 任意值。
+   * @returns 命中项数组（最多 PAGE_SIZE 条）。
+   */
+  function normalizeItems(raw) {
+    if (!Array.isArray(raw)) return [];
+    var out = [];
+    for (var i = 0; i < raw.length && out.length < PAGE_SIZE; i++) {
+      var item = normalizeItem(raw[i]);
+      if (item !== null) out.push(item);
+    }
+    return out;
+  }
+
+  /**
+   * 按 path+kind 合并两批命中项（保留先出现的顺序、去重）。
+   *
+   * @param existing - 已加载的条目。
+   * @param incoming - 新一批条目。
+   * @returns 合并后的条目。
+   */
+  function mergeItems(existing, incoming) {
+    var seen = {};
+    var out = [];
+    var add = function (item) {
+      if (!item || typeof item !== 'object') return;
+      var key = asString(item.path) + '|' + (item.kind === 'dir' ? 'dir' : 'file');
+      if (seen[key] === true) return;
+      seen[key] = true;
+      out.push(item);
+    };
+    var a = Array.isArray(existing) ? existing : [];
+    var b = Array.isArray(incoming) ? incoming : [];
+    for (var i = 0; i < a.length; i++) add(a[i]);
+    for (var j = 0; j < b.length; j++) add(b[j]);
+    return out;
+  }
+
+  /**
+   * 归一化失败项列表。
+   *
+   * @param raw - 任意值。
+   * @returns { path, message } 数组。
+   */
+  function normalizeErrors(raw) {
+    if (!Array.isArray(raw)) return [];
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var entry = raw[i];
+      if (entry === null || entry === undefined) continue;
+      if (typeof entry === 'string') {
+        out.push({ path: '', message: entry });
+        continue;
+      }
+      if (typeof entry !== 'object') continue;
+      out.push({ path: asString(entry.path), message: asString(entry.message) });
+    }
+    return out;
+  }
+
+  /**
+   * 归一化 health 响应。
+   *
+   * @param data - 响应 JSON。
+   * @returns 稳定的 health 形状（字段缺失用安全默认值）。
+   */
+  function normalizeHealth(data) {
+    var raw = data !== null && typeof data === 'object' ? data : {};
+    var engine = raw.engine !== null && typeof raw.engine === 'object' ? raw.engine : null;
+    var registry = raw.registry !== null && typeof raw.registry === 'object' ? raw.registry : null;
+    return {
+      version: asString(raw.version),
+      platform: asString(raw.platform),
+      engine:
+        engine === null
+          ? null
+          : {
+              integrity: asString(engine.integrity),
+              available: engine.available !== false,
+              reason: asString(engine.reason),
+              // canWriteLabel 是 Host 的可选提示；缺省视为「可写」（false 才表示引擎受限）。
+              canWriteLabel: engine.canWriteLabel !== false,
+            },
+      registry:
+        registry === null
+          ? null
+          : { available: registry.available !== false, count: asNumber(registry.count) },
+      warnings: asStringArray(raw.warnings),
+    };
+  }
+
+  /**
+   * 归一化 workspace 响应里的 workspace 字段。
+   *
+   * @param raw - 任意值。
+   * @returns { id, path, title } 或 null。
+   */
+  function normalizeWorkspace(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    var path = asString(raw.path);
+    if (path === '') return null;
+    return { id: asString(raw.id), path: path, title: asString(raw.title) };
+  }
+
+  /**
+   * 归一化 workspace 响应里的附加信息。
+   *
+   * @param data - 响应 JSON。
+   * @returns { sessionCount, liveAgentCount, warnings } 或 null。
+   */
+  function normalizeWorkspaceMeta(data) {
+    if (data === null || typeof data !== 'object') return null;
+    return {
+      sessionCount: asNumber(data.sessionCount),
+      liveAgentCount: asNumber(data.liveAgentCount),
+      warnings: asStringArray(data.warnings),
+    };
+  }
+
+  /**
+   * 归一化 job 对象；缺 id 视为不可用。
+   *
+   * @param raw - 响应 JSON 里的 job。
+   * @returns 稳定的 job 形状或 null。
+   */
+  function normalizeJob(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    var id = asString(raw.id);
+    if (id === '') return null;
+    var status = asString(raw.status);
+    if (status !== 'running' && status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') {
+      status = 'failed';
+    }
+    var action = raw.action === 'repair' ? 'repair' : 'scan';
+    return {
+      id: id,
+      action: action,
+      status: status,
+      phase: asString(raw.phase),
+      scanned: asNumber(raw.scanned),
+      total: asNumber(raw.total),
+      hits: asNumber(raw.hits),
+      explicitCount: asNumber(raw.explicitCount),
+      inheritedCount: asNumber(raw.inheritedCount),
+      rootLabel: asString(raw.rootLabel),
+      fixed: asNumber(raw.fixed),
+      failedCount: asNumber(raw.failedCount),
+      errorCount: asNumber(raw.errorCount),
+      // 宿主当前 snapshot 未暴露复扫剩余数（只有引擎 result 内部用）；缺省用 -1 标记，
+      // 面板用 hits - fixed - failedCount 兜底估算（见 remainingHitsOf）。
+      remainingCount: typeof raw.remainingCount === 'number' && isFinite(raw.remainingCount) ? raw.remainingCount : -1,
+      errors: normalizeErrors(raw.errors),
+      items: normalizeItems(raw.items),
+      truncated: raw.truncated === true,
+      snapshotPath: asString(raw.snapshotPath),
+      restorePath: asString(raw.restorePath),
+      startedAt: toTime(raw.startedAt),
+      finishedAt: toTime(raw.finishedAt),
+      message: asString(raw.message),
+    };
+  }
+
+  /**
+   * 清除后的复扫剩余命中数：优先宿主给的 remainingCount，缺省用
+   * hits - fixed - failedCount 估算（宿主 snapshot 目前未暴露 remainingCount）。
+   *
+   * @param job - 归一化后的 repair job。
+   * @returns 非负的剩余命中数。
+   */
+  function remainingHitsOf(job) {
+    if (job === null || typeof job !== 'object') return 0;
+    if (typeof job.remainingCount === 'number' && job.remainingCount >= 0) return job.remainingCount;
+    return Math.max(0, job.hits - job.fixed - job.failedCount);
+  }
+
+  /**
+   * 造一个刚提交、尚未取到真实状态的 running job（让轮询立刻有目标）。
+   *
+   * @param action - 'scan' | 'repair'。
+   * @param id - 宿主返回的 jobId。
+   * @returns 稳定的 job 形状。
+   */
+  function provisionalJob(action, id) {
+    return {
+      id: id,
+      action: action,
+      status: 'running',
+      phase: '',
+      scanned: 0,
+      total: 0,
+      hits: 0,
+      explicitCount: 0,
+      inheritedCount: 0,
+      rootLabel: '',
+      fixed: 0,
+      failedCount: 0,
+      errorCount: 0,
+      remainingCount: -1,
+      errors: [],
+      items: [],
+      truncated: false,
+      snapshotPath: '',
+      restorePath: '',
+      startedAt: Date.now(),
+      finishedAt: 0,
+      message: '',
+    };
+  }
+
+  /**
+   * 把一次 job 状态换算成面板状态的补丁（保持「扫描结果」与「当前任务」两份视角）。
+   *
+   * @param prev - 之前的面板状态。
+   * @param job - 归一化后的 job。
+   * @returns 状态补丁。
+   */
+  function jobPatch(prev, job) {
+    var patch = { job: job, jobId: job.id, jobLoading: false, now: Date.now() };
+    if (job.action === 'scan') {
+      if (job.status === 'running') {
+        if (prev.itemsJobId !== job.id) {
+          patch.items = normalizeItems(job.items);
+          patch.itemsTotal = job.hits;
+          patch.itemsJobId = job.id;
+          patch.itemsLoaded = true;
+          patch.itemsError = null;
+        } else {
+          patch.itemsTotal = job.hits;
+        }
+      } else {
+        patch.scanJob = job;
+        patch.items = mergeItems(prev.itemsJobId === job.id ? prev.items : [], job.items);
+        patch.itemsTotal = job.hits;
+        patch.itemsJobId = job.id;
+        patch.itemsLoaded = true;
+        patch.itemsError = null;
+      }
+    } else if (job.action === 'repair' && job.status !== 'running') {
+      if (job.status === 'succeeded') {
+        // 清除成功后 job.hits 是修复前的命中数，不能当复扫结果，也不该再显示旧命中清单。
+        patch.scanJob = null;
+        patch.items = [];
+        patch.itemsTotal = 0;
+        patch.itemsJobId = job.id;
+        patch.itemsLoaded = true;
+        patch.itemsError = null;
+      } else if (prev.itemsTotal === 0 && prev.items.length === 0) {
+        // 失败/取消且本地没有扫描清单时（例如从 sessionStorage 恢复），用任务自带的命中项兜底。
+        patch.items = normalizeItems(job.items);
+        patch.itemsTotal = job.hits;
+        patch.itemsJobId = job.id;
+        patch.itemsLoaded = true;
+        patch.itemsError = null;
+      }
+    }
+    return patch;
+  }
+
+  //#endregion
+
+  //#region 剪贴板与 sessionStorage
+
+  /**
+   * 复制文本：优先 navigator.clipboard，失败退化为 textarea + execCommand。
+   *
+   * @param text - 要复制的文本。
+   * @returns Promise 结果（boolean）：是否成功。
+   */
+  function copyToClipboard(text) {
+    return new Promise(function (resolve) {
+      if (typeof text !== 'string' || text === '') {
+        resolve(false);
+        return;
+      }
+      var nav = typeof navigator === 'undefined' ? null : navigator;
+      if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+        var pending;
+        try {
+          pending = nav.clipboard.writeText(text);
+        } catch (error) {
+          resolve(fallbackCopy(text));
+          return;
+        }
+        if (pending && typeof pending.then === 'function') {
+          pending.then(
+            function () {
+              resolve(true);
+            },
+            function () {
+              resolve(fallbackCopy(text));
+            },
+          );
+        } else {
+          resolve(true);
+        }
+        return;
+      }
+      resolve(fallbackCopy(text));
+    });
+  }
+
+  /**
+   * 剪贴板 API 缺失/被拒时的兜底复制。
+   *
+   * @param text - 要复制的文本。
+   * @returns 是否成功。
+   */
+  function fallbackCopy(text) {
+    if (typeof document === 'undefined' || !document.body) return false;
+    try {
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', 'readonly');
+      area.style.position = 'fixed';
+      area.style.top = '0';
+      area.style.left = '0';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      var ok = typeof document.execCommand === 'function' ? document.execCommand('copy') : false;
+      document.body.removeChild(area);
+      return ok === true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * 取 sessionStorage；不可用时返回 null（隐私模式/被策略禁用）。
+   *
+   * @returns Storage 或 null。
+   */
+  function storageOf() {
+    try {
+      if (typeof window === 'undefined' || !window.sessionStorage) return null;
+      return window.sessionStorage;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * 读某会话记住的 jobId。
+   *
+   * @param sessionId - 会话 id。
+   * @returns jobId；没有/读不到时 ''。
+   */
+  function readStoredJob(sessionId) {
+    var storage = storageOf();
+    if (storage === null || sessionId === '') return '';
+    try {
+      var value = storage.getItem(STORAGE_PREFIX + String(sessionId));
+      return typeof value === 'string' ? value : '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /**
+   * 写/清某会话记住的 jobId。
+   *
+   * @param sessionId - 会话 id。
+   * @param jobId - 要记住的 jobId；空串表示清除。
+   */
+  function writeStoredJob(sessionId, jobId) {
+    var storage = storageOf();
+    if (storage === null || sessionId === '') return;
+    try {
+      var key = STORAGE_PREFIX + String(sessionId);
+      if (typeof jobId === 'string' && jobId !== '') storage.setItem(key, jobId);
+      else storage.removeItem(key);
+    } catch (error) {
+      /* sessionStorage 写满/被禁用：任务恢复降级为不恢复，不影响面板本身 */
+    }
+  }
+
+  /**
+   * 清掉某会话记住的 jobId。
+   *
+   * @param sessionId - 会话 id。
+   */
+  function removeStoredJob(sessionId) {
+    writeStoredJob(sessionId, '');
+  }
+
+  /**
+   * 从 slot props 取 sessionId（防御旧/新版本 props 形状差异）。
+   *
+   * @param props - 插槽组件 props。
+   * @returns 会话 id；取不到时 ''。
+   */
+  function readSessionId(props) {
+    if (props === null || typeof props !== 'object') return '';
+    if (typeof props.sessionId === 'string' && props.sessionId !== '') return props.sessionId;
+    if (typeof props.session === 'string' && props.session !== '') return props.session;
+    if (props.session !== null && typeof props.session === 'object') {
+      if (typeof props.session.id === 'string' && props.session.id !== '') return props.session.id;
+    }
+    if (props.tab !== null && typeof props.tab === 'object') {
+      if (typeof props.tab.sessionId === 'string' && props.tab.sessionId !== '') return props.tab.sessionId;
+    }
+    return '';
+  }
+
+  //#endregion
+
+  //#region 纯渲染辅助
+
+  /**
+   * 造一个按钮。
+   *
+   * @param h - React.createElement。
+   * @param options - { label, onClick, variant?, small?, disabled?, title?, key? }。
+   * @returns 按钮元素。
+   */
+  function actionButton(h, options) {
+    var className = 'fi-btn';
+    if (options.variant === 'primary') className += ' fi-btn-primary';
+    else if (options.variant === 'danger') className += ' fi-btn-danger';
+    if (options.small === true) className += ' fi-btn-small';
+    var props = {
+      type: 'button',
+      className: className,
+      disabled: options.disabled === true,
+      onClick: options.onClick,
+    };
+    if (typeof options.title === 'string' && options.title !== '') props.title = options.title;
+    if (typeof options.key === 'string') props.key = options.key;
+    return h('button', props, options.label);
+  }
+
+  /**
+   * 造一个提示条。
+   *
+   * @param h - React.createElement。
+   * @param options - { tone: 'info'|'warn'|'error'|'success', title?, text?, key? }。
+   * @returns 提示条元素。
+   */
+  function banner(h, options) {
+    var className = 'fi-banner fi-banner-info';
+    if (options.tone === 'warn') className = 'fi-banner fi-banner-warn';
+    else if (options.tone === 'error') className = 'fi-banner fi-banner-error';
+    else if (options.tone === 'success') className = 'fi-banner fi-banner-success';
+    var children = [];
+    if (typeof options.title === 'string' && options.title !== '') {
+      children.push(h('div', { className: 'fi-banner-title', key: 'title' }, options.title));
+    }
+    if (typeof options.text === 'string' && options.text !== '') {
+      children.push(h('div', { className: 'fi-banner-text', key: 'text' }, options.text));
+    }
+    return h('div', { className: className, key: typeof options.key === 'string' ? options.key : undefined }, children);
+  }
+
+  /**
+   * 把错误对象翻成一句本地化文案（坏值一律兜底）。
+   *
+   * @param t - locale 绑定函数。
+   * @param error - { code, message } 或任意值。
+   * @returns 可展示文案。
+   */
+  function describeError(t, error) {
+    if (error === null || error === undefined) return '';
+    var code = '';
+    var message = '';
+    if (typeof error === 'string') {
+      message = error;
+    } else if (typeof error === 'object') {
+      code = asString(error.code);
+      message = asString(error.message);
+    }
+    if (message.length > 400) message = message.slice(0, 400) + '…';
+    var base;
+    if (code !== '' && KNOWN_ERROR_CODES[code] === true) base = t('error.' + code);
+    else base = t('error.generic', { message: message !== '' ? message : code !== '' ? code : '?' });
+    if (message !== '' && KNOWN_ERROR_CODES[code] === true) return base + ' · ' + message;
+    return base;
+  }
+
+  /**
+   * 一行「标签 + 路径 + 复制」。
+   *
+   * @param h - React.createElement。
+   * @param t - locale 绑定函数。
+   * @param actions - 面板动作（含 copy）。
+   * @param label - 行标题。
+   * @param path - 路径文本；空串时显示「宿主未返回路径」。
+   * @param key - React key。
+   * @returns 行元素。
+   */
+  function artifactRow(h, t, actions, label, path, key) {
+    var value = typeof path === 'string' ? path : '';
+    var pathNode =
+      value !== ''
+        ? h('code', { className: 'fi-path', title: value }, value)
+        : h('span', { className: 'fi-muted' }, t('repair.pathMissing'));
+    var copyNode =
+      value !== ''
+        ? actionButton(h, {
+            label: t('artifact.copy'),
+            variant: 'ghost',
+            small: true,
+            onClick: function () {
+              actions.copy(value);
+            },
+          })
+        : null;
+    return h('div', { className: 'fi-col', key: key }, h('span', { className: 'fi-label' }, label), h('div', { className: 'fi-row' }, pathNode, copyNode));
+  }
+
+  /**
+   * 单条命中行：相对路径 + 类型 + 显式/继承 + 复制完整路径。
+   *
+   * @param h - React.createElement。
+   * @param t - locale 绑定函数。
+   * @param actions - 面板动作。
+   * @param item - 命中项。
+   * @param index - 序号（React key 用）。
+   * @returns 行元素。
+   */
+  function hitRow(h, t, actions, item, index) {
+    var kindLabel = item.kind === 'dir' ? t('hits.kind.dir') : t('hits.kind.file');
+    var explicitLabel = item.explicit ? t('hits.badge.explicit') : t('hits.badge.inherited');
+    return h(
+      'div',
+      { className: 'fi-hit', key: (item.path || '') + '#' + index },
+      h('code', { className: 'fi-hit-path', title: item.path }, item.relativePath || item.path),
+      h(
+        'span',
+        { className: 'fi-badges' },
+        h('span', { className: 'fi-badge', key: 'kind' }, kindLabel),
+        h('span', { className: 'fi-badge ' + (item.explicit ? 'fi-badge-warn' : ''), key: 'scope' }, explicitLabel),
+      ),
+      actionButton(h, {
+        label: t('action.copy'),
+        title: t('hits.copyPath'),
+        small: true,
+        onClick: function () {
+          actions.copy(item.path);
+        },
+      }),
+    );
+  }
+
+  //#endregion
+
+  //#region 面板渲染
+
+  /**
+   * 顶部：标题 + 只读/运行中角标。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 头部元素或 null。
+   */
+  function renderHeader(view) {
+    var h = view.h;
+    var t = view.t;
+    var flags = view.flags;
+    var badges = [];
+    if (flags.readOnly) badges.push(h('span', { className: 'fi-badge fi-badge-warn', key: 'readonly' }, t('badge.readonly')));
+    if (flags.running) badges.push(h('span', { className: 'fi-badge', key: 'running' }, t('badge.running')));
+    return h(
+      'div',
+      { className: 'fi-head' },
+      h(
+        'div',
+        { className: 'fi-head-main' },
+        h('div', { className: 'fi-title' }, t('tab.title')),
+        h('div', { className: 'fi-sub' }, t('header.subtitle')),
+      ),
+      badges.length > 0 ? h('div', { className: 'fi-badges' }, badges) : null,
+    );
+  }
+
+  /**
+   * 工作区卡片：路径（可复制）+ 会话计数 + 活跃会话风险 + 解析/重试。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 卡片元素。
+   */
+  function renderWorkspace(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var workspace = state.workspace;
+    var meta = state.workspaceMeta;
+    var children = [];
+    children.push(
+      h(
+        'div',
+        { className: 'fi-row', key: 'head' },
+        h('span', { className: 'fi-label' }, t('workspace.label')),
+        h('span', { className: 'fi-spacer' }),
+        workspace !== null
+          ? actionButton(h, {
+              label: t('action.copy'),
+              variant: 'ghost',
+              small: true,
+              onClick: function () {
+                actions.copy(workspace.path);
+              },
+            })
+          : null,
+        actionButton(h, {
+          label: workspace === null ? t('action.resolve') : t('action.retry'),
+          variant: 'ghost',
+          small: true,
+          onClick: actions.retryLoad,
+        }),
+      ),
+    );
+    if (workspace !== null) {
+      children.push(h('code', { className: 'fi-path', key: 'path', title: workspace.path }, workspace.path));
+    } else if (state.loaded) {
+      children.push(h('div', { className: 'fi-muted', key: 'empty' }, t('workspace.pathEmpty')));
+    } else {
+      children.push(h('div', { className: 'fi-muted', key: 'loading' }, t('loading.workspace')));
+    }
+    if (meta !== null) {
+      children.push(
+        h(
+          'div',
+          { className: 'fi-muted', key: 'meta' },
+          t('workspace.sessionCount', { count: meta.sessionCount }) + ' · ' + t('workspace.liveAgents', { count: meta.liveAgentCount }),
+        ),
+      );
+      if (meta.liveAgentCount > 0) {
+        children.push(h('div', { className: 'fi-warn-text', key: 'risk' }, t('workspace.riskLive', { count: meta.liveAgentCount })));
+      }
+      if (meta.warnings.length > 0) {
+        children.push(h('div', { className: 'fi-warn-text', key: 'warnings' }, t('workspace.warnings', { count: meta.warnings.length })));
+      }
+    }
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 全局提示条集合：只读、引擎不可用、health/workspace/poll/action/export/log 错误、复制提示。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 提示条容器或 null。
+   */
+  function renderBanners(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    var nodes = [];
+    if (flags.readOnly) {
+      nodes.push(banner(h, { tone: 'warn', text: t('readonly.banner', { platform: flags.platform || '—' }), key: 'readonly' }));
+    }
+    if (state.health !== null && state.health.engine !== null && state.health.engine.available === false) {
+      var reason = state.health.engine.reason !== '' ? state.health.engine.reason : state.health.engine.integrity !== '' ? state.health.engine.integrity : '—';
+      nodes.push(banner(h, { tone: 'warn', text: t('engine.unavailable', { reason: reason }), key: 'engine' }));
+    }
+    if (state.health !== null && state.health.engine !== null && state.health.engine.available !== false && flags.engineRestricted) {
+      var integrityLabel = state.health.engine.integrity !== '' ? state.health.engine.integrity : '—';
+      nodes.push(banner(h, { tone: 'warn', text: t('engine.restricted', { integrity: integrityLabel }), key: 'engine-restricted' }));
+    }
+    if (state.health !== null && state.health.platform === '') {
+      nodes.push(banner(h, { tone: 'error', text: t('health.bad'), key: 'health-bad' }));
+    }
+    if (state.healthError !== null) {
+      nodes.push(
+        banner(h, {
+          tone: 'error',
+          title: t('health.error', { message: describeError(t, state.healthError) }),
+          key: 'health-error',
+        }),
+      );
+    }
+    if (state.workspaceError !== null) {
+      nodes.push(
+        banner(h, {
+          tone: 'error',
+          title: describeError(t, state.workspaceError),
+          key: 'workspace-error',
+        }),
+      );
+    }
+    if (state.pollError !== null) {
+      nodes.push(
+        banner(h, {
+          tone: 'warn',
+          text: t('poll.failed', { message: describeError(t, state.pollError) }),
+          key: 'poll-error',
+        }),
+      );
+    }
+    if (state.actionError !== null) {
+      var actionError = state.actionError;
+      var actionText;
+      if (actionError.code === 'job-not-found') {
+        actionText = t('job.expired');
+      } else if (actionError.context === 'scan') {
+        actionText = t('scan.startFailed', { message: describeError(t, actionError) });
+      } else if (actionError.context === 'repair') {
+        actionText = t('repair.startFailed', { message: describeError(t, actionError) });
+      } else {
+        actionText = describeError(t, actionError);
+      }
+      nodes.push(banner(h, { tone: 'error', title: actionText, key: 'action-error' }));
+    }
+    if (state.exportError !== null) {
+      nodes.push(
+        banner(h, { tone: 'error', text: t('export.failed', { message: describeError(t, state.exportError) }), key: 'export-error' }),
+      );
+    }
+    if (state.logError !== null) {
+      nodes.push(
+        banner(h, { tone: 'error', text: t('log.failed', { message: describeError(t, state.logError) }), key: 'log-error' }),
+      );
+    }
+    if (state.notice !== '') {
+      nodes.push(banner(h, { tone: 'info', text: state.notice, key: 'notice' }));
+    }
+    if (nodes.length === 0) return null;
+    return h('div', { className: 'fi-banners' }, nodes);
+  }
+
+  /**
+   * 动作行：扫描/重扫、导出清单、一键清除、取消任务。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 动作行。
+   */
+  function renderActions(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    var buttons = [];
+    buttons.push(
+      actionButton(h, {
+        label: flags.scanJob !== null ? t('action.rescan') : t('action.scan'),
+        variant: 'primary',
+        disabled: !flags.canScan,
+        onClick: actions.startScan,
+        key: 'scan',
+      }),
+    );
+    if (flags.showExport) {
+      buttons.push(
+        actionButton(h, {
+          label: state.exporting ? t('loading.items') : t('action.export'),
+          variant: 'ghost',
+          disabled: !flags.canExport,
+          onClick: actions.exportList,
+          key: 'export',
+        }),
+      );
+    }
+    if (flags.showRepair) {
+      buttons.push(
+        actionButton(h, {
+          label: t('action.repair'),
+          variant: 'danger',
+          disabled: !flags.canRepair,
+          onClick: actions.openConfirm,
+          key: 'repair',
+        }),
+      );
+    }
+    if (flags.running) {
+      buttons.push(
+        actionButton(h, {
+          label: state.cancelling ? t('action.cancelling') : t('action.cancel'),
+          variant: 'danger',
+          disabled: state.cancelling,
+          onClick: actions.cancelJob,
+          key: 'cancel',
+        }),
+      );
+    }
+    return h('div', { className: 'fi-row' }, buttons);
+  }
+
+  /**
+   * 破坏性确认条：预计修复数 + 快照/恢复文件提示 + workspace-write 风险。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 确认条或 null。
+   */
+  function renderConfirm(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    if (!state.confirmOpen) return null;
+    var liveCount = state.workspaceMeta !== null ? state.workspaceMeta.liveAgentCount : 0;
+    var children = [
+      h('div', { className: 'fi-banner-title', key: 'title' }, t('repair.confirm.title')),
+      h('div', { className: 'fi-banner-text', key: 'count' }, t('repair.confirm.count', { count: flags.confirmHits })),
+      h('div', { className: 'fi-banner-text', key: 'backup' }, t('repair.confirm.backup')),
+      h('div', { className: 'fi-banner-text', key: 'risk' }, t('repair.confirm.risk', { count: liveCount })),
+      flags.engineRestricted ? h('div', { className: 'fi-banner-text', key: 'engine' }, t('repair.confirm.engineLimited')) : null,
+      h(
+        'div',
+        { className: 'fi-row', key: 'buttons' },
+        actionButton(h, {
+          label: t('action.dismiss'),
+          variant: 'ghost',
+          onClick: actions.closeConfirm,
+        }),
+        actionButton(h, {
+          label: t('action.confirm'),
+          variant: 'danger',
+          disabled: !flags.canRepair || state.starting,
+          onClick: actions.startRepair,
+        }),
+      ),
+    ];
+    return h('div', { className: 'fi-card fi-card-danger' }, children);
+  }
+
+  /**
+   * 运行中：阶段 / 已扫描 / 命中 / 耗时 + 进度条（取消按钮在动作行）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 运行卡片或 null。
+   */
+  function renderRunning(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var flags = view.flags;
+    if (!flags.running || state.job === null) return null;
+    var job = state.job;
+    var actionLabel = job.action === 'repair' ? t('action.label.repair') : t('action.label.scan');
+    var done = job.action === 'repair' ? job.fixed + job.failedCount : job.scanned;
+    var percent = job.total > 0 ? Math.max(0, Math.min(100, Math.round((done / job.total) * 100))) : 0;
+    var children = [];
+    children.push(
+      h(
+        'div',
+        { className: 'fi-row', key: 'head' },
+        h('span', { className: 'fi-label' }, t('job.running', { action: actionLabel })),
+        h('span', { className: 'fi-spacer' }),
+        h('span', { className: 'fi-muted' }, t('job.elapsed', { duration: formatDuration(flags.elapsed) })),
+      ),
+    );
+    children.push(
+      job.phase !== ''
+        ? h('div', { className: 'fi-muted', key: 'phase' }, t('job.phase', { phase: job.phase }))
+        : h('div', { className: 'fi-muted', key: 'phase' }, t('job.waiting')),
+    );
+    children.push(
+      h(
+        'div',
+        { className: 'fi-kv', key: 'scanned' },
+        h('span', null, t('job.scanned', { scanned: job.scanned, total: job.total > 0 ? job.total : '?' })),
+        h('span', { className: 'fi-kv-value' }, t('job.hits', { count: job.hits })),
+      ),
+    );
+    children.push(h('div', { className: 'fi-progress-track', key: 'progress' }, h('div', { className: 'fi-progress-fill', style: { width: percent + '%' } })));
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 扫描结果：两态（未发现 Low / 发现 N 个）+ explicit/inherited 计数 + 扫描元信息。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 结果卡片或 null。
+   */
+  function renderScanResult(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    var scanJob = flags.scanJob;
+    if (scanJob === null) return null;
+    var children = [];
+    if (scanJob.status === 'succeeded') {
+      if (scanJob.hits === 0) {
+        children.push(banner(h, { tone: 'success', title: t('scan.result.none'), key: 'title' }));
+      } else {
+        children.push(
+          banner(h, {
+            tone: 'warn',
+            title: t('scan.result.found', { count: scanJob.hits }),
+            text: t('scan.result.counts', { explicit: scanJob.explicitCount, inherited: scanJob.inheritedCount }),
+            key: 'title',
+          }),
+        );
+      }
+      if (scanJob.scanned > 0 || scanJob.finishedAt > 0) {
+        children.push(
+          h(
+            'div',
+            { className: 'fi-muted', key: 'meta' },
+            t('scan.result.meta', {
+              scanned: scanJob.scanned,
+              duration: formatDuration(Math.max(0, scanJob.finishedAt - scanJob.startedAt)),
+            }),
+          ),
+        );
+      }
+      if (scanJob.rootLabel !== '') {
+        children.push(h('div', { className: 'fi-muted', key: 'root' }, t('scan.result.root', { rootLabel: scanJob.rootLabel })));
+      }
+    } else if (scanJob.status === 'cancelled') {
+      children.push(banner(h, { tone: 'info', title: t('job.cancelled'), key: 'title' }));
+      children.push(
+        actionButton(h, {
+          label: state.logging ? t('action.logging') : t('action.log'),
+          variant: 'ghost',
+          small: true,
+          disabled: state.logging,
+          onClick: actions.generateLog,
+          key: 'log',
+        }),
+      );
+    } else {
+      children.push(
+        banner(h, {
+          tone: 'error',
+          title: t('scan.failed'),
+          text: scanJob.message,
+          key: 'title',
+        }),
+      );
+      children.push(
+        actionButton(h, {
+          label: state.logging ? t('action.logging') : t('action.log'),
+          variant: 'ghost',
+          small: true,
+          disabled: state.logging,
+          onClick: actions.generateLog,
+          key: 'log',
+        }),
+      );
+    }
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 清除结果：成功（N 项 + 复扫结果 + 快照/恢复路径）或失败（N 项失败 + 日志入口）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 结果卡片或 null。
+   */
+  function renderRepairResult(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    var job = flags.repairJob;
+    if (job === null || !flags.repairTerminal) return null;
+    var children = [];
+    if (job.status === 'succeeded') {
+      children.push(banner(h, { tone: 'success', title: t('repair.success', { count: job.fixed }), key: 'title' }));
+      var remaining = remainingHitsOf(job);
+      if (remaining === 0) {
+        children.push(h('div', { className: 'fi-success-text', key: 'rescan' }, t('repair.rescan.none')));
+      } else {
+        children.push(h('div', { className: 'fi-warn-text', key: 'rescan' }, t('repair.rescan.found', { count: remaining })));
+      }
+      children.push(
+        h(
+          'div',
+          { className: 'fi-muted', key: 'meta' },
+          t('scan.result.meta', {
+            scanned: job.scanned,
+            duration: formatDuration(Math.max(0, job.finishedAt - job.startedAt)),
+          }),
+        ),
+      );
+      children.push(artifactRow(h, t, actions, t('repair.snapshot'), job.snapshotPath, 'snapshot'));
+      children.push(artifactRow(h, t, actions, t('repair.restore'), job.restorePath, 'restore'));
+    } else if (job.status === 'cancelled') {
+      children.push(banner(h, { tone: 'info', title: t('job.cancelled'), key: 'title' }));
+      children.push(
+        actionButton(h, {
+          label: state.logging ? t('action.logging') : t('action.log'),
+          variant: 'ghost',
+          small: true,
+          disabled: state.logging,
+          onClick: actions.generateLog,
+          key: 'log',
+        }),
+      );
+    } else {
+      children.push(banner(h, { tone: 'error', title: t('repair.failed', { count: job.failedCount }), key: 'title' }));
+      if (job.message !== '') {
+        children.push(h('div', { className: 'fi-error-text', key: 'message' }, job.message));
+      }
+      if (job.fixed > 0) {
+        children.push(h('div', { className: 'fi-muted', key: 'fixed' }, t('repair.partialFixed', { count: job.fixed })));
+      }
+      children.push(
+        actionButton(h, {
+          label: state.logging ? t('action.logging') : t('action.log'),
+          variant: 'ghost',
+          small: true,
+          disabled: state.logging,
+          onClick: actions.generateLog,
+          key: 'log',
+        }),
+      );
+    }
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 命中清单：首屏 200 条 + 「加载更多」分页。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 清单卡片或 null。
+   */
+  function renderHits(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    if (!flags.showHits) return null;
+    var total = state.itemsTotal;
+    var items = state.items;
+    var children = [];
+    children.push(
+      h(
+        'div',
+        { className: 'fi-row', key: 'head' },
+        h('span', { className: 'fi-label' }, t('hits.title')),
+        h('span', { className: 'fi-spacer' }),
+        h('span', { className: 'fi-muted' }, t('hits.shown', { shown: items.length, total: total })),
+      ),
+    );
+    if (items.length > 0) {
+      children.push(h('div', { className: 'fi-hits', key: 'list' }, items.map(function (item, index) {
+        return hitRow(h, t, actions, item, index);
+      })));
+    } else {
+      children.push(h('div', { className: 'fi-muted', key: 'empty' }, t('hits.empty')));
+    }
+    if (items.length < total) {
+      children.push(
+        h(
+          'div',
+          { className: 'fi-row', key: 'more' },
+          actionButton(h, {
+            label: state.itemsLoading ? t('loading.items') : t('action.loadMore'),
+            variant: 'ghost',
+            small: true,
+            disabled: state.itemsLoading,
+            onClick: actions.loadMore,
+          }),
+          h('span', { className: 'fi-muted' }, t('hits.more', { count: Math.max(0, total - items.length) })),
+        ),
+      );
+    }
+    if (state.itemsError !== null) {
+      children.push(
+        h('div', { className: 'fi-error-text', key: 'error' }, t('hits.loadFailed', { message: describeError(t, state.itemsError) })),
+      );
+    }
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 清除失败列表（限制展示条数，其余只给计数）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 失败列表卡片或 null。
+   */
+  function renderFailures(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var flags = view.flags;
+    var job = flags.repairJob;
+    if (job === null || job.status !== 'failed' || job.errors.length === 0) return null;
+    var shown = job.errors.slice(0, MAX_FAILURE_ROWS);
+    var rows = shown.map(function (entry, index) {
+      var text = entry.message !== '' ? entry.message : t('scan.failed');
+      return h(
+        'div',
+        { className: 'fi-failure', key: (entry.path || '') + '#' + index },
+        h('code', { className: 'fi-path', title: entry.path !== '' ? entry.path : text }, entry.path !== '' ? entry.path : text),
+        entry.path !== '' ? h('div', { className: 'fi-muted' }, text) : null,
+      );
+    });
+    var children = [h('div', { className: 'fi-row', key: 'head' }, h('span', { className: 'fi-label' }, t('repair.failures')))];
+    children.push(h('div', { className: 'fi-list', key: 'list' }, rows));
+    var reportedFailures = job.errorCount > job.errors.length ? job.errorCount : job.errors.length;
+    if (reportedFailures > shown.length) {
+      children.push(h('div', { className: 'fi-muted', key: 'more' }, t('repair.failuresMore', { count: reportedFailures - shown.length })));
+    }
+    return h('div', { className: 'fi-card' }, children);
+  }
+
+  /**
+   * 产物路径（导出清单 / 日志）：生成后显示返回路径并可复制。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 产物卡片或 null。
+   */
+  function renderArtifacts(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var rows = [];
+    if (state.exportPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.export'), state.exportPath, 'export'));
+    if (state.logPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.log'), state.logPath, 'log'));
+    if (rows.length === 0) return null;
+    return h('div', { className: 'fi-card' }, rows);
+  }
+
+  /**
+   * 尚未扫描时的引导文案。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 文案元素或 null。
+   */
+  function renderIntro(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var flags = view.flags;
+    if (!state.loaded || flags.running || state.jobLoading) return null;
+    if (flags.scanJob !== null || state.job !== null) return null;
+    if (state.workspace === null) return null;
+    return h('div', { className: 'fi-card' }, h('div', { className: 'fi-muted' }, t('intro.hint')));
+  }
+
+  /**
+   * 恢复任务中。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 提示元素或 null。
+   */
+  function renderJobLoading(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    if (!state.jobLoading) return null;
+    return h('div', { className: 'fi-muted' }, t('loading.job'));
+  }
+
+  /**
+   * 底部宿主信息（版本 / 平台 / 引擎 / 注册表 / 警告）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 底部元素或 null。
+   */
+  function renderFooter(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var health = state.health;
+    if (health === null) return null;
+    var parts = [];
+    if (health.version !== '') parts.push(t('health.version', { version: health.version }));
+    parts.push(t('health.platform', { platform: health.platform !== '' ? health.platform : '—' }));
+    if (health.engine !== null && health.engine.integrity !== '') {
+      parts.push(t('footer.engine', { integrity: health.engine.integrity }));
+    }
+    if (health.registry !== null && health.registry.count > 0) {
+      parts.push(t('footer.registry', { count: health.registry.count }));
+    }
+    var children = [h('div', { className: 'fi-muted', key: 'meta' }, parts.join(' · '))];
+    if (health.warnings.length > 0) {
+      children.push(
+        h(
+          'div',
+          { className: 'fi-muted fi-warn-text', key: 'warnings' },
+          t('health.warnings', { count: health.warnings.length, first: health.warnings.slice(0, 3).join('; ') }),
+        ),
+      );
+    }
+    return h('div', { className: 'fi-footer' }, children);
+  }
+
+  /**
+   * 面板根元素（纯渲染，不含状态）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 根元素。
+   */
+  function renderPanel(view) {
+    var h = view.h;
+    return h(
+      'div',
+      { className: 'fi-panel' },
+      renderHeader(view),
+      renderWorkspace(view),
+      renderBanners(view),
+      renderIntro(view),
+      renderActions(view),
+      renderConfirm(view),
+      renderJobLoading(view),
+      renderRunning(view),
+      renderScanResult(view),
+      renderRepairResult(view),
+      renderArtifacts(view),
+      renderHits(view),
+      renderFailures(view),
+      renderFooter(view),
+    );
+  }
+
+  //#endregion
+
+  //#region 面板组件
+
+  /**
+   * 造面板组件（注入 React 与 locale 绑定；组件本身只在 apply 里创建一次）。
+   *
+   * @param runtime - { React, h, t }。
+   * @returns 可直接注册到 sidebar.right.pane.tab 的组件。
+   */
+  function makePanel(runtime) {
+    var React = runtime.React;
+    var h = runtime.h;
+    var t = runtime.t;
+
+    /** slot 组件崩溃会让整块区域空白：这里兜住渲染异常并提供重试。 */
+    class PanelBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { failed: false, attempt: 0 };
+        this.handleRetry = this.handleRetry.bind(this);
+      }
+
+      static getDerivedStateFromError() {
+        return { failed: true };
+      }
+
+      componentDidCatch(error) {
+        console.error(LOG_PREFIX + ' 面板渲染失败（已兜底，不影响页面）：', error);
+      }
+
+      handleRetry() {
+        this.setState(function (prev) {
+          return { failed: false, attempt: prev.attempt + 1 };
+        });
+      }
+
+      render() {
+        if (this.state.failed) {
+          return h(
+            'div',
+            { className: 'fi-panel fi-fatal' },
+            h('div', { className: 'fi-fatal-title' }, t('error.boundary')),
+            h('button', { type: 'button', className: 'fi-btn', onClick: this.handleRetry }, t('action.retry')),
+          );
+        }
+        // attempt 变化 → key 变化 → 子面板重新挂载一次（面板自愈的最后一招）。
+        return h('div', { className: 'fi-fatal-holder', key: 'attempt-' + this.state.attempt }, this.props.children);
+      }
+    }
+
+    /**
+     * 面板主体。
+     *
+     * @param props - 插槽标准 props（sessionId 等）。
+     * @returns 面板根元素。
+     */
+    function Panel(props) {
+      var sessionId = readSessionId(props);
+
+      var [state, setState] = React.useState(function () {
+        return initialPanelState();
+      });
+      var [loadNonce, setLoadNonce] = React.useState(0);
+
+      var mountedRef = React.useRef(true);
+      var sessionIdRef = React.useRef(sessionId);
+      sessionIdRef.current = sessionId;
+
+      React.useEffect(function () {
+        mountedRef.current = true;
+        return function () {
+          mountedRef.current = false;
+        };
+      }, []);
+
+      /** 异步回调里判断「还是同一个面板、同一个会话」。 */
+      function isCurrent(session) {
+        return mountedRef.current === true && sessionIdRef.current === session;
+      }
+
+      /** 复制并展示提示。 */
+      function copyValue(text) {
+        if (typeof text !== 'string' || text === '') return;
+        copyToClipboard(text).then(function (ok) {
+          if (!mountedRef.current) return;
+          setState(function (prev) {
+            return Object.assign({}, prev, { notice: ok ? t('notice.copied') : t('notice.copyFailed') });
+          });
+        });
+      }
+
+      /** 发一次任务请求（扫描/清除共用）：成功后写入任务并交给轮询。 */
+      function startJob(action) {
+        if (sessionId === '' || state.starting) return;
+        if (state.job !== null && state.job.status === 'running') return;
+        var mySession = sessionId;
+        setState(function (prev) {
+          return Object.assign({}, prev, {
+            starting: true,
+            confirmOpen: false,
+            actionError: null,
+            pollError: null,
+            notice: '',
+            exportError: null,
+            logError: null,
+          });
+        });
+        requestJson({ path: '/jobs', method: 'POST', body: { action: action, sessionId: mySession } }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              return Object.assign({}, prev, {
+                starting: false,
+                actionError: { code: res.code, message: res.message, context: action },
+              });
+            });
+            return;
+          }
+          var jobId = res.data !== null && typeof res.data === 'object' ? asString(res.data.jobId) : '';
+          if (jobId === '') {
+            setState(function (prev) {
+              return Object.assign({}, prev, { starting: false, actionError: { code: 'bad-response', message: '' } });
+            });
+            return;
+          }
+          writeStoredJob(mySession, jobId);
+          setState(function (prev) {
+            var patch = {
+              starting: false,
+              jobId: jobId,
+              job: provisionalJob(action, jobId),
+              pollError: null,
+              actionError: null,
+              now: Date.now(),
+            };
+            if (action === 'scan') {
+              patch.scanJob = null;
+              patch.items = [];
+              patch.itemsTotal = 0;
+              patch.itemsJobId = '';
+              patch.itemsLoaded = false;
+              patch.itemsError = null;
+              patch.exportPath = '';
+              patch.exportError = null;
+            }
+            return Object.assign({}, prev, patch);
+          });
+        });
+      }
+
+      /** 取消运行中的任务。 */
+      function cancelJob() {
+        var target = state.job;
+        if (target === null || target.status !== 'running' || state.cancelling) return;
+        var mySession = sessionId;
+        setState(function (prev) {
+          return Object.assign({}, prev, { cancelling: true, actionError: null });
+        });
+        requestJson({ path: '/jobs/' + encodeURIComponent(target.id) + '/cancel', method: 'POST', body: {} }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              var patch = { cancelling: false, actionError: { code: res.code, message: res.message } };
+              if (res.code === 'job-not-found' || res.status === 404) {
+                removeStoredJob(mySession);
+                patch.job = null;
+                patch.jobId = '';
+              }
+              return Object.assign({}, prev, patch);
+            });
+            return;
+          }
+          setState(function (prev) {
+            return Object.assign({}, prev, { cancelling: false, notice: t('job.cancelled') });
+          });
+        });
+      }
+
+      /** 导出当前扫描清单，展示宿主返回的路径。 */
+      function exportList() {
+        var target = state.scanJob;
+        if (target === null || target.status === 'running' || state.exporting) return;
+        var mySession = sessionId;
+        setState(function (prev) {
+          return Object.assign({}, prev, { exporting: true, exportError: null });
+        });
+        requestJson({ path: '/jobs/' + encodeURIComponent(target.id) + '/export', method: 'POST', body: {} }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              return Object.assign({}, prev, { exporting: false, exportError: { code: res.code, message: res.message } });
+            });
+            return;
+          }
+          var path = res.data !== null && typeof res.data === 'object' ? asString(res.data.path) : '';
+          setState(function (prev) {
+            return Object.assign({}, prev, {
+              exporting: false,
+              exportPath: path,
+              exportError: null,
+              notice: path !== '' ? t('export.ok') : '',
+            });
+          });
+        });
+      }
+
+      /** 生成当前（失败）任务的日志，展示宿主返回的路径。 */
+      function generateLog() {
+        var target = state.job;
+        if (target === null || target.status === 'running' || state.logging) return;
+        var mySession = sessionId;
+        setState(function (prev) {
+          return Object.assign({}, prev, { logging: true, logError: null });
+        });
+        requestJson({ path: '/jobs/' + encodeURIComponent(target.id) + '/log', method: 'POST', body: {} }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              return Object.assign({}, prev, { logging: false, logError: { code: res.code, message: res.message } });
+            });
+            return;
+          }
+          var path = res.data !== null && typeof res.data === 'object' ? asString(res.data.path) : '';
+          setState(function (prev) {
+            return Object.assign({}, prev, {
+              logging: false,
+              logPath: path,
+              logError: null,
+              notice: path !== '' ? t('log.ok') : '',
+            });
+          });
+        });
+      }
+
+      /** 命中清单分页：从已加载条数开始再取一页。 */
+      function loadMore() {
+        var jobId = state.itemsJobId;
+        if (jobId === '' || state.itemsLoading) return;
+        if (state.itemsTotal > 0 && state.items.length >= state.itemsTotal) return;
+        var mySession = sessionId;
+        var offset = state.items.length;
+        setState(function (prev) {
+          return Object.assign({}, prev, { itemsLoading: true, itemsError: null });
+        });
+        requestJson({
+          path: '/jobs/' + encodeURIComponent(jobId) + '/items?offset=' + encodeURIComponent(String(offset)) + '&limit=' + PAGE_SIZE,
+          method: 'GET',
+        }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            if (res.code === 'job-not-found' || res.status === 404) {
+              removeStoredJob(mySession);
+              setState(function (prev) {
+                return Object.assign({}, prev, {
+                  itemsLoading: false,
+                  itemsError: null,
+                  jobId: '',
+                  job: null,
+                  actionError: { code: 'job-not-found', message: '' },
+                });
+              });
+              return;
+            }
+            setState(function (prev) {
+              return Object.assign({}, prev, { itemsLoading: false, itemsError: { code: res.code, message: res.message } });
+            });
+            return;
+          }
+          var data = res.data !== null && typeof res.data === 'object' ? res.data : {};
+          var pageItems = normalizeItems(data.items);
+          var reportedTotal = typeof data.total === 'number' && isFinite(data.total) ? data.total : -1;
+          setState(function (prev) {
+            var merged = mergeItems(prev.items, pageItems);
+            return Object.assign({}, prev, {
+              itemsLoading: false,
+              items: merged,
+              itemsTotal: reportedTotal >= 0 ? reportedTotal : prev.itemsTotal,
+              itemsLoaded: true,
+              itemsError: null,
+            });
+          });
+        });
+      }
+
+      /** 重新解析工作区 / 重试加载（含 health 与任务恢复）。 */
+      function retryLoad() {
+        setLoadNonce(function (prev) {
+          return prev + 1;
+        });
+      }
+
+      /** 打开破坏性确认条。 */
+      function openConfirm() {
+        setState(function (prev) {
+          return Object.assign({}, prev, { confirmOpen: true, actionError: null });
+        });
+      }
+
+      /** 收起确认条。 */
+      function closeConfirm() {
+        setState(function (prev) {
+          return Object.assign({}, prev, { confirmOpen: false });
+        });
+      }
+
+      // ---- 加载：health + workspace + 任务恢复（会话切换时重置） ----
+      React.useEffect(
+        function () {
+          var alive = true;
+          var controller = typeof AbortController === 'function' ? new AbortController() : null;
+          var signal = controller === null ? undefined : controller.signal;
+
+          setState(function () {
+            return initialPanelState();
+          });
+
+          if (sessionId === '') {
+            setState(function (prev) {
+              return Object.assign({}, prev, {
+                loaded: true,
+                workspaceError: { code: 'no-session', message: '' },
+              });
+            });
+            return function () {
+              alive = false;
+              if (controller !== null) controller.abort();
+            };
+          }
+
+          function isAlive() {
+            return alive === true && mountedRef.current === true && sessionIdRef.current === sessionId;
+          }
+
+          function restoreJob() {
+            var storedJobId = readStoredJob(sessionId);
+            if (storedJobId === '') return;
+            setState(function (prev) {
+              return Object.assign({}, prev, { jobLoading: true });
+            });
+            requestJson({ path: '/jobs/' + encodeURIComponent(storedJobId), method: 'GET', signal: signal }).then(function (res) {
+              if (!isAlive()) return;
+              if (!res.ok) {
+                if (res.code === 'job-not-found' || res.status === 404) {
+                  removeStoredJob(sessionId);
+                  setState(function (prev) {
+                    return Object.assign({}, prev, {
+                      jobLoading: false,
+                      jobId: '',
+                      job: null,
+                      actionError: { code: 'job-not-found', message: '' },
+                    });
+                  });
+                } else if (!res.aborted) {
+                  setState(function (prev) {
+                    return Object.assign({}, prev, { jobLoading: false, pollError: { code: res.code, message: res.message } });
+                  });
+                }
+                return;
+              }
+              var restored = normalizeJob(res.data !== null && typeof res.data === 'object' ? res.data.job : null);
+              if (restored === null) {
+                removeStoredJob(sessionId);
+                setState(function (prev) {
+                  return Object.assign({}, prev, { jobLoading: false, actionError: { code: 'bad-response', message: '' } });
+                });
+                return;
+              }
+              setState(function (prev) {
+                return Object.assign({}, prev, { jobLoading: false }, jobPatch(prev, restored));
+              });
+            });
+          }
+
+          Promise.all([
+            requestJson({ path: '/health', method: 'GET', signal: signal }),
+            requestJson({ path: '/workspace', method: 'POST', body: { sessionId: sessionId }, signal: signal }),
+          ]).then(function (results) {
+            if (!isAlive()) return;
+            var healthRes = results[0];
+            var workspaceRes = results[1];
+            var patch = { loaded: true, now: Date.now() };
+            if (healthRes.ok === true) {
+              var health = normalizeHealth(healthRes.data);
+              patch.health = health;
+              patch.healthError = health.platform === '' ? { code: 'bad-response', message: '' } : null;
+            } else if (healthRes.aborted !== true) {
+              patch.healthError = { code: healthRes.code, message: healthRes.message };
+            }
+            if (workspaceRes.ok === true) {
+              var workspace = normalizeWorkspace(workspaceRes.data !== null && typeof workspaceRes.data === 'object' ? workspaceRes.data.workspace : null);
+              if (workspace === null) {
+                patch.workspace = null;
+                patch.workspaceError = { code: 'bad-response', message: '' };
+              } else {
+                patch.workspace = workspace;
+                patch.workspaceMeta = normalizeWorkspaceMeta(workspaceRes.data);
+                patch.workspaceError = null;
+              }
+            } else if (workspaceRes.aborted !== true) {
+              patch.workspaceError = { code: workspaceRes.code, message: workspaceRes.message };
+            }
+            setState(function (prev) {
+              return Object.assign({}, prev, patch);
+            });
+            restoreJob();
+          });
+
+          return function () {
+            alive = false;
+            if (controller !== null) controller.abort();
+          };
+        },
+        [sessionId, loadNonce],
+      );
+
+      // ---- 轮询：运行中的任务每 800ms 刷新一次；cleanup 清定时器与 AbortController ----
+      var pollStatus = state.job !== null ? state.job.status : '';
+      React.useEffect(
+        function () {
+          if (state.jobId === '' || pollStatus !== 'running') return undefined;
+          var jobId = state.jobId;
+          var mySession = sessionId;
+          var disposed = false;
+          var busy = false;
+          var controller = null;
+
+          function tick() {
+            if (disposed || busy) return;
+            busy = true;
+            controller = typeof AbortController === 'function' ? new AbortController() : null;
+            var signal = controller === null ? undefined : controller.signal;
+            requestJson({ path: '/jobs/' + encodeURIComponent(jobId), method: 'GET', signal: signal })
+              .then(function (res) {
+                if (disposed) return;
+                if (!res.ok) {
+                  if (res.code === 'job-not-found' || res.status === 404) {
+                    removeStoredJob(mySession);
+                    setState(function (prev) {
+                      return Object.assign({}, prev, {
+                        jobId: '',
+                        job: null,
+                        jobLoading: false,
+                        actionError: { code: 'job-not-found', message: '' },
+                      });
+                    });
+                    return;
+                  }
+                  if (res.aborted !== true) {
+                    setState(function (prev) {
+                      return Object.assign({}, prev, { pollError: { code: res.code, message: res.message }, now: Date.now() });
+                    });
+                  }
+                  return;
+                }
+                var job = normalizeJob(res.data !== null && typeof res.data === 'object' ? res.data.job : null);
+                if (job === null) {
+                  setState(function (prev) {
+                    return Object.assign({}, prev, { pollError: { code: 'bad-response', message: '' }, now: Date.now() });
+                  });
+                  return;
+                }
+                setState(function (prev) {
+                  return Object.assign({}, prev, jobPatch(prev, job), { pollError: null });
+                });
+              })
+              .then(function () {
+                busy = false;
+              });
+          }
+
+          var timer = window.setInterval(tick, POLL_INTERVAL_MS);
+          tick();
+          return function () {
+            disposed = true;
+            if (timer !== undefined && timer !== null) window.clearInterval(timer);
+            if (controller !== null) controller.abort();
+          };
+        },
+        [sessionId, state.jobId, pollStatus],
+      );
+
+      // ---- 提示自动消失 ----
+      React.useEffect(
+        function () {
+          if (state.notice === '') return undefined;
+          var timer = window.setTimeout(function () {
+            setState(function (prev) {
+              return Object.assign({}, prev, { notice: '' });
+            });
+          }, NOTICE_MS);
+          return function () {
+            window.clearTimeout(timer);
+          };
+        },
+        [state.notice],
+      );
+
+      // ---- 派生视图状态 ----
+      var health = state.health;
+      var platform = health !== null ? health.platform : '';
+      var readOnly = health !== null && platform !== '' && platform !== 'win32';
+      var engineReady = health !== null && health.engine !== null && health.engine.available !== false;
+      // Host 提示：canWriteLabel === false，或当前进程完整性标签不是 Medium 时无法写回 Medium。
+      var engineRestricted =
+        health !== null &&
+        health.engine !== null &&
+        (health.engine.canWriteLabel === false ||
+          (health.engine.integrity !== '' && health.engine.integrity !== 'Medium'));
+      var writable = health !== null && platform === 'win32' && engineReady;
+      var job = state.job;
+      var running = job !== null && job.status === 'running';
+      var scanJob = state.scanJob !== null && state.scanJob.status !== 'running' ? state.scanJob : null;
+      var repairJob = job !== null && job.action === 'repair' ? job : null;
+      var repairTerminal = repairJob !== null && repairJob.status !== 'running';
+      var workspace = state.workspace;
+      var liveAgentCount = state.workspaceMeta !== null ? state.workspaceMeta.liveAgentCount : 0;
+      var canScan = workspace !== null && sessionId !== '' && writable && !running && !state.starting;
+      var showExport = scanJob !== null && scanJob.hits > 0;
+      var canExport = showExport && !running && !state.exporting && !readOnly;
+      var showRepair = scanJob !== null && scanJob.hits > 0;
+      var canRepair = showRepair && writable && !engineRestricted && !running && !state.starting;
+      var showHits = state.itemsTotal > 0 || state.items.length > 0;
+      var elapsed = 0;
+      if (job !== null) {
+        var startAt = job.startedAt;
+        var endAt = job.status === 'running' ? state.now : job.finishedAt !== 0 ? job.finishedAt : state.now;
+        if (startAt > 0 && endAt >= startAt) elapsed = endAt - startAt;
+      }
+      var flags = {
+        readOnly: readOnly,
+        writable: writable,
+        engineReady: engineReady,
+        engineRestricted: engineRestricted,
+        platform: platform,
+        running: running,
+        job: job,
+        scanJob: scanJob,
+        repairJob: repairJob,
+        repairTerminal: repairTerminal,
+        liveAgentCount: liveAgentCount,
+        canScan: canScan,
+        showExport: showExport,
+        canExport: canExport,
+        showRepair: showRepair,
+        canRepair: canRepair,
+        showHits: showHits,
+        confirmHits: scanJob !== null ? scanJob.hits : state.itemsTotal,
+        elapsed: elapsed,
+      };
+      var actions = {
+        copy: copyValue,
+        retryLoad: retryLoad,
+        startScan: function () {
+          startJob('scan');
+        },
+        startRepair: function () {
+          startJob('repair');
+        },
+        openConfirm: openConfirm,
+        closeConfirm: closeConfirm,
+        cancelJob: cancelJob,
+        exportList: exportList,
+        generateLog: generateLog,
+        loadMore: loadMore,
+      };
+
+      return renderPanel({ h: h, t: t, state: state, actions: actions, flags: flags });
+    }
+
+    /**
+     * 注册到插槽的组件：外层先挂错误边界，任何渲染异常都不会让整块侧栏空白。
+     *
+     * @param props - 插槽标准 props。
+     * @returns 面板元素。
+     */
+    return function LowIntegrityPanel(props) {
+      return h(PanelBoundary, null, h(Panel, props));
+    };
+  }
+
+  /**
+   * 面板初始状态（每个会话/每次重载都从干净状态开始）。
+   *
+   * @returns 初始状态对象。
+   */
+  function initialPanelState() {
+    return {
+      loaded: false,
+      health: null,
+      healthError: null,
+      workspace: null,
+      workspaceMeta: null,
+      workspaceError: null,
+      job: null,
+      scanJob: null,
+      jobId: '',
+      jobLoading: false,
+      pollError: null,
+      items: [],
+      itemsTotal: 0,
+      itemsJobId: '',
+      itemsLoaded: false,
+      itemsLoading: false,
+      itemsError: null,
+      exporting: false,
+      exportPath: '',
+      exportError: null,
+      logging: false,
+      logPath: '',
+      logError: null,
+      confirmOpen: false,
+      starting: false,
+      cancelling: false,
+      actionError: null,
+      notice: '',
+      now: 0,
+    };
+  }
+
+  //#endregion
+
+  //#region 模块装配
+
+  /**
+   * 创建 DSH 插件 factory。
+   *
+   * @returns (require) => module.exports。
+   */
+  function makeFactory() {
+    return function factory(require) {
+      var module = { exports: {} };
+      var name = TAB_ID;
+      var inject = ['slots', 'locale'];
+
+      var React;
+      try {
+        React = require('react');
+      } catch (error) {
+        console.error(LOG_PREFIX + ' 无法加载 react（插件降级为空实现）：', error);
+        module.exports = { name: name, inject: inject, apply: function () {} };
+        return module.exports;
+      }
+      var h = React.createElement;
+
+      /**
+       * 激活：注册 locale、样式、右侧栏标签类型与正文插槽。
+       *
+       * 任何一步失败都只降级功能，绝不让插件抛错——否则整个 Web 端可能进不去。
+       *
+       * @param ctx - 浏览器侧 Cordis 上下文。
+       */
+      function apply(ctx) {
+        try {
+          applyInner(ctx);
+        } catch (error) {
+          console.error(LOG_PREFIX + ' 插件激活失败（已忽略，不影响页面）：', error);
+        }
+      }
+
+      /**
+       * 真正的注册流程。
+       *
+       * @param ctx - 浏览器侧 Cordis 上下文。
+       */
+      function applyInner(ctx) {
+        // locale：所有可见文案走 t()。
+        var t = function (key) {
+          return key;
+        };
+        try {
+          ctx.effect(function () {
+            return ctx.locale.register(NS, DICTS);
+          }, 'dsh-low-integrity-check: dictionaries');
+          t = ctx.locale.bind(NS);
+        } catch (error) {
+          console.error(LOG_PREFIX + ' locale 注册失败（文案退化为键名）：', error);
+        }
+
+        // 样式：照抄 dsh-pet 的引用计数注入/清理。
+        try {
+          ctx.effect(function () {
+            return injectPanelCss();
+          }, 'dsh-low-integrity-check: panel styles');
+        } catch (error) {
+          console.error(LOG_PREFIX + ' 面板样式注入失败（不影响功能）：', error);
+        }
+
+        var Panel = makePanel({ React: React, h: h, t: t });
+
+        /**
+         * 软取右侧栏导航控制器并打开本标签（服务缺失时静默）。
+         *
+         * @param kind - 标签类型。
+         */
+        function openSidebarTab(kind) {
+          try {
+            var controller = typeof ctx.get === 'function' ? ctx.get('sidebarRight') : undefined;
+            if (controller !== undefined && controller !== null && typeof controller.openTab === 'function') {
+              controller.openTab(kind);
+            }
+          } catch (error) {
+            console.warn(LOG_PREFIX + ' 打开右侧栏标签失败（已忽略）：', error);
+          }
+        }
+
+        // 右侧栏是可选能力：服务可能晚到，做 20 × 250ms 有界重试；失败只告警。
+        try {
+          ctx.effect(
+            function () {
+              var disposed = false;
+              var timer = null;
+              var attempts = 0;
+              var disposers = [];
+
+              function giveUp() {
+                console.warn(LOG_PREFIX + ' 右侧栏不可用：20 次重试内没有 sidebarRightTabs 服务，面板标签未注册');
+              }
+
+              function registerTabType() {
+                if (disposed) return;
+                var tabs;
+                try {
+                  tabs = typeof ctx.get === 'function' ? ctx.get('sidebarRightTabs') : undefined;
+                } catch (error) {
+                  tabs = undefined;
+                }
+                if (tabs === undefined || tabs === null || typeof tabs.register !== 'function') {
+                  attempts += 1;
+                  if (attempts >= SIDEBAR_RETRY_TRIES) {
+                    giveUp();
+                    return;
+                  }
+                  timer = window.setTimeout(registerTabType, SIDEBAR_RETRY_DELAY_MS);
+                  return;
+                }
+                try {
+                  var disposeType = tabs.register({
+                    id: TAB_ID,
+                    kind: TAB_KIND,
+                    // extension 是外部插件最高优先带：不与内置类型抢地址，但可以覆盖同名 kind
+                    priority: 'extension',
+                    title: function () {
+                      return t('tab.title');
+                    },
+                    guide: [
+                      {
+                        id: TAB_KIND,
+                        order: 300,
+                        title: function () {
+                          return t('tab.title');
+                        },
+                        description: function () {
+                          return t('tab.description');
+                        },
+                      },
+                    ],
+                  });
+                  if (typeof disposeType === 'function') disposers.push(disposeType);
+                } catch (error) {
+                  console.error(LOG_PREFIX + ' 标签类型注册失败（面板不可用，其余功能不受影响）：', error);
+                }
+                // 正文插槽：等 sidebar.right.pane.tab 被声明后注册，避免「打开标签却空白」。
+                try {
+                  ctx.slots.inject('sidebar.right.pane.tab', function* () {
+                    yield ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID, order: 100 }, Panel);
+                  });
+                } catch (error) {
+                  console.error(LOG_PREFIX + ' 面板正文插槽注册失败（已忽略）：', error);
+                }
+                // 服务是重试后才出现的：说明右侧栏比本插件晚就绪，主动打开一次让用户看见入口。
+                if (attempts > 0) openSidebarTab(TAB_KIND);
+              }
+
+              registerTabType();
+
+              return function () {
+                disposed = true;
+                if (timer !== null) window.clearTimeout(timer);
+                for (var i = 0; i < disposers.length; i++) {
+                  try {
+                    disposers[i]();
+                  } catch (error) {
+                    /* 注销失败不影响页面 */
+                  }
+                }
+              };
+            },
+            'dsh-low-integrity-check: sidebar panel tab',
+          );
+        } catch (error) {
+          console.error(LOG_PREFIX + ' 右侧栏注册抛出异常（已忽略，不影响页面）：', error);
+        }
+      }
+
+      module.exports = { name: name, inject: inject, apply: apply };
+      return module.exports;
+    };
+  }
+
+  // 浏览器模块入口：id 是插件身份，factory 返回 { name, inject, apply }。
+  try {
+    window.__ModuleLoader__.load({ id: TAB_ID, factory: makeFactory() });
+  } catch (error) {
+    console.error(LOG_PREFIX + ' 模块加载失败：', error);
+  }
+
+  //#endregion
+})();

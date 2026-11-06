@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Integrity check",
+    "description": "Check the current workspace for Low integrity labels in the right sidebar and restore them to Medium."
+  }
+}
