@@ -162,6 +162,7 @@ test('scan job lifecycle over HTTP: start, poll, items, export and log', async (
       body: JSON.stringify({ action: 'scan', sessionId: 'session-1' }),
     })
     assert.equal(start.json.ok, true)
+    assert.equal(start.json.depth, 'quick')
     const jobId = start.json.jobId
     assert.equal(typeof jobId, 'string')
 

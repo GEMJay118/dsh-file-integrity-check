@@ -130,27 +130,54 @@
 
     'intro.hint': '尚未扫描：先解析工作区，再开始扫描。',
 
+    'scan.depth.label': '深度扫描（逐文件清单）',
+    'scan.depth.hint': '关闭时使用快速扫描：只列出显式 Low 项，继承项聚合显示。',
+    'scan.depth.quick': '快速模式',
+    'scan.depth.deep': '深度模式',
+    'scan.engine.csharp': 'C# 引擎',
+    'scan.engine.powershell': 'PowerShell 引擎',
+
     'job.running': '正在{action}…',
-    'job.phase': '阶段：{phase}',
     'job.scanned': '已扫描 {scanned} / {total}',
     'job.hits': '命中 {count}',
     'job.elapsed': '耗时 {duration}',
-    'job.waiting': '正在等待宿主报告进度…',
+    'job.rate': '扫描速率',
+    'job.rateValue': '{rate} 项/秒',
+    'job.rateEmpty': '—',
+    'job.eta': '预计剩余',
+    'job.etaValue': '约 {duration}',
+    'job.etaCalculating': '计算中…',
+    'job.etaUnknown': '总项数未知',
     'job.cancelled': '任务已取消',
     'job.expired': '任务已失效，请重新检查',
+
+    'phase.starting': '准备中',
+    'phase.enumerate': '枚举目录',
+    'phase.read': '读取标签',
+    'phase.repair': '修复标签',
+    'phase.verify': '复扫验证',
+    'phase.other': '阶段：{phase}',
+    'phase.waiting': '等待进度…',
 
     'action.label.scan': '扫描',
     'action.label.repair': '清除',
 
     'scan.result.none': '未发现 Low 完整性标签',
-    'scan.result.found': '发现 {count} 个 Low 完整性对象',
-    'scan.result.counts': '显式 {explicit} · 继承 {inherited}',
+    'scan.result.aggregate': '发现 {count} 个 Low 对象（{explicit} 显式 / {inherited} 继承自父级）',
     'scan.result.meta': '扫描 {scanned} 项 · 耗时 {duration}',
     'scan.result.root': '根目录 {rootLabel}',
+    'scan.inherited.quick': '{count} 项继承 Low 由 {parents} 个已发现的显式父级目录导致；修复父级后可能自动恢复（快速模式不逐行列出）。',
+    'scan.inherited.quickPlain': '{count} 项继承 Low（继承自父级目录）；修复父级后可能自动恢复（快速模式不逐行列出）。',
+    'scan.inherited.deep': '{count} 项继承 Low 已包含在下方清单中。',
+    'scan.legacy': '该任务未记录扫描模式，按深度模式（全部命中）展示。',
+    'scan.truncated': '命中项过多，清单可能被截断（仅保留宿主上限内的条目）。',
     'scan.failed': '扫描失败',
     'scan.startFailed': '无法启动扫描：{message}',
 
     'hits.title': '命中清单',
+    'hits.badge.mode.quick': '仅显式项',
+    'hits.badge.mode.all': '全部命中',
+    'hits.quickNote': '另有 {count} 项继承 Low 未逐行列出（见上方聚合说明）。',
     'hits.empty': '没有命中项',
     'hits.shown': '已显示 {shown} / {total}',
     'hits.more': '还有 {count} 条未加载',
@@ -179,6 +206,7 @@
     'repair.startFailed': '无法启动清除：{message}',
 
     'artifact.export': '清单文件',
+    'artifact.report': '引擎报告',
     'artifact.log': '日志文件',
     'artifact.copy': '复制路径',
     'export.ok': '清单已导出',
@@ -254,27 +282,54 @@
 
     'intro.hint': 'Not scanned yet: resolve the workspace, then start a scan.',
 
+    'scan.depth.label': 'Deep scan (per-file list)',
+    'scan.depth.hint': 'When off, quick scan lists only explicit Low objects and aggregates inherited ones.',
+    'scan.depth.quick': 'Quick mode',
+    'scan.depth.deep': 'Deep mode',
+    'scan.engine.csharp': 'C# engine',
+    'scan.engine.powershell': 'PowerShell engine',
+
     'job.running': '{action} in progress…',
-    'job.phase': 'Phase: {phase}',
     'job.scanned': 'Scanned {scanned} / {total}',
     'job.hits': 'Hits {count}',
     'job.elapsed': 'Elapsed {duration}',
-    'job.waiting': 'Waiting for host progress…',
+    'job.rate': 'Scan rate',
+    'job.rateValue': '{rate} items/s',
+    'job.rateEmpty': '—',
+    'job.eta': 'ETA',
+    'job.etaValue': '~{duration}',
+    'job.etaCalculating': 'calculating…',
+    'job.etaUnknown': 'total unknown',
     'job.cancelled': 'Job cancelled',
     'job.expired': 'Job expired, please check again',
+
+    'phase.starting': 'Starting',
+    'phase.enumerate': 'Enumerating',
+    'phase.read': 'Reading labels',
+    'phase.repair': 'Repairing',
+    'phase.verify': 'Verifying',
+    'phase.other': 'Phase: {phase}',
+    'phase.waiting': 'Waiting for progress…',
 
     'action.label.scan': 'Scan',
     'action.label.repair': 'Clear',
 
     'scan.result.none': 'No Low integrity labels found',
-    'scan.result.found': 'Found {count} Low integrity objects',
-    'scan.result.counts': 'Explicit {explicit} · Inherited {inherited}',
+    'scan.result.aggregate': 'Found {count} Low objects ({explicit} explicit / {inherited} inherited from parents)',
     'scan.result.meta': 'Scanned {scanned} items · {duration}',
     'scan.result.root': 'Root {rootLabel}',
+    'scan.inherited.quick': '{count} inherited Low items come from {parents} discovered explicit parent directories; they may recover when the parents are cleared (quick mode does not list them).',
+    'scan.inherited.quickPlain': '{count} inherited Low items (inherited from parent directories); they may recover when the parents are cleared (quick mode does not list them).',
+    'scan.inherited.deep': '{count} inherited Low items are included in the list below.',
+    'scan.legacy': 'This job recorded no scan mode; it is shown as deep mode (all hits).',
+    'scan.truncated': 'Too many hits; the list may be truncated (only entries within the host limit are kept).',
     'scan.failed': 'Scan failed',
     'scan.startFailed': 'Cannot start scan: {message}',
 
     'hits.title': 'Hit list',
+    'hits.badge.mode.quick': 'Explicit only',
+    'hits.badge.mode.all': 'All hits',
+    'hits.quickNote': '{count} inherited Low items are not listed (see the aggregate above).',
     'hits.empty': 'No hits',
     'hits.shown': 'Showing {shown} / {total}',
     'hits.more': '{count} more not loaded',
@@ -303,6 +358,7 @@
     'repair.startFailed': 'Cannot start clear: {message}',
 
     'artifact.export': 'List file',
+    'artifact.report': 'Engine report',
     'artifact.log': 'Log file',
     'artifact.copy': 'Copy path',
     'export.ok': 'List exported',
@@ -388,6 +444,9 @@
     '.fi-hit-path{flex:1 1 auto;min-width:0;word-break:break-all;color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12);font-family:var(--dsw-font-markdown-code-font-family,monospace);}',
     '.fi-list{display:flex;flex-direction:column;gap:4px;flex:0 0 auto;max-height:30vh;overflow-y:auto;}',
     '.fi-failure{display:flex;flex-direction:column;gap:1px;padding:4px 6px;border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-interactive-bg-hover-danger);}',
+    '.fi-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-primary);}',
+    '.fi-toggle input{accent-color:var(--dsw-alias-state-business-primary);cursor:inherit;}',
+    '.fi-toggle.is-disabled{cursor:default;opacity:.6;}',
     '.fi-footer{display:flex;flex-direction:column;gap:2px;flex:0 0 auto;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2);}',
   ].join('\n');
 
@@ -606,6 +665,20 @@
   }
 
   /**
+   * 扫描速率 → 展示文本（不带单位，单位在文案里）。
+   *
+   * @param rate - 项/秒。
+   * @returns 形如 `12.3` / `128`。
+   */
+  function formatRate(rate) {
+    var value = typeof rate === 'number' && isFinite(rate) && rate > 0 ? rate : 0;
+    if (value === 0) return '0';
+    if (value >= 100) return String(Math.round(value));
+    if (value >= 10) return value.toFixed(1).replace(/\.0$/, '');
+    return value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  /**
    * 时间字段 → 毫秒时间戳（宿主可能给 number，也可能给 ISO 字符串）。
    *
    * @param value - 任意值。
@@ -806,6 +879,11 @@
       fixed: asNumber(raw.fixed),
       failedCount: asNumber(raw.failedCount),
       errorCount: asNumber(raw.errorCount),
+      // 扫描模式相关（旧任务/repair 任务可能缺失；展示时见 effectiveScanDepth / effectiveItemsScope）。
+      depth: raw.depth === 'quick' ? 'quick' : raw.depth === 'deep' ? 'deep' : '',
+      itemsScope: raw.itemsScope === 'explicit' ? 'explicit' : raw.itemsScope === 'all' ? 'all' : '',
+      engine: asString(raw.engine),
+      reportPath: asString(raw.reportPath),
       // 宿主当前 snapshot 未暴露复扫剩余数（只有引擎 result 内部用）；缺省用 -1 标记，
       // 面板用 hits - fixed - failedCount 兜底估算（见 remainingHitsOf）。
       remainingCount: typeof raw.remainingCount === 'number' && isFinite(raw.remainingCount) ? raw.remainingCount : -1,
@@ -818,6 +896,61 @@
       finishedAt: toTime(raw.finishedAt),
       message: asString(raw.message),
     };
+  }
+
+  /**
+   * 归一化后的扫描深度：旧任务缺 depth 时按 deep 展示（兼容契约），repair 任务返回 ''。
+   *
+   * @param job - 归一化后的 job（可为 null）。
+   * @returns 'quick' | 'deep' | ''。
+   */
+  function effectiveScanDepth(job) {
+    if (job === null || typeof job !== 'object' || job.action !== 'scan') return '';
+    return job.depth === 'quick' ? 'quick' : 'deep';
+  }
+
+  /**
+   * 归一化后的清单范围：缺 itemsScope 时按深度推断（quick→explicit，其余→all）。
+   *
+   * @param job - 归一化后的 job（可为 null）。
+   * @returns 'explicit' | 'all'。
+   */
+  function effectiveItemsScope(job) {
+    if (job === null || typeof job !== 'object') return 'all';
+    if (job.itemsScope === 'explicit' || job.itemsScope === 'all') return job.itemsScope;
+    return effectiveScanDepth(job) === 'quick' ? 'explicit' : 'all';
+  }
+
+  /**
+   * 按展示范围过滤命中项（quick 只列显式；deep 全部）。
+   *
+   * @param items - 归一化后的命中项。
+   * @param scope - 'explicit' | 'all'。
+   * @returns 过滤后的命中项。
+   */
+  function filterItemsByScope(items, scope) {
+    var list = Array.isArray(items) ? items : [];
+    if (scope !== 'explicit') return list;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].explicit === true) out.push(list[i]);
+    }
+    return out;
+  }
+
+  /**
+   * 已加载清单里的显式父级目录数（quick 模式下用于继承项聚合说明的估算）。
+   *
+   * @param items - 归一化后的命中项。
+   * @returns 非负整数。
+   */
+  function countExplicitDirs(items) {
+    var list = Array.isArray(items) ? items : [];
+    var count = 0;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].kind === 'dir' && list[i].explicit === true) count += 1;
+    }
+    return count;
   }
 
   /**
@@ -838,14 +971,20 @@
    *
    * @param action - 'scan' | 'repair'。
    * @param id - 宿主返回的 jobId。
+   * @param depth - 扫描请求的深度（'quick' | 'deep'，仅 scan 有效；repair 传 ''）。
    * @returns 稳定的 job 形状。
    */
-  function provisionalJob(action, id) {
+  function provisionalJob(action, id, depth) {
+    var scanDepth = action === 'scan' ? (depth === 'deep' ? 'deep' : 'quick') : '';
     return {
       id: id,
       action: action,
       status: 'running',
       phase: '',
+      depth: scanDepth,
+      itemsScope: action === 'scan' ? (scanDepth === 'quick' ? 'explicit' : 'all') : '',
+      engine: '',
+      reportPath: '',
       scanned: 0,
       total: 0,
       hits: 0,
@@ -877,20 +1016,23 @@
   function jobPatch(prev, job) {
     var patch = { job: job, jobId: job.id, jobLoading: false, now: Date.now() };
     if (job.action === 'scan') {
+      var scope = effectiveItemsScope(job);
+      // quick 模式的清单只列显式项，因此清单总数用 explicitCount；deep 用全部 hits。
+      var listTotal = scope === 'explicit' ? job.explicitCount : job.hits;
       if (job.status === 'running') {
         if (prev.itemsJobId !== job.id) {
-          patch.items = normalizeItems(job.items);
-          patch.itemsTotal = job.hits;
+          patch.items = filterItemsByScope(normalizeItems(job.items), scope);
+          patch.itemsTotal = listTotal;
           patch.itemsJobId = job.id;
           patch.itemsLoaded = true;
           patch.itemsError = null;
         } else {
-          patch.itemsTotal = job.hits;
+          patch.itemsTotal = listTotal;
         }
       } else {
         patch.scanJob = job;
-        patch.items = mergeItems(prev.itemsJobId === job.id ? prev.items : [], job.items);
-        patch.itemsTotal = job.hits;
+        patch.items = filterItemsByScope(mergeItems(prev.itemsJobId === job.id ? prev.items : [], job.items), scope);
+        patch.itemsTotal = listTotal;
         patch.itemsJobId = job.id;
         patch.itemsLoaded = true;
         patch.itemsError = null;
@@ -1477,7 +1619,58 @@
   }
 
   /**
-   * 运行中：阶段 / 已扫描 / 命中 / 耗时 + 进度条（取消按钮在动作行）。
+   * 阶段码 → 本地化阶段文案（枚举/读取/修复/验证各一句；未知阶段兜底显示原值）。
+   *
+   * @param t - locale 绑定函数。
+   * @param phase - 引擎给的阶段码（可能为空/未知）。
+   * @returns 可展示文案。
+   */
+  function phaseLabel(t, phase) {
+    var code = typeof phase === 'string' ? phase : '';
+    if (code === 'starting') return t('phase.starting');
+    if (code === 'enumerate') return t('phase.enumerate');
+    if (code === 'read') return t('phase.read');
+    if (code === 'repair') return t('phase.repair');
+    if (code === 'verify') return t('phase.verify');
+    if (code !== '') return t('phase.other', { phase: code });
+    return t('phase.waiting');
+  }
+
+  /**
+   * 扫描选项：深度模式开关（关闭=快速模式）。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 选项卡片。
+   */
+  function renderScanOptions(view) {
+    var h = view.h;
+    var t = view.t;
+    var state = view.state;
+    var actions = view.actions;
+    var flags = view.flags;
+    var disabled = flags.running || state.starting;
+    var inputProps = {
+      type: 'checkbox',
+      checked: state.deepScan === true,
+      disabled: disabled,
+      'aria-label': t('scan.depth.label'),
+      onChange: actions.toggleDeepScan,
+    };
+    return h(
+      'div',
+      { className: 'fi-card' },
+      h(
+        'label',
+        { className: 'fi-toggle' + (disabled ? ' is-disabled' : '') },
+        h('input', inputProps),
+        h('span', null, t('scan.depth.label')),
+      ),
+      h('div', { className: 'fi-muted' }, t('scan.depth.hint')),
+    );
+  }
+
+  /**
+   * 运行中：阶段 / 已扫描 / 命中 / 速率 / ETA / 耗时 + 进度条（取消按钮在动作行）。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 运行卡片或 null。
@@ -1491,7 +1684,14 @@
     var job = state.job;
     var actionLabel = job.action === 'repair' ? t('action.label.repair') : t('action.label.scan');
     var done = job.action === 'repair' ? job.fixed + job.failedCount : job.scanned;
-    var percent = job.total > 0 ? Math.max(0, Math.min(100, Math.round((done / job.total) * 100))) : 0;
+    var hasTotal = job.total > 0;
+    var percent = hasTotal ? Math.max(0, Math.min(100, Math.round((done / job.total) * 100))) : 0;
+    var rate = flags.rate;
+    var rateText = rate > 0 ? t('job.rateValue', { rate: formatRate(rate) }) : t('job.rateEmpty');
+    var etaText;
+    if (!hasTotal) etaText = t('job.etaUnknown');
+    else if (rate > 0) etaText = t('job.etaValue', { duration: formatDuration(flags.eta) });
+    else etaText = t('job.etaCalculating');
     var children = [];
     children.push(
       h(
@@ -1502,25 +1702,39 @@
         h('span', { className: 'fi-muted' }, t('job.elapsed', { duration: formatDuration(flags.elapsed) })),
       ),
     );
-    children.push(
-      job.phase !== ''
-        ? h('div', { className: 'fi-muted', key: 'phase' }, t('job.phase', { phase: job.phase }))
-        : h('div', { className: 'fi-muted', key: 'phase' }, t('job.waiting')),
-    );
+    children.push(h('div', { className: 'fi-muted', key: 'phase' }, phaseLabel(t, job.phase)));
     children.push(
       h(
         'div',
         { className: 'fi-kv', key: 'scanned' },
-        h('span', null, t('job.scanned', { scanned: job.scanned, total: job.total > 0 ? job.total : '?' })),
+        h('span', null, t('job.scanned', { scanned: job.scanned, total: hasTotal ? job.total : '?' })),
         h('span', { className: 'fi-kv-value' }, t('job.hits', { count: job.hits })),
       ),
     );
-    children.push(h('div', { className: 'fi-progress-track', key: 'progress' }, h('div', { className: 'fi-progress-fill', style: { width: percent + '%' } })));
+    children.push(
+      h(
+        'div',
+        { className: 'fi-kv', key: 'rate' },
+        h('span', null, t('job.rate')),
+        h('span', { className: 'fi-kv-value' }, rateText),
+      ),
+    );
+    children.push(
+      h(
+        'div',
+        { className: 'fi-kv', key: 'eta' },
+        h('span', null, t('job.eta')),
+        h('span', { className: 'fi-kv-value' }, etaText),
+      ),
+    );
+    if (hasTotal) {
+      children.push(h('div', { className: 'fi-progress-track', key: 'progress' }, h('div', { className: 'fi-progress-fill', style: { width: percent + '%' } })));
+    }
     return h('div', { className: 'fi-card' }, children);
   }
 
   /**
-   * 扫描结果：两态（未发现 Low / 发现 N 个）+ explicit/inherited 计数 + 扫描元信息。
+   * 扫描结果：两态 + 聚合计数（N 个 Low：X 显式 / Y 继承）+ 模式/引擎角标 + 继承项聚合说明。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 结果卡片或 null。
@@ -1533,19 +1747,48 @@
     var flags = view.flags;
     var scanJob = flags.scanJob;
     if (scanJob === null) return null;
+    var depth = effectiveScanDepth(scanJob);
+    var engineLabel =
+      scanJob.engine === 'csharp'
+        ? t('scan.engine.csharp')
+        : scanJob.engine === 'powershell'
+          ? t('scan.engine.powershell')
+          : '';
     var children = [];
     if (scanJob.status === 'succeeded') {
+      var badges = [h('span', { className: 'fi-badge', key: 'mode' }, depth === 'quick' ? t('scan.depth.quick') : t('scan.depth.deep'))];
+      if (engineLabel !== '') badges.push(h('span', { className: 'fi-badge', key: 'engine' }, engineLabel));
+      children.push(h('div', { className: 'fi-badges', key: 'badges' }, badges));
       if (scanJob.hits === 0) {
         children.push(banner(h, { tone: 'success', title: t('scan.result.none'), key: 'title' }));
       } else {
         children.push(
           banner(h, {
             tone: 'warn',
-            title: t('scan.result.found', { count: scanJob.hits }),
-            text: t('scan.result.counts', { explicit: scanJob.explicitCount, inherited: scanJob.inheritedCount }),
+            title: t('scan.result.aggregate', {
+              count: scanJob.hits,
+              explicit: scanJob.explicitCount,
+              inherited: scanJob.inheritedCount,
+            }),
             key: 'title',
           }),
         );
+      }
+      if (scanJob.inheritedCount > 0) {
+        var parents = countExplicitDirs(scanJob.items);
+        var inheritedNote =
+          depth === 'quick'
+            ? parents > 0
+              ? t('scan.inherited.quick', { count: scanJob.inheritedCount, parents: parents })
+              : t('scan.inherited.quickPlain', { count: scanJob.inheritedCount })
+            : t('scan.inherited.deep', { count: scanJob.inheritedCount });
+        children.push(h('div', { className: 'fi-muted', key: 'inherited' }, inheritedNote));
+      }
+      if (scanJob.depth === '') {
+        children.push(h('div', { className: 'fi-muted', key: 'legacy' }, t('scan.legacy')));
+      }
+      if (scanJob.truncated) {
+        children.push(h('div', { className: 'fi-warn-text', key: 'truncated' }, t('scan.truncated')));
       }
       if (scanJob.scanned > 0 || scanJob.finishedAt > 0) {
         children.push(
@@ -1667,7 +1910,7 @@
   }
 
   /**
-   * 命中清单：首屏 200 条 + 「加载更多」分页。
+   * 命中清单：quick 只列显式项（继承项聚合说明）、deep 列全部；首屏 200 + 分页。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 清单卡片或 null。
@@ -1679,22 +1922,34 @@
     var actions = view.actions;
     var flags = view.flags;
     if (!flags.showHits) return null;
-    var total = state.itemsTotal;
-    var items = state.items;
+    var scope = flags.listScope;
+    // 展示范围再兜一层：即使 Host 给了全部 items，quick 也绝不逐行渲染继承项。
+    var items = filterItemsByScope(state.items, scope);
+    var total = flags.listTotal > 0 ? flags.listTotal : state.itemsTotal;
     var children = [];
     children.push(
       h(
         'div',
         { className: 'fi-row', key: 'head' },
         h('span', { className: 'fi-label' }, t('hits.title')),
+        h(
+          'span',
+          { className: 'fi-badges' },
+          h('span', { className: 'fi-badge', key: 'scope' }, scope === 'explicit' ? t('hits.badge.mode.quick') : t('hits.badge.mode.all')),
+        ),
         h('span', { className: 'fi-spacer' }),
         h('span', { className: 'fi-muted' }, t('hits.shown', { shown: items.length, total: total })),
       ),
     );
+    if (scope === 'explicit' && flags.inheritedRemaining > 0) {
+      children.push(h('div', { className: 'fi-muted', key: 'quick-note' }, t('hits.quickNote', { count: flags.inheritedRemaining })));
+    }
     if (items.length > 0) {
-      children.push(h('div', { className: 'fi-hits', key: 'list' }, items.map(function (item, index) {
-        return hitRow(h, t, actions, item, index);
-      })));
+      children.push(
+        h('div', { className: 'fi-hits', key: 'list' }, items.map(function (item, index) {
+          return hitRow(h, t, actions, item, index);
+        })),
+      );
     } else {
       children.push(h('div', { className: 'fi-muted', key: 'empty' }, t('hits.empty')));
     }
@@ -1767,6 +2022,12 @@
     var actions = view.actions;
     var rows = [];
     if (state.exportPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.export'), state.exportPath, 'export'));
+    // 引擎直写报告（task-4 起 Host 在 reportPath 存在时原样返回）：未导出时也可提前展示。
+    var reportJob = state.scanJob !== null ? state.scanJob : state.job !== null && state.job.action === 'scan' ? state.job : null;
+    var reportPath = reportJob !== null ? reportJob.reportPath : '';
+    if (reportPath !== '' && reportPath !== state.exportPath) {
+      rows.push(artifactRow(h, t, actions, t('artifact.report'), reportPath, 'report'));
+    }
     if (state.logPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.log'), state.logPath, 'log'));
     if (rows.length === 0) return null;
     return h('div', { className: 'fi-card' }, rows);
@@ -1852,6 +2113,7 @@
       renderWorkspace(view),
       renderBanners(view),
       renderIntro(view),
+      renderScanOptions(view),
       renderActions(view),
       renderConfirm(view),
       renderJobLoading(view),
@@ -1934,6 +2196,58 @@
       var sessionIdRef = React.useRef(sessionId);
       sessionIdRef.current = sessionId;
 
+      /**
+       * 运行中进度采样：给速率/ETA 用。
+       * 结构 { jobId, phase, samples:[{t,s}], rate, eta }；只在轮询回调里更新（不参与 hook 依赖）。
+       */
+      var progressRef = React.useRef({ jobId: '', phase: '', samples: [], rate: 0, eta: 0 });
+
+      /**
+       * 重置进度采样。
+       *
+       * @param jobId - 新任务 id；空串表示当前没有在跟踪的任务。
+       */
+      function resetProgress(jobId) {
+        progressRef.current = { jobId: typeof jobId === 'string' ? jobId : '', phase: '', samples: [], rate: 0, eta: 0 };
+      }
+
+      /**
+       * 记录一次任务进度：按当前阶段收集样本，估算速率与 ETA。
+       * 阶段切换、任务切换都会清空样本，避免跨阶段混算。
+       *
+       * @param job - 归一化后的 task 快照。
+       */
+      function observeProgress(job) {
+        if (job === null || typeof job !== 'object') return;
+        var now = Date.now();
+        if (progressRef.current.jobId !== job.id) resetProgress(job.id);
+        var ref = progressRef.current;
+        if (ref.phase !== job.phase) {
+          ref.phase = job.phase;
+          ref.samples = [];
+          ref.rate = 0;
+          ref.eta = 0;
+        }
+        var scanned = Math.max(0, job.scanned);
+        var samples = ref.samples;
+        var last = samples.length > 0 ? samples[samples.length - 1] : null;
+        if (last === null || now - last.t >= 150) {
+          samples.push({ t: now, s: scanned });
+          while (samples.length > 8) samples.shift();
+          while (samples.length > 2 && now - samples[0].t > 6000) samples.shift();
+        } else {
+          last.t = now;
+          last.s = scanned;
+        }
+        var first = samples[0];
+        var tail = samples[samples.length - 1];
+        var dt = tail.t - first.t;
+        var ds = tail.s - first.s;
+        ref.rate = dt > 0 && ds > 0 ? ds / (dt / 1000) : 0;
+        if (job.total > 0 && ref.rate > 0.01) ref.eta = (Math.max(0, job.total - scanned) / ref.rate) * 1000;
+        else ref.eta = 0;
+      }
+
       React.useEffect(function () {
         mountedRef.current = true;
         return function () {
@@ -1957,11 +2271,24 @@
         });
       }
 
+      /** 切换下一次扫描的深度模式（快速 ↔ 深度）。 */
+      function toggleDeepScan(event) {
+        var checked = event !== null && typeof event === 'object' && event.target !== null && typeof event.target === 'object'
+          ? event.target.checked === true
+          : state.deepScan !== true;
+        setState(function (prev) {
+          return Object.assign({}, prev, { deepScan: checked });
+        });
+      }
+
       /** 发一次任务请求（扫描/清除共用）：成功后写入任务并交给轮询。 */
       function startJob(action) {
         if (sessionId === '' || state.starting) return;
         if (state.job !== null && state.job.status === 'running') return;
         var mySession = sessionId;
+        var scanDepth = state.deepScan === true ? 'deep' : 'quick';
+        var requestBody = action === 'scan' ? { action: 'scan', sessionId: mySession, depth: scanDepth } : { action: 'repair', sessionId: mySession };
+        resetProgress('');
         setState(function (prev) {
           return Object.assign({}, prev, {
             starting: true,
@@ -1973,7 +2300,7 @@
             logError: null,
           });
         });
-        requestJson({ path: '/jobs', method: 'POST', body: { action: action, sessionId: mySession } }).then(function (res) {
+        requestJson({ path: '/jobs', method: 'POST', body: requestBody }).then(function (res) {
           if (!isCurrent(mySession)) return;
           if (!res.ok) {
             setState(function (prev) {
@@ -1996,7 +2323,7 @@
             var patch = {
               starting: false,
               jobId: jobId,
-              job: provisionalJob(action, jobId),
+              job: provisionalJob(action, jobId, scanDepth),
               pollError: null,
               actionError: null,
               now: Date.now(),
@@ -2181,6 +2508,7 @@
           setState(function () {
             return initialPanelState();
           });
+          resetProgress('');
 
           if (sessionId === '') {
             setState(function (prev) {
@@ -2233,8 +2561,12 @@
                 });
                 return;
               }
+              observeProgress(restored);
+              var restorePatch = { jobLoading: false };
+              // 恢复到的扫描任务是什么模式，开关就回显什么模式（下一次重扫沿用它）。
+              if (restored.action === 'scan') restorePatch.deepScan = effectiveScanDepth(restored) === 'deep';
               setState(function (prev) {
-                return Object.assign({}, prev, { jobLoading: false }, jobPatch(prev, restored));
+                return Object.assign({}, prev, restorePatch, jobPatch(prev, restored));
               });
             });
           }
@@ -2327,6 +2659,7 @@
                   });
                   return;
                 }
+                observeProgress(job);
                 setState(function (prev) {
                   return Object.assign({}, prev, jobPatch(prev, job), { pollError: null });
                 });
@@ -2388,6 +2721,11 @@
       var showRepair = scanJob !== null && scanJob.hits > 0;
       var canRepair = showRepair && writable && !engineRestricted && !running && !state.starting;
       var showHits = state.itemsTotal > 0 || state.items.length > 0;
+      // 清单范围：优先看最近一次扫描结果的 depth/itemsScope；没有扫描结果时按 all 处理。
+      var listJob = scanJob !== null ? scanJob : job !== null && job.action === 'scan' ? job : null;
+      var listScope = listJob !== null ? effectiveItemsScope(listJob) : 'all';
+      var inheritedRemaining = listScope === 'explicit' && scanJob !== null ? scanJob.inheritedCount : 0;
+      var progress = progressRef.current;
       var elapsed = 0;
       if (job !== null) {
         var startAt = job.startedAt;
@@ -2414,10 +2752,17 @@
         showHits: showHits,
         confirmHits: scanJob !== null ? scanJob.hits : state.itemsTotal,
         elapsed: elapsed,
+        deepScan: state.deepScan === true,
+        listScope: listScope,
+        listTotal: state.itemsTotal,
+        inheritedRemaining: inheritedRemaining,
+        rate: running ? progress.rate : 0,
+        eta: running ? progress.eta : 0,
       };
       var actions = {
         copy: copyValue,
         retryLoad: retryLoad,
+        toggleDeepScan: toggleDeepScan,
         startScan: function () {
           startJob('scan');
         },
@@ -2481,6 +2826,7 @@
       cancelling: false,
       actionError: null,
       notice: '',
+      deepScan: false,
       now: 0,
     };
   }

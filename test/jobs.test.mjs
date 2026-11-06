@@ -241,6 +241,25 @@ test('successful repair reports success and snapshot paths', async () => {
   manager.dispose()
 })
 
+test('scan depth defaults to quick and persists deep when requested', async () => {
+  const manager = makeManager(
+    fakeEngine([
+      { type: 'result', mode: 'scan', scanned: 1, hits: 0, explicitCount: 0, inheritedCount: 0, rootLabel: 'Medium' },
+    ]),
+  )
+  const quickStart = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(manager.get(quickStart.jobId).depth, 'quick')
+  assert.equal(manager.get(quickStart.jobId).itemsScope, 'explicit')
+  await waitTerminal(manager, quickStart.jobId)
+
+  const deepStart = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1', depth: 'deep' })
+  assert.equal(manager.get(deepStart.jobId).depth, 'deep')
+  assert.equal(manager.get(deepStart.jobId).itemsScope, 'all')
+  const job = await waitTerminal(manager, deepStart.jobId)
+  assert.equal(manager.snapshot(job).depth, 'deep')
+  manager.dispose()
+})
+
 test('unknown job ids are reported as job-not-found', () => {
   const manager = makeManager(fakeEngine([]))
   assert.equal(manager.get('missing'), undefined)

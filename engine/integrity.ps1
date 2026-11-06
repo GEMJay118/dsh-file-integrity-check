@@ -10,7 +10,11 @@
              stream a "hit" line for every object whose label is Low. Reparse points
              (junctions / symlinks) are never followed. -SkipDirs entries are skipped
              entirely (neither reported nor traversed). Unreadable objects produce an
-             "error" line and do not abort the scan.
+             "error" line and do not abort the scan. When the scan finishes, the full
+             hit report is written to <DataDir>\reports\scan-<timestamp>.json and
+             result.reportPath points at it (the Host can export that file directly).
+             -ScanDepth quick (default) uses the embedded C# scanner; deep keeps the
+             legacy PowerShell traversal.
     Repair - scan first (streaming hit lines), snapshot every hit into
              <DataDir>\snapshots\snapshot-*.json plus a restore-*.ps1 script, then repair:
                1. explicit-Low directories (shallowest first), icacls "(OI)(CI)Medium"
@@ -18,14 +22,17 @@
                3. rescan; any object still Low is repaired individually as a fallback
              The repair does not assume that inherited-Low children recover when their
              parent is repaired: the rescan step repairs every remaining object.
-             When a label write is denied because the object DACL does not grant
-             WRITE_OWNER (typical for objects created by a sandboxed/AppContainer
-             process), the engine grants WRITE_OWNER to the current user temporarily,
-             retries the label write, removes the grant again and verifies that the
-             DACL is restored byte-for-byte. This fallback only runs when the current
-             user owns the object; otherwise the object is reported as failed with
-             guidance. Non-hit objects are never modified. A final verification pass
-             over the original hit set produces the "failed" / "remaining" result fields.
+             Fast path: each object is repaired in-process with SetNamedSecurityInfoW
+             (no icacls process). When that is denied because the object DACL does not
+             grant WRITE_OWNER (typical for objects created by a sandboxed/AppContainer
+             process), the engine saves the DACL, inserts a temporary WRITE_OWNER allow
+             ACE for the current owner, sets the label, restores the original DACL and
+             verifies the restored DACL byte-for-byte - all in-process, no icacls spawn.
+             This only runs when the current user owns the object. If the in-process
+             paths fail, the legacy icacls based fallback runs to produce a readable
+             error. Non-hit objects are never modified. A final verification pass over
+             the original hit set produces the "failed" / "remaining" result fields.
+             result.methods reports icacls / pinvoke / grant / native counts.
              The restore-*.ps1 script restores EVERY snapshot hit explicitly as Low
              (inherited entries become explicit Low) and uses the same temporary-grant
              fallback when the DACL denies the label write.
@@ -59,12 +66,27 @@
 .PARAMETER SkipDirs
   Directory names skipped entirely during traversal. Default: node_modules, .git.
 
+.PARAMETER ScanDepth
+  Scan implementation / output depth for -Mode Scan. Default: quick.
+    quick - embedded C# scanner (single process, FindFirstFileExW + per-object
+            GetNamedSecurityInfoW/ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            label parsed in C#). Streams "hit" lines only for EXPLICIT Low objects
+            (inherited Low objects are counted, not emitted). result carries
+            depth:"quick", engine:"csharp", scanMs.
+    deep  - legacy PowerShell traversal; streams every Low hit and behaves exactly
+            like previous engine versions. result carries depth:"deep",
+            engine:"powershell".
+  -Mode Env and -Mode Repair are unaffected by this switch (Repair keeps the deep
+  PowerShell traversal so the snapshot/repair logic stays unchanged).
+
 .PARAMETER IcaclsPath
   icacls executable (test seam). Default: icacls.exe resolved from PATH/System32.
 
 .PARAMETER DataDir
-  Base directory for Repair snapshots. Default: <temp>\dsh-file-integrity-check.
-  Snapshots and restore scripts are written to <DataDir>\snapshots\.
+  Engine data directory. Repair writes snapshots and restore scripts to
+  <DataDir>\snapshots\; Scan writes its complete hit report to <DataDir>\reports\
+  as scan-<timestamp>.json (result.reportPath). Default:
+  <temp>\dsh-file-integrity-check.
 
 .PARAMETER Json
   Accepted for Host compatibility; output is always JSON Lines.
@@ -82,6 +104,9 @@ param(
 
     [string[]]$SkipDirs = @('node_modules', '.git'),
 
+    [ValidateSet('quick', 'deep')]
+    [string]$ScanDepth = 'quick',
+
     [string]$IcaclsPath = 'icacls.exe',
 
     [string]$DataDir,
@@ -94,6 +119,7 @@ $ErrorActionPreference = 'Stop'
 $script:EngineVersion = '0.1.0'
 $script:MaxScannedItems = 1000000
 $script:MaxErrorsInResult = 1000
+$script:MaxReportItems = 50000
 $script:CurrentUserSidCache = $null
 
 # ---------------------------------------------------------------------------
@@ -358,6 +384,77 @@ namespace DshIntegrity
             }
         }
 
+        public static string GetLabelLevel(string path, out int errorCode)
+        {
+            string sddl = GetLabelSddl(path, out errorCode);
+            if (sddl == null) return null;
+            return ParseLabelLevelSddl(sddl);
+        }
+
+        private static string ParseLabelLevelSddl(string sddl)
+        {
+            if (sddl == null || sddl.Length == 0) return "None";
+            string explicitLevel = null;
+            string inheritedLevel = null;
+            int index = 0;
+            while (index < sddl.Length)
+            {
+                int open = sddl.IndexOf('(', index);
+                if (open < 0) break;
+                int close = sddl.IndexOf(')', open + 1);
+                if (close < 0) break;
+                string ace = sddl.Substring(open + 1, close - open - 1);
+                if (ace.StartsWith("ML;", StringComparison.Ordinal))
+                {
+                    string[] parts = ace.Split(';');
+                    if (parts.Length >= 6)
+                    {
+                        bool inherited = (parts[1].IndexOf("ID", StringComparison.Ordinal) >= 0);
+                        string level = LevelFromSidName(parts[5]);
+                        if (inherited)
+                        {
+                            if (inheritedLevel == null) inheritedLevel = level;
+                        }
+                        else
+                        {
+                            if (explicitLevel == null) explicitLevel = level;
+                        }
+                    }
+                }
+                index = close + 1;
+            }
+            if (explicitLevel != null) return explicitLevel;
+            if (inheritedLevel != null) return inheritedLevel;
+            return "None";
+        }
+
+        private static string LevelFromSidName(string sid)
+        {
+            if (sid == null) return "None";
+            if (sid == "LW") return "Low";
+            if (sid == "ME") return "Medium";
+            if (sid == "HI") return "High";
+            if (sid == "SI") return "System";
+            if (sid.StartsWith("S-1-16-", StringComparison.Ordinal))
+            {
+                int rid = 0;
+                if (int.TryParse(sid.Substring(7), out rid))
+                {
+                    switch (rid)
+                    {
+                        case 0: return "Untrusted";
+                        case 4096: return "Low";
+                        case 8192: return "Medium";
+                        case 12288: return "High";
+                        case 16384: return "System";
+                        case 20480: return "Protected";
+                        default: return "S-1-16-" + rid.ToString();
+                    }
+                }
+            }
+            return sid;
+        }
+
         public static int SetLabel(string path, string sddl)
         {
             IntPtr securityDescriptor;
@@ -405,13 +502,278 @@ namespace DshIntegrity
             }
         }
 
+        // ------------------------------------------------------------------
+        // Fast repair path: in-process SetNamedSecurityInfoW(LABEL) and, when
+        // the object DACL does not grant WRITE_OWNER, an in-process temporary
+        // DACL grant that is reverted and verified before returning.
+        // ------------------------------------------------------------------
+        private const uint DaclSecurityInformation = 0x00000004;
+        private const uint ProtectedDaclSecurityInformation = 0x80000000;
+        private const uint WriteOwnerAccess = 0x00080000;
+        private const int GrantAccess = 1;
+        private const int TrusteeFormIsSid = 0;
+        private const int TrusteeTypeIsUser = 1;
+        private const uint NoInheritance = 0;
+        private const ushort SeDaclProtected = 0x1000;
+
+        private static IntPtr mediumFileSacl = IntPtr.Zero;
+        private static IntPtr mediumDirectorySacl = IntPtr.Zero;
+        private static IntPtr mediumFileSecurityDescriptor = IntPtr.Zero;
+        private static IntPtr mediumDirectorySecurityDescriptor = IntPtr.Zero;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct TRUSTEE
+        {
+            public IntPtr pMultipleTrustee;
+            public int MultipleTrusteeOperation;
+            public int TrusteeForm;
+            public int TrusteeType;
+            public IntPtr ptstrName;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct EXPLICIT_ACCESS
+        {
+            public uint grfAccessPermissions;
+            public int grfAccessMode;
+            public uint grfInheritance;
+            public TRUSTEE Trustee;
+        }
+
+        [DllImport("advapi32.dll", EntryPoint = "GetNamedSecurityInfoW", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetNamedSecurityInfoWithDaclW(
+            string pObjectName,
+            int ObjectType,
+            uint SecurityInfo,
+            IntPtr ppsidOwner,
+            IntPtr ppsidGroup,
+            out IntPtr ppDacl,
+            IntPtr ppSacl,
+            out IntPtr ppSecurityDescriptor);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetSecurityDescriptorDacl(
+            IntPtr pSecurityDescriptor,
+            out bool lpbDaclPresent,
+            out IntPtr pDacl,
+            out bool lpbDaclDefaulted);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetSecurityDescriptorControl(
+            IntPtr pSecurityDescriptor,
+            out ushort pControl,
+            out uint lpdwRevision);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ConvertStringSidToSidW(string StringSid, out IntPtr Sid);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint SetEntriesInAclW(
+            int cCountOfExplicitEntries,
+            ref EXPLICIT_ACCESS pListOfExplicitEntries,
+            IntPtr OldAcl,
+            out IntPtr NewAcl);
+
+        public sealed class GrantSetResult
+        {
+            public int LabelCode;
+            public int GrantCode;
+            public int RestoreCode;
+            public int DaclErrorCode;
+            public int DaclAfterErrorCode;
+            public bool DaclRestored;
+            public string DaclBefore;
+            public string DaclAfter;
+            public string Message;
+        }
+
+        private static IntPtr GetMediumSacl(bool isDirectory)
+        {
+            if (isDirectory)
+            {
+                if (mediumDirectorySacl == IntPtr.Zero)
+                {
+                    BuildMediumSecurityDescriptor(true, out mediumDirectorySecurityDescriptor, out mediumDirectorySacl);
+                }
+                return mediumDirectorySacl;
+            }
+            if (mediumFileSacl == IntPtr.Zero)
+            {
+                BuildMediumSecurityDescriptor(false, out mediumFileSecurityDescriptor, out mediumFileSacl);
+            }
+            return mediumFileSacl;
+        }
+
+        private static void BuildMediumSecurityDescriptor(bool isDirectory, out IntPtr securityDescriptor, out IntPtr sacl)
+        {
+            securityDescriptor = IntPtr.Zero;
+            sacl = IntPtr.Zero;
+            string sddl = isDirectory ? "S:(ML;OICI;NW;;;ME)" : "S:(ML;;NW;;;ME)";
+            IntPtr built;
+            uint size;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SddlRevision1, out built, out size))
+            {
+                return;
+            }
+            bool present;
+            IntPtr acl;
+            bool defaulted;
+            if (!GetSecurityDescriptorSacl(built, out present, out acl, out defaulted) || !present || acl == IntPtr.Zero)
+            {
+                LocalFree(built);
+                return;
+            }
+            securityDescriptor = built;
+            sacl = acl;
+        }
+
+        public static int SetLabelToMedium(string path, bool isDirectory)
+        {
+            IntPtr sacl = GetMediumSacl(isDirectory);
+            if (sacl == IntPtr.Zero)
+            {
+                return 87; // ERROR_INVALID_PARAMETER
+            }
+            uint result = SetNamedSecurityInfoW(
+                path,
+                SeFileObject,
+                LabelSecurityInformation,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                sacl);
+            if (result != 0)
+            {
+                return unchecked((int)result);
+            }
+            return 0;
+        }
+
+        public static GrantSetResult SetLabelToMediumWithTemporaryGrant(string path, bool isDirectory, string userSid)
+        {
+            GrantSetResult result = new GrantSetResult();
+            result.LabelCode = -1;
+            result.GrantCode = -1;
+            result.RestoreCode = -1;
+            result.DaclBefore = GetDaclSddl(path, out result.DaclErrorCode);
+
+            IntPtr securityDescriptor = IntPtr.Zero;
+            IntPtr sid = IntPtr.Zero;
+            IntPtr newAcl = IntPtr.Zero;
+            bool daclPresent = false;
+            IntPtr originalDacl = IntPtr.Zero;
+            bool daclDefaulted = false;
+            ushort control = 0;
+            uint revision = 0;
+            bool grantApplied = false;
+
+            try
+            {
+                uint getResult = GetNamedSecurityInfoWithDaclW(
+                    path,
+                    SeFileObject,
+                    DaclSecurityInformation,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out originalDacl,
+                    IntPtr.Zero,
+                    out securityDescriptor);
+                if (getResult != 0)
+                {
+                    result.Message = "GetNamedSecurityInfoW(DACL) failed: Win32 " + getResult.ToString();
+                    return result;
+                }
+                if (!GetSecurityDescriptorDacl(securityDescriptor, out daclPresent, out originalDacl, out daclDefaulted))
+                {
+                    result.Message = "GetSecurityDescriptorDacl failed: Win32 " + Marshal.GetLastWin32Error().ToString();
+                    return result;
+                }
+                GetSecurityDescriptorControl(securityDescriptor, out control, out revision);
+                bool daclProtected = ((control & SeDaclProtected) != 0);
+
+                if (!ConvertStringSidToSidW(userSid, out sid))
+                {
+                    result.Message = "ConvertStringSidToSidW failed: Win32 " + Marshal.GetLastWin32Error().ToString();
+                    return result;
+                }
+
+                EXPLICIT_ACCESS explicitAccess = new EXPLICIT_ACCESS();
+                explicitAccess.grfAccessPermissions = WriteOwnerAccess;
+                explicitAccess.grfAccessMode = GrantAccess;
+                explicitAccess.grfInheritance = NoInheritance;
+                explicitAccess.Trustee.pMultipleTrustee = IntPtr.Zero;
+                explicitAccess.Trustee.MultipleTrusteeOperation = 0;
+                explicitAccess.Trustee.TrusteeForm = TrusteeFormIsSid;
+                explicitAccess.Trustee.TrusteeType = TrusteeTypeIsUser;
+                explicitAccess.Trustee.ptstrName = sid;
+
+                uint aclResult = SetEntriesInAclW(1, ref explicitAccess, daclPresent ? originalDacl : IntPtr.Zero, out newAcl);
+                if (aclResult != 0)
+                {
+                    result.GrantCode = unchecked((int)aclResult);
+                    result.Message = "SetEntriesInAclW failed: Win32 " + aclResult.ToString();
+                    return result;
+                }
+
+                uint securityInformation = DaclSecurityInformation | ProtectedDaclSecurityInformation;
+                uint grantResult = SetNamedSecurityInfoW(
+                    path,
+                    SeFileObject,
+                    securityInformation,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    newAcl,
+                    IntPtr.Zero);
+                result.GrantCode = unchecked((int)grantResult);
+                if (grantResult != 0)
+                {
+                    result.Message = "applying temporary DACL grant failed: Win32 " + grantResult.ToString();
+                    return result;
+                }
+                grantApplied = true;
+                result.LabelCode = SetLabelToMedium(path, isDirectory);
+            }
+            finally
+            {
+                if (grantApplied)
+                {
+                    uint restoreInformation = DaclSecurityInformation;
+                    if ((control & SeDaclProtected) != 0) restoreInformation = restoreInformation | ProtectedDaclSecurityInformation;
+                    IntPtr restoreDacl = daclPresent ? originalDacl : IntPtr.Zero;
+                    uint restoreResult = SetNamedSecurityInfoW(
+                        path,
+                        SeFileObject,
+                        restoreInformation,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        restoreDacl,
+                        IntPtr.Zero);
+                    result.RestoreCode = unchecked((int)restoreResult);
+                    result.DaclAfter = GetDaclSddl(path, out result.DaclAfterErrorCode);
+                    result.DaclRestored = (restoreResult == 0) &&
+                        (result.DaclBefore != null) &&
+                        (result.DaclAfter != null) &&
+                        string.Equals(result.DaclBefore, result.DaclAfter, StringComparison.Ordinal);
+                }
+                else
+                {
+                    // The grant was never applied, so the DACL cannot have changed.
+                    result.DaclAfter = result.DaclBefore;
+                    result.DaclRestored = true;
+                }
+                if (newAcl != IntPtr.Zero) LocalFree(newAcl);
+                if (sid != IntPtr.Zero) LocalFree(sid);
+                if (securityDescriptor != IntPtr.Zero) LocalFree(securityDescriptor);
+            }
+            return result;
+        }
+
         public static string GetTokenIntegritySid()
         {
             IntPtr token;
             if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out token))
             {
-                return null;
-            }
+                return null;            }
             try
             {
                 int length = 0;
@@ -452,6 +814,429 @@ namespace DshIntegrity
 
 if (-not ([System.Management.Automation.PSTypeName]'DshIntegrity.Native').Type) {
     Add-Type -TypeDefinition $script:NativeTypeCode -Language CSharp -ErrorAction Stop | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# Embedded C# quick scanner (-ScanDepth quick).
+# Enumerates with FindFirstFileExW, reads the mandatory label per object with
+# GetNamedSecurityInfoW + ConvertSecurityDescriptorToStringSecurityDescriptorW,
+# parses the ML ACE (LW/ME/HI/SI + ID inherited flag) directly in C# and only
+# returns the EXPLICIT Low hits. Compiled lazily so Env / Repair / deep scans do
+# not pay the Add-Type cost.
+# ---------------------------------------------------------------------------
+$script:QuickScannerTypeCode = @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+namespace DshIntegrity
+{
+    public sealed class QuickScanHit
+    {
+        public string Path;
+        public string Kind;
+        public bool Explicit;
+        public bool Inherited;
+        public string Sddl;
+    }
+
+    public sealed class QuickScanError
+    {
+        public string Path;
+        public string Message;
+    }
+
+    public sealed class QuickScanResult
+    {
+        public int Scanned;
+        public int Hits;
+        public int ExplicitCount;
+        public int InheritedCount;
+        public string RootLabel;
+        public bool Truncated;
+        public long ScanMs;
+        public List<QuickScanHit> ExplicitHits = new List<QuickScanHit>();
+        public List<QuickScanError> Errors = new List<QuickScanError>();
+    }
+
+    public static class QuickScanner
+    {
+        private const int SeFileObject = 1;
+        private const uint LabelSecurityInformation = 0x00000010;
+        private const uint SddlRevision1 = 1;
+
+        private const int MaxExplicitHits = 5000;
+        private const int MaxErrors = 500;
+        private const int ProgressItemStep = 2000;
+        private const int ProgressMillisecondStep = 250;
+
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WIN32_FIND_DATA
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationTimeLow;
+            public uint ftCreationTimeHigh;
+            public uint ftLastAccessTimeLow;
+            public uint ftLastAccessTimeHigh;
+            public uint ftLastWriteTimeLow;
+            public uint ftLastWriteTimeHigh;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint dwReserved0;
+            public uint dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+            public string cAlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstFileExW(
+            string lpFileName,
+            int fInfoLevelId,
+            out WIN32_FIND_DATA lpFindFileData,
+            int fSearchOp,
+            IntPtr lpSearchFilter,
+            int dwAdditionalFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATA lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FindClose(IntPtr hFindFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileAttributesW(string lpFileName);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetNamedSecurityInfoW(
+            string pObjectName,
+            int ObjectType,
+            uint SecurityInfo,
+            IntPtr ppsidOwner,
+            IntPtr ppsidGroup,
+            IntPtr ppDacl,
+            IntPtr ppSacl,
+            out IntPtr ppSecurityDescriptor);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            IntPtr pSecurityDescriptor,
+            uint SDRevision,
+            uint SecurityInformation,
+            out IntPtr StringSecurityDescriptor,
+            out uint StringSecurityDescriptorLen);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+
+        public static QuickScanResult Scan(string rootPath, string[] skipDirNames, Action<int, int, int> progress)
+        {
+            QuickScanResult result = new QuickScanResult();
+            result.RootLabel = "Unknown";
+
+            HashSet<string> skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (skipDirNames != null)
+            {
+                for (int index = 0; index < skipDirNames.Length; index++)
+                {
+                    string skipName = skipDirNames[index];
+                    if (skipName == null) continue;
+                    skipName = skipName.Trim();
+                    if (skipName.Length > 0) skip.Add(skipName);
+                }
+            }
+
+            Stopwatch watch = Stopwatch.StartNew();
+            string rootWin32 = ToWin32Path(rootPath);
+            uint rootAttributes = GetFileAttributesW(rootWin32);
+            bool rootIsDirectory = ((rootAttributes & FileAttributeDirectory) != 0);
+            bool rootIsReparse = ((rootAttributes & FileAttributeReparsePoint) != 0);
+
+            ProcessItem(result, rootWin32, NormalizeForOutput(rootWin32), rootIsDirectory, true);
+            if (result.RootLabel == null) result.RootLabel = "Unknown";
+
+            Stack<string> directories = new Stack<string>();
+            if (rootIsDirectory && !rootIsReparse) directories.Push(rootWin32);
+
+            int lastProgressScanned = 0;
+            long lastProgressMilliseconds = 0;
+
+            while (directories.Count > 0)
+            {
+                string directory = directories.Pop();
+                bool directoryHasTrailingBackslash = directory.EndsWith("\\", StringComparison.Ordinal);
+                string pattern = directoryHasTrailingBackslash ? directory + "*" : directory + "\\*";
+                WIN32_FIND_DATA findData;
+                // fInfoLevelId 1 = FindExInfoBasic (skips short-name lookup);
+                // dwAdditionalFlags 2 = FIND_FIRST_EX_LARGE_FETCH (faster large dirs).
+                IntPtr findHandle = FindFirstFileExW(pattern, 1, out findData, 0, IntPtr.Zero, 2);
+                if (findHandle == new IntPtr(-1))
+                {
+                    int enumerationError = Marshal.GetLastWin32Error();
+                    AddError(result, NormalizeForOutput(directory), "enumerate failed: " + DescribeWin32(enumerationError));
+                }
+                else
+                {
+                    try
+                    {
+                        bool hasMore = true;
+                        while (hasMore)
+                        {
+                            string fileName = findData.cFileName;
+                            if (fileName != null && fileName.Length > 0 && fileName != "." && fileName != "..")
+                            {
+                                bool isDirectory = ((findData.dwFileAttributes & FileAttributeDirectory) != 0);
+                                bool isReparse = ((findData.dwFileAttributes & FileAttributeReparsePoint) != 0);
+                                bool skipThis = (isDirectory && skip.Contains(fileName));
+                                if (!skipThis)
+                                {
+                                    string childWin32 = directoryHasTrailingBackslash ? directory + fileName : directory + "\\" + fileName;
+                                    ProcessItem(result, childWin32, NormalizeForOutput(childWin32), isDirectory, false);
+                                    if (isDirectory && !isReparse) directories.Push(childWin32);
+                                }
+                            }
+                            hasMore = FindNextFileW(findHandle, out findData);
+                        }
+                    }
+                    finally
+                    {
+                        FindClose(findHandle);
+                    }
+                }
+
+                long elapsed = watch.ElapsedMilliseconds;
+                if (progress != null && ((result.Scanned - lastProgressScanned) >= ProgressItemStep || (elapsed - lastProgressMilliseconds) >= ProgressMillisecondStep))
+                {
+                    progress(result.Scanned, result.Hits, result.Errors.Count);
+                    lastProgressScanned = result.Scanned;
+                    lastProgressMilliseconds = elapsed;
+                }
+            }
+
+            watch.Stop();
+            result.ScanMs = watch.ElapsedMilliseconds;
+            return result;
+        }
+
+        private static void ProcessItem(QuickScanResult result, string win32Path, string outputPath, bool isDirectory, bool isRoot)
+        {
+            int errorCode = 0;
+            string sddl = GetLabelSddl(win32Path, out errorCode);
+            if (sddl == null)
+            {
+                result.Scanned = result.Scanned + 1;
+                AddError(result, outputPath, DescribeWin32(errorCode));
+                if (isRoot) result.RootLabel = "Unknown";
+                return;
+            }
+            bool explicitLabel = false;
+            bool inheritedLabel = false;
+            string level = ParseLabelSddl(sddl, out explicitLabel, out inheritedLabel);
+            if (isRoot) result.RootLabel = level;
+            result.Scanned = result.Scanned + 1;
+            if (level != "Low") return;
+            result.Hits = result.Hits + 1;
+            if (explicitLabel) result.ExplicitCount = result.ExplicitCount + 1;
+            else result.InheritedCount = result.InheritedCount + 1;
+            if (!explicitLabel) return;
+            if (result.ExplicitHits.Count < MaxExplicitHits)
+            {
+                QuickScanHit hit = new QuickScanHit();
+                hit.Path = outputPath;
+                hit.Kind = isDirectory ? "dir" : "file";
+                hit.Explicit = true;
+                hit.Inherited = false;
+                hit.Sddl = sddl;
+                result.ExplicitHits.Add(hit);
+            }
+            else
+            {
+                result.Truncated = true;
+            }
+        }
+
+        private static string GetLabelSddl(string path, out int errorCode)
+        {
+            errorCode = 0;
+            IntPtr securityDescriptor;
+            uint callResult = GetNamedSecurityInfoW(
+                path,
+                SeFileObject,
+                LabelSecurityInformation,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                out securityDescriptor);
+            if (callResult != 0)
+            {
+                errorCode = unchecked((int)callResult);
+                return null;
+            }
+            try
+            {
+                IntPtr text;
+                uint textLength;
+                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        securityDescriptor,
+                        SddlRevision1,
+                        LabelSecurityInformation,
+                        out text,
+                        out textLength))
+                {
+                    errorCode = Marshal.GetLastWin32Error();
+                    return null;
+                }
+                try
+                {
+                    return Marshal.PtrToStringUni(text);
+                }
+                finally
+                {
+                    LocalFree(text);
+                }
+            }
+            finally
+            {
+                LocalFree(securityDescriptor);
+            }
+        }
+
+        private static string ParseLabelSddl(string sddl, out bool explicitLabel, out bool inheritedLabel)
+        {
+            explicitLabel = false;
+            inheritedLabel = false;
+            if (sddl == null || sddl.Length == 0) return "None";
+            string explicitLevel = null;
+            string inheritedLevel = null;
+            int index = 0;
+            while (index < sddl.Length)
+            {
+                int open = sddl.IndexOf('(', index);
+                if (open < 0) break;
+                int close = sddl.IndexOf(')', open + 1);
+                if (close < 0) break;
+                string ace = sddl.Substring(open + 1, close - open - 1);
+                if (ace.StartsWith("ML;", StringComparison.Ordinal))
+                {
+                    string[] parts = ace.Split(';');
+                    if (parts.Length >= 6)
+                    {
+                        string aceFlags = parts[1];
+                        string aceSid = parts[5];
+                        bool inheritedAce = (aceFlags.IndexOf("ID", StringComparison.Ordinal) >= 0);
+                        string level = LevelFromSid(aceSid);
+                        if (inheritedAce)
+                        {
+                            if (inheritedLevel == null) inheritedLevel = level;
+                        }
+                        else
+                        {
+                            if (explicitLevel == null) explicitLevel = level;
+                        }
+                    }
+                }
+                index = close + 1;
+            }
+            if (explicitLevel != null)
+            {
+                explicitLabel = true;
+                inheritedLabel = false;
+                return explicitLevel;
+            }
+            if (inheritedLevel != null)
+            {
+                inheritedLabel = true;
+                return inheritedLevel;
+            }
+            return "None";
+        }
+
+        private static string LevelFromSid(string sid)
+        {
+            if (sid == null) return "None";
+            if (sid == "LW") return "Low";
+            if (sid == "ME") return "Medium";
+            if (sid == "HI") return "High";
+            if (sid == "SI") return "System";
+            if (sid.StartsWith("S-1-16-", StringComparison.Ordinal))
+            {
+                int rid = 0;
+                if (int.TryParse(sid.Substring(7), out rid))
+                {
+                    switch (rid)
+                    {
+                        case 0: return "Untrusted";
+                        case 4096: return "Low";
+                        case 8192: return "Medium";
+                        case 12288: return "High";
+                        case 16384: return "System";
+                        case 20480: return "Protected";
+                        default: return "S-1-16-" + rid.ToString();
+                    }
+                }
+            }
+            return sid;
+        }
+
+        private static void AddError(QuickScanResult result, string path, string message)
+        {
+            if (result.Errors.Count < MaxErrors)
+            {
+                QuickScanError item = new QuickScanError();
+                item.Path = path;
+                item.Message = message;
+                result.Errors.Add(item);
+            }
+            else
+            {
+                result.Truncated = true;
+            }
+        }
+
+        private static string DescribeWin32(int errorCode)
+        {
+            try
+            {
+                string text = new Win32Exception(errorCode).Message;
+                return text + " (Win32 " + errorCode.ToString() + ")";
+            }
+            catch
+            {
+                return "Win32 " + errorCode.ToString();
+            }
+        }
+
+        private static string ToWin32Path(string path)
+        {
+            if (path == null) return path;
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) return path;
+            if (path.StartsWith(@"\\", StringComparison.Ordinal)) return @"\\?\UNC\" + path.Substring(2);
+            if (path.Length == 3 && path[1] == ':' && path[2] == '\\') return path;
+            return @"\\?\" + path;
+        }
+
+        private static string NormalizeForOutput(string win32Path)
+        {
+            if (win32Path == null) return null;
+            if (win32Path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) return @"\\" + win32Path.Substring(8);
+            if (win32Path.StartsWith(@"\\?\", StringComparison.Ordinal)) return win32Path.Substring(4);
+            return win32Path;
+        }
+    }
+}
+'@
+
+function Ensure-QuickScannerType {
+    if (-not ([System.Management.Automation.PSTypeName]'DshIntegrity.QuickScanner').Type) {
+        Add-Type -TypeDefinition $script:QuickScannerTypeCode -Language CSharp -ErrorAction Stop | Out-Null
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -738,6 +1523,22 @@ function Get-IntegrityLabelInfo {
     return (ConvertFrom-LabelSddl -Sddl $sddl)
 }
 
+function Get-LabelLevelFast {
+    param([string]$Win32Path)
+    $errorCode = 0
+    $level = $null
+    try {
+        $level = [DshIntegrity.Native]::GetLabelLevel($Win32Path, [ref]$errorCode)
+    } catch {
+        return @{ ok = $false; level = 'Unknown'; errorCode = -1; message = $_.Exception.Message }
+    }
+    if ($errorCode -ne 0) {
+        return @{ ok = $false; level = 'Unknown'; errorCode = $errorCode; message = (Get-Win32Message $errorCode) }
+    }
+    if ($null -eq $level) { $level = 'Unknown' }
+    return @{ ok = $true; level = [string]$level; errorCode = 0; message = '' }
+}
+
 # ---------------------------------------------------------------------------
 # Owner / DACL helpers (needed for the temporary-WRITE_OWNER repair fallback).
 # ---------------------------------------------------------------------------
@@ -914,57 +1715,99 @@ function Set-IntegrityLevelOnPath {
         [string]$Kind,
         [string]$TargetLevel
     )
+    $isDirectory = ($Kind -eq 'dir')
+
+    # Fast path 1: in-process SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION).
+    # No icacls process is spawned for the common case.
+    $nativeSetCode = -1
+    try {
+        if ($TargetLevel -eq 'Medium') {
+            $nativeSetCode = [DshIntegrity.Native]::SetLabelToMedium($Win32Path, $isDirectory)
+        } else {
+            $sddlLevel = ConvertTo-SddlLevelAbbreviation $TargetLevel
+            if ($isDirectory) {
+                $sddl = 'S:(ML;OICI;NW;;;' + $sddlLevel + ')'
+            } else {
+                $sddl = 'S:(ML;;NW;;;' + $sddlLevel + ')'
+            }
+            $nativeSetCode = [DshIntegrity.Native]::SetLabel($Win32Path, $sddl)
+        }
+    } catch {
+        $nativeSetCode = -1
+    }
+    if ($nativeSetCode -eq 0) {
+        return @{ ok = $true; method = 'native'; output = ''; message = ''; icaclsExitCode = 0 }
+    }
+
+    # Fast path 2: Access denied -> in-process temporary WRITE_OWNER DACL grant.
+    # The DACL is saved, the grant/restore happens via SetNamedSecurityInfoW and the
+    # restored DACL is compared byte-for-byte with the original SDDL.
+    $grantDiagnostics = $null
+    $failureMessage = 'in-process SetNamedSecurityInfoW failed: Win32 ' + $nativeSetCode + ' (' + (Get-Win32Message $nativeSetCode) + ')'
+    if ($TargetLevel -eq 'Medium' -and $nativeSetCode -eq 5) {
+        $ownerInfo = Get-IntegrityObjectOwnerSid -Win32Path $Win32Path
+        $currentSid = Get-CurrentUserSid
+        $guidance = 'guidance: run the repair as the object owner or with administrator rights'
+        if (-not $ownerInfo.ok) {
+            $failureMessage = 'access denied (Win32 5); the object owner could not be read (' + $ownerInfo.message + '); ' + $guidance
+        } elseif ([string]::IsNullOrEmpty($currentSid)) {
+            $failureMessage = 'access denied (Win32 5); the current user SID is unknown; ' + $guidance
+        } elseif (-not ([string]$ownerInfo.sid).Equals($currentSid, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $failureMessage = 'access denied (Win32 5); object owner ' + [string]$ownerInfo.sid + ' is not the current user ' + $currentSid + '; ' + $guidance
+        } else {
+            try {
+                $grantDiagnostics = [DshIntegrity.Native]::SetLabelToMediumWithTemporaryGrant($Win32Path, $isDirectory, $currentSid)
+            } catch {
+                $grantDiagnostics = $null
+                $failureMessage = 'access denied (Win32 5); in-process temporary grant threw: ' + $_.Exception.Message + '; ' + $guidance
+            }
+            if ($null -ne $grantDiagnostics) {
+                if ($grantDiagnostics.LabelCode -eq 0 -and $grantDiagnostics.DaclRestored) {
+                    return @{
+                        ok     = $true
+                        method = 'grant'
+                        output = ''
+                        message = 'access denied; in-process temporary WRITE_OWNER grant used and DACL restored'
+                        icaclsExitCode = 0
+                    }
+                }
+                $failureMessage = 'access denied (Win32 5); in-process temporary grant failed'
+                if ($grantDiagnostics.Message) {
+                    $failureMessage = $failureMessage + ': ' + [string]$grantDiagnostics.Message
+                }
+                if (-not $grantDiagnostics.DaclRestored) {
+                    $failureMessage = $failureMessage + '; the DACL was not restored byte-for-byte (before=' + [string]$grantDiagnostics.DaclBefore + ' after=' + [string]$grantDiagnostics.DaclAfter + '); guidance: inspect and restore the ACL manually'
+                } else {
+                    $failureMessage = $failureMessage + '; ' + $guidance
+                }
+            }
+        }
+    }
+
+    # Legacy fallback: icacls. Only reached for unusual/non-Medium failures; it is
+    # also what produces the human readable error text in the failed log.
     $levelSpecification = $TargetLevel
-    if ($Kind -eq 'dir') { $levelSpecification = '(OI)(CI)' + $TargetLevel }
-
+    if ($isDirectory) { $levelSpecification = '(OI)(CI)' + $TargetLevel }
     $toolPath = Get-IcaclsToolPath -NormalPath $NormalPath -Win32Path $Win32Path
-
     $arguments = (Quote-ProcessArgument $toolPath) + ' /setintegritylevel ' + (Quote-ProcessArgument $levelSpecification)
     $call = Invoke-IcaclsProcess -Executable $script:IcaclsExecutable -ArgumentString $arguments
     if ($call.exitCode -eq 0) {
         return @{ ok = $true; method = 'icacls'; output = $call.output; message = ''; icaclsExitCode = 0 }
     }
 
-    # icacls failed: try the API directly (needed for paths icacls rejects, harmless otherwise).
-    $nativeResult = -1
-    $fallbackMessage = ''
-    try {
-        $sddlLevel = ConvertTo-SddlLevelAbbreviation $TargetLevel
-        if ($Kind -eq 'dir') {
-            $sddl = 'S:(ML;OICI;NW;;;' + $sddlLevel + ')'
-        } else {
-            $sddl = 'S:(ML;;NW;;;' + $sddlLevel + ')'
-        }
-        $nativeResult = [DshIntegrity.Native]::SetLabel($Win32Path, $sddl)
-        if ($nativeResult -eq 0) {
-            return @{
-                ok            = $true
-                method        = 'pinvoke'
-                output        = $call.output
-                message       = 'icacls failed; P/Invoke SetNamedSecurityInfoW succeeded'
-                icaclsExitCode = $call.exitCode
-            }
-        }
-        $fallbackMessage = 'P/Invoke SetNamedSecurityInfoW failed: Win32 ' + $nativeResult + ' (' + (Get-Win32Message $nativeResult) + ')'
-    } catch {
-        $fallbackMessage = 'P/Invoke fallback threw: ' + $_.Exception.Message
+    $combinedOutput = $call.output
+    if ($call.exitCode -eq 5) {
+        $legacyGrant = Set-IntegrityLevelWithOwnerGrant -NormalPath $NormalPath -Win32Path $Win32Path -Kind $Kind -TargetLevel $TargetLevel -OriginalOutput $call.output
+        if ($legacyGrant.ok) { return $legacyGrant }
+        if ($legacyGrant.message) { $failureMessage = $failureMessage + '; ' + [string]$legacyGrant.message }
+        $combinedOutput = [string]$legacyGrant.output
     }
 
-    # Both direct attempts were denied. When the current user owns the object but its
-    # DACL does not grant WRITE_OWNER (typical for objects created by a sandboxed /
-    # AppContainer process), grant WRITE_OWNER temporarily, set the label, then remove
-    # the grant again and verify that the DACL is byte-for-byte restored.
-    $accessDenied = (($call.exitCode -eq 5) -or ($nativeResult -eq 5))
-    if ($accessDenied) {
-        return (Set-IntegrityLevelWithOwnerGrant -NormalPath $NormalPath -Win32Path $Win32Path -Kind $Kind -TargetLevel $TargetLevel -OriginalOutput $call.output)
-    }
-
-    $message = 'icacls exit ' + $call.exitCode + '; ' + $fallbackMessage
     return @{
-        ok            = $false
-        method        = 'icacls+pinvoke'
-        output        = $call.output
-        message       = $message
+        ok             = $false
+        method         = 'native+icacls'
+        output         = $combinedOutput
+        message        = $failureMessage
         icaclsExitCode = $call.exitCode
     }
 }
@@ -1103,7 +1946,7 @@ function Set-IntegrityLevelWithOwnerGrant {
 
 function Repair-SingleObject {
     param([hashtable]$Hit, [string]$TargetLevel)
-    $before = Get-IntegrityLabelInfo -Win32Path $Hit.win32Path
+    $before = Get-LabelLevelFast -Win32Path $Hit.win32Path
     if ($before.ok -and $before.level -ne 'Low') {
         return @{ status = 'already' }
     }
@@ -1111,7 +1954,7 @@ function Repair-SingleObject {
     if (-not $before.ok) { $preReadMessage = 'pre-read failed: ' + $before.message }
 
     $setResult = Set-IntegrityLevelOnPath -NormalPath $Hit.path -Win32Path $Hit.win32Path -Kind $Hit.kind -TargetLevel $TargetLevel
-    $after = Get-IntegrityLabelInfo -Win32Path $Hit.win32Path
+    $after = Get-LabelLevelFast -Win32Path $Hit.win32Path
     if ($after.ok -and $after.level -eq $TargetLevel) {
         return @{ status = 'fixed'; method = $setResult.method; output = $setResult.output }
     }
@@ -1145,7 +1988,8 @@ function Invoke-Traversal {
         [bool]$StreamHits,
         [System.Collections.ArrayList]$HitCollector,
         [string]$ProgressPhase,
-        [string[]]$ExcludePaths = @()
+        [string[]]$ExcludePaths = @(),
+        [int]$MaxCollectCount = 0
     )
     $skipLookup = @{}
     foreach ($name in @($SkipDirNames)) {
@@ -1241,7 +2085,11 @@ function Invoke-Traversal {
                     depth     = (Get-PathDepth $currentNormal)
                 }
                 if ($StreamHits) { Write-HitEvent -Hit $hit }
-                if ($null -ne $HitCollector) { [void]$HitCollector.Add($hit) }
+                if ($null -ne $HitCollector) {
+                    if ($MaxCollectCount -le 0 -or $HitCollector.Count -lt $MaxCollectCount) {
+                        [void]$HitCollector.Add($hit)
+                    }
+                }
             }
         } else {
             [void]$errors.Add(@{ path = $currentNormal; message = $label.message })
@@ -1318,6 +2166,116 @@ function ConvertTo-ResultErrors {
 }
 
 # ---------------------------------------------------------------------------
+# Scan report writer: a complete machine readable result file written directly by
+# the engine, so the Host can export it without re-serializing its in-memory items.
+# ---------------------------------------------------------------------------
+function Resolve-DataDirectory {
+    $dataDirectory = $DataDir
+    if ([string]::IsNullOrEmpty($dataDirectory)) {
+        $dataDirectory = Join-Path ([System.IO.Path]::GetTempPath()) 'dsh-file-integrity-check'
+    }
+    try {
+        $dataDirectory = [System.IO.Path]::GetFullPath($dataDirectory)
+    } catch { }
+    return $dataDirectory
+}
+
+function Get-RelativeReportPath {
+    param([string]$RootNormal, [string]$ItemNormal)
+    if ([string]::IsNullOrEmpty($RootNormal) -or [string]::IsNullOrEmpty($ItemNormal)) { return $ItemNormal }
+    $rootText = $RootNormal.TrimEnd('\')
+    if ($rootText.Length -eq 0) { return $ItemNormal }
+    $rootLower = $rootText.ToLowerInvariant()
+    $itemLower = $ItemNormal.ToLowerInvariant()
+    if ($itemLower -eq $rootLower) { return '.' }
+    if ($itemLower.StartsWith($rootLower + '\')) { return $ItemNormal.Substring($rootText.Length + 1) }
+    return $ItemNormal
+}
+
+function Write-ScanReport {
+    param(
+        [string]$Depth,
+        [string]$EngineName,
+        [string]$RootPath,
+        [string]$RootLabel,
+        [int]$Scanned,
+        [int]$Hits,
+        [int]$ExplicitCount,
+        [int]$InheritedCount,
+        [bool]$Truncated,
+        $Items,
+        $ErrorList,
+        [long]$ScanMs
+    )
+    $reportPath = $null
+    try {
+        $dataDirectory = Resolve-DataDirectory
+        $reportDirectory = Join-Path $dataDirectory 'reports'
+        if (-not [System.IO.Directory]::Exists($reportDirectory)) {
+            [System.IO.Directory]::CreateDirectory($reportDirectory) | Out-Null
+        }
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+        $reportPath = Join-Path $reportDirectory ('scan-' + $stamp + '.json')
+
+        $reportItems = New-Object System.Collections.ArrayList
+        $itemCount = 0
+        if ($null -ne $Items) {
+            foreach ($item in $Items) {
+                $itemPath = [string]$item.path
+                [void]$reportItems.Add([ordered]@{
+                        path         = $itemPath
+                        relativePath = (Get-RelativeReportPath -RootNormal $RootPath -ItemNormal $itemPath)
+                        kind         = [string]$item.kind
+                        explicit     = [bool]$item.explicit
+                        label        = 'Low'
+                        sddl         = [string]$item.sddl
+                    })
+                $itemCount = $itemCount + 1
+            }
+        }
+        $expectedItemCount = $Hits
+        if ($Depth -eq 'quick') { $expectedItemCount = $ExplicitCount }
+        $itemsTruncated = ([bool]$Truncated) -or ($expectedItemCount -gt $itemCount)
+        $itemsScope = 'all'
+        $note = 'deep scan: every Low object is listed in items'
+        if ($Depth -eq 'quick') {
+            $itemsScope = 'explicit'
+            $note = 'quick scan: inherited Low objects are counted (inheritedCount) but not listed in items'
+        }
+        $document = [ordered]@{
+            version        = $script:EngineVersion
+            createdAt      = (Get-Date).ToString('o')
+            mode           = 'scan'
+            depth          = $Depth
+            engine         = $EngineName
+            root           = $RootPath
+            rootLabel      = $RootLabel
+            scanned        = $Scanned
+            hits           = $Hits
+            explicitCount  = $ExplicitCount
+            inheritedCount = $InheritedCount
+            truncated      = [bool]$itemsTruncated
+            scanMs         = $ScanMs
+            itemsScope     = $itemsScope
+            note           = $note
+            items          = $reportItems
+            errors         = $ErrorList
+        }
+        Write-TextFileNoBom -Path $reportPath -Text (ConvertTo-JsonValue $document)
+        return $reportPath
+    } catch {
+        $message = $_.Exception.Message
+        $message = $message -replace "`r?`n", ' '
+        Write-Event -Fields ([ordered]@{
+                type    = 'error'
+                path    = [string]$reportPath
+                message = ('scan report write failed: ' + $message)
+            })
+        return $null
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Modes.
 # ---------------------------------------------------------------------------
 function Invoke-EnvMode {
@@ -1362,18 +2320,32 @@ function Test-RootArgument {
 }
 
 function Invoke-ScanMode {
+    if ($ScanDepth -eq 'quick') {
+        return (Invoke-QuickScanMode)
+    }
+    return (Invoke-DeepScanMode)
+}
+
+function Invoke-DeepScanMode {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $rootCheck = Test-RootArgument
     if (-not $rootCheck.ok) { return 3 }
 
-    $scan = Invoke-Traversal -RootNormal $rootCheck.rootNormal -SkipDirNames $script:SkipDirList -StreamHits $true -HitCollector $null -ProgressPhase 'enumerate'
+    # Collect all hits for the report file (capped at MaxReportItems to bound memory;
+    # the report then carries truncated=true).
+    $deepHits = New-Object System.Collections.ArrayList
+    $scan = Invoke-Traversal -RootNormal $rootCheck.rootNormal -SkipDirNames $script:SkipDirList -StreamHits $true -HitCollector $deepHits -ProgressPhase 'enumerate' -MaxCollectCount $script:MaxReportItems
 
     $convertedErrors = ConvertTo-ResultErrors -ErrorList $scan.errors
     $truncated = ([bool]$scan.truncated) -or ([bool]$convertedErrors.truncated)
 
+    $reportPath = Write-ScanReport -Depth 'deep' -EngineName 'powershell' -RootPath $rootCheck.rootNormal -RootLabel $scan.rootLabel -Scanned ([int]$scan.scanned) -Hits ([int]$scan.hits) -ExplicitCount ([int]$scan.explicitCount) -InheritedCount ([int]$scan.inheritedCount) -Truncated ([bool]$truncated) -Items $deepHits -ErrorList $convertedErrors.list -ScanMs ([long]$stopwatch.ElapsedMilliseconds)
+
     Write-Event -Fields ([ordered]@{
             type           = 'result'
             mode           = 'scan'
+            depth          = 'deep'
+            engine         = 'powershell'
             root           = $rootCheck.rootNormal
             rootLabel      = $scan.rootLabel
             scanned        = $scan.scanned
@@ -1382,11 +2354,82 @@ function Invoke-ScanMode {
             inheritedCount = $scan.inheritedCount
             errors         = $convertedErrors.list
             truncated      = [bool]$truncated
+            reportPath     = $reportPath
             engineVersion  = $script:EngineVersion
             durationMs     = [int]$stopwatch.ElapsedMilliseconds
         })
 
     if ($scan.hits -gt 0) { return 2 }
+    return 0
+}
+
+function Invoke-QuickScanMode {
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $rootCheck = Test-RootArgument
+    if (-not $rootCheck.ok) { return 3 }
+
+    try {
+        Ensure-QuickScannerType
+    } catch {
+        Write-Fatal -Code 'scanner-init-failed' -Message ('Could not compile the embedded C# quick scanner: ' + $_.Exception.Message)
+        return 3
+    }
+
+    # The C# scanner calls this delegate every ~2000 items or ~250 ms; each call
+    # becomes one progress JSON line (throttled native-side, so the callback cost
+    # is negligible).
+    $progressCallback = [System.Action[int, int, int]] {
+        param($scanned, $hitCount, $errorCount)
+        Write-ProgressEvent -Phase 'enumerate' -Scanned $scanned -Total $null -Hits $hitCount
+    }
+
+    try {
+        $scan = [DshIntegrity.QuickScanner]::Scan($rootCheck.rootNormal, $script:SkipDirList, $progressCallback)
+    } catch {
+        Write-Fatal -Code 'scan-failed' -Message $_.Exception.Message
+        return 3
+    }
+
+    # quick depth: only explicit Low objects are streamed as hit lines.
+    foreach ($hit in $scan.ExplicitHits) {
+        Write-Event -Fields ([ordered]@{
+                type      = 'hit'
+                path      = [string]$hit.Path
+                kind      = [string]$hit.Kind
+                explicit  = $true
+                label     = 'Low'
+                inherited = $false
+                sddl      = [string]$hit.Sddl
+            })
+    }
+
+    Write-ProgressEvent -Phase 'enumerate' -Scanned ([int]$scan.Scanned) -Total $null -Hits ([int]$scan.Hits)
+
+    $convertedErrors = ConvertTo-ResultErrors -ErrorList $scan.Errors
+    $truncated = ([bool]$scan.Truncated) -or ([bool]$convertedErrors.truncated)
+
+    $reportPath = Write-ScanReport -Depth 'quick' -EngineName 'csharp' -RootPath $rootCheck.rootNormal -RootLabel ([string]$scan.RootLabel) -Scanned ([int]$scan.Scanned) -Hits ([int]$scan.Hits) -ExplicitCount ([int]$scan.ExplicitCount) -InheritedCount ([int]$scan.InheritedCount) -Truncated ([bool]$truncated) -Items $scan.ExplicitHits -ErrorList $convertedErrors.list -ScanMs ([long]$scan.ScanMs)
+
+    Write-Event -Fields ([ordered]@{
+            type           = 'result'
+            mode           = 'scan'
+            depth          = 'quick'
+            engine         = 'csharp'
+            root           = $rootCheck.rootNormal
+            rootLabel      = [string]$scan.RootLabel
+            scanned        = [int]$scan.Scanned
+            hits           = [int]$scan.Hits
+            explicitCount  = [int]$scan.ExplicitCount
+            inheritedCount = [int]$scan.InheritedCount
+            errors         = $convertedErrors.list
+            truncated      = [bool]$truncated
+            scanMs         = [long]$scan.ScanMs
+            reportPath     = $reportPath
+            engineVersion  = $script:EngineVersion
+            durationMs     = [int]$stopwatch.ElapsedMilliseconds
+        })
+
+    if ([int]$scan.Hits -gt 0) { return 2 }
     return 0
 }
 
@@ -1609,7 +2652,7 @@ function Invoke-RepairMode {
     $attemptRecords = @{}
     $fixedCount = 0
     $processedCount = 0
-    $methods = @{ icacls = 0; pinvoke = 0; grant = 0 }
+    $methods = @{ icacls = 0; pinvoke = 0; grant = 0; native = 0 }
 
     $recordFailureEvent = {
         param($hit, $message, $output)
@@ -1670,7 +2713,7 @@ function Invoke-RepairMode {
     foreach ($hit in $hits) {
         $verifiedCount = $verifiedCount + 1
         $key = $hit.path.ToLowerInvariant()
-        $info = Get-IntegrityLabelInfo -Win32Path $hit.win32Path
+        $info = Get-LabelLevelFast -Win32Path $hit.win32Path
         if (-not $info.ok) {
             $verifyFailures = $verifyFailures + 1
             $finalProblems[$key] = @{ state = 'verify-failed'; message = ('verification failed: ' + $info.message) }
@@ -1723,7 +2766,7 @@ function Invoke-RepairMode {
             fixed          = $fixedCount
             failed         = $failed
             remaining      = $remainingCount
-            methods        = ([ordered]@{ icacls = $methods['icacls']; pinvoke = $methods['pinvoke']; grant = $methods['grant'] })
+            methods        = ([ordered]@{ icacls = $methods['icacls']; pinvoke = $methods['pinvoke']; grant = $methods['grant']; native = $methods['native'] })
             snapshotPath   = $snapshotPath
             restorePath    = $restorePath
             engineVersion  = $script:EngineVersion

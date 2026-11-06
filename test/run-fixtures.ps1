@@ -15,13 +15,25 @@
       * label writes available -> FULL suite:
           clean/, low-inherited/, low-explicit-file/, low-dir-explicit/, junction/,
           node_modules/, >260 char nested path, Chinese/space path, E1 propagation
-          experiment, Repair success + restore-script round-trip.
+          experiment, Repair success + restore-script round-trip,
+          repair-needs-grant (DACL without WRITE_OWNER -> temporary-grant fallback).
       * label writes denied   -> SANDBOX suite:
           every object created by this session inherits Low, therefore only the
           subset that does not require Medium objects / label writes is executed:
           Scan hits, junction no-follow, -SkipDirs, long path, Chinese/space path,
           repair-failure path, snapshot/restore artifacts, read-only clean scan.
           Cases that need label writes are reported as SKIP with the reason.
+
+  Both modes also exercise the quick scan depth (-ScanDepth quick, embedded C#
+  scanner): quick streams only explicit-Low hit lines while its result counts all
+  Low objects (explicit + inherited); quick/deep counts and explicit hit sets are
+  asserted equal; a 2000 file fixture records the quick vs deep timing as INFO
+  plus a soft "quick is faster" assertion (no flaky hard threshold).
+  Every scan now writes a report file (<DataDir>\reports\scan-*.json) and its
+  result.reportPath is asserted (existence, counts, items scope, item fields).
+  FULL mode also covers the in-process fast repair path: normal objects are fixed
+  through P/Invoke, DACL-less objects through the in-process temporary grant, and
+  a 3000 grant-file fixture records the repair throughput (INFO).
 
   Engine invocations use Windows PowerShell 5.1 when available (the engine must be
   5.1 compatible); -EngineHost overrides the executable. An additional Env parity
@@ -77,6 +89,7 @@ $script:RunId = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid()
 $tempRoot = [System.IO.Path]::GetTempPath()
 $script:TestTempRoot = Join-Path $tempRoot 'dsh-low-integrity-tests'
 $script:BaseDir = Join-Path $script:TestTempRoot $script:RunId
+$script:ScanDataDir = Join-Path $script:BaseDir 'data-scan'
 
 $script:TestDir = $PSScriptRoot
 if ([string]::IsNullOrEmpty($script:TestDir)) {
@@ -357,6 +370,12 @@ function Remove-Tree {
         }
     }
     try { [System.IO.Directory]::Delete($win32, $false) } catch { }
+}
+
+function Clear-ScanReports {
+    if (Test-Path -LiteralPath $script:ScanDataDir) {
+        Remove-Tree -Path $script:ScanDataDir
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -897,7 +916,7 @@ function Test-EnvMode {
 
 function Test-ScanSuite {
     param($Fixtures, $ExpectedHits, [string]$Prefix)
-    $arguments = @('-Mode', 'Scan', '-Root', $Fixtures.root, '-SkipDirs', 'node_modules', '-Json')
+    $arguments = @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules', '-Json')
     $run = Invoke-Engine -EngineArguments $arguments
     Test-EventContract -Run $run -NamePrefix $Prefix
     Test-Assert -Name ($Prefix + '-exit-code') -Condition ($run.exitCode -eq 2) -Detail ('exit=' + $run.exitCode)
@@ -905,10 +924,13 @@ function Test-ScanSuite {
     $result = Get-ResultEvent $run
     if ($null -ne $result) {
         Test-Assert -Name ($Prefix + '-result-mode') -Condition ([string]$result.mode -eq 'scan') -Detail ('mode=' + [string]$result.mode)
+        Test-Assert -Name ($Prefix + '-result-depth') -Condition ([string]$result.depth -eq 'deep') -Detail ('depth=' + [string]$result.depth)
+        Test-Assert -Name ($Prefix + '-result-engine') -Condition ([string]$result.engine -eq 'powershell') -Detail ('engine=' + [string]$result.engine)
         Test-Assert -Name ($Prefix + '-result-root') -Condition (([string]$result.root).ToLowerInvariant().TrimEnd('\') -eq $Fixtures.root.ToLowerInvariant().TrimEnd('\')) -Detail ('root=' + [string]$result.root)
     }
     $hitEvents = @(Get-EventsOfType $run 'hit')
     Test-HitSet -NamePrefix $Prefix -HitEvents $hitEvents -ExpectedHits $ExpectedHits
+    Test-ScanReport -Result $result -Prefix $Prefix -ExpectedDepth 'deep'
 
     $progressEvents = @(Get-EventsOfType $run 'progress')
     Test-Assert -Name ($Prefix + '-progress-present') -Condition ($progressEvents.Count -gt 0) -Detail ('count=' + $progressEvents.Count)
@@ -960,7 +982,7 @@ function Test-LongPath {
 
 function Test-LocalizedRoot {
     param($Fixtures, [string]$Prefix)
-    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $Fixtures.localizedDir, '-SkipDirs', 'node_modules')
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.localizedDir, '-SkipDirs', 'node_modules')
     Test-EventContract -Run $run -NamePrefix ($Prefix + '-localized')
     Test-Assert -Name ($Prefix + '-localized-exit-code') -Condition ($run.exitCode -eq 2) -Detail ('exit=' + $run.exitCode)
     $hitEvents = @(Get-EventsOfType $run 'hit')
@@ -975,7 +997,7 @@ function Test-LocalizedRoot {
 
 function Test-FatalMissingRoot {
     $missing = Join-Path $script:BaseDir ('missing-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $missing)
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $missing)
     Test-Assert -Name 'fatal-missing-root-exit' -Condition ($run.exitCode -eq 3) -Detail ('exit=' + $run.exitCode)
     $fatalEvents = @(Get-EventsOfType $run 'fatal')
     Test-Assert -Name 'fatal-missing-root-event' -Condition ($fatalEvents.Count -eq 1) -Detail ('count=' + $fatalEvents.Count)
@@ -1003,7 +1025,7 @@ function Test-ReadOnlyCleanScan {
         Add-Skip -Name 'clean-scan-readonly' -Detail 'no readable non-Low reference directory available in this sandbox'
         return
     }
-    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $candidate, '-SkipDirs', 'node_modules')
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $candidate, '-SkipDirs', 'node_modules')
     Test-EventContract -Run $run -NamePrefix 'clean-readonly'
     $result = Get-ResultEvent $run
     $hits = @(Get-EventsOfType $run 'hit')
@@ -1024,7 +1046,7 @@ function Test-RepairFailure {
         $targetSddlBefore = [string]$targetInfoBefore.sddl
     }
 
-    $scanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $repairTarget)
+    $scanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $repairTarget)
     $scanHits = @(Get-EventsOfType $scanRun 'hit')
 
     $dataDir = Join-Path $script:BaseDir 'data-repair-fail'
@@ -1053,7 +1075,7 @@ function Test-RepairFailure {
     Test-Assert -Name 'repair-fail-error-events' -Condition ($repairErrors.Count -gt 0) -Detail ('repair error events=' + $repairErrors.Count)
     Test-Assert -Name 'repair-fail-error-output' -Condition ($withOutput.Count -gt 0) -Detail ('with output=' + $withOutput.Count)
 
-    $rescanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $repairTarget)
+    $rescanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $repairTarget)
     Test-Assert -Name 'repair-fail-rescan-still-low' -Condition ($rescanRun.exitCode -eq 2) -Detail ('exit=' + $rescanRun.exitCode)
 
     if ($null -ne $Fixtures.targetFile) {
@@ -1062,36 +1084,32 @@ function Test-RepairFailure {
     }
 }
 
-function Test-PinvokeFallback {
-    $target = Join-Path $script:BaseDir 'pinvoke-target'
+function Test-NativeFastPath {
+    $target = Join-Path $script:BaseDir 'native-fastpath'
     New-FixtureDirectory $target
-    New-FixtureFile (Join-Path $target 'pinvoke-child.txt') 'low'
+    New-FixtureFile (Join-Path $target 'native-child.txt') 'low'
     $setLow = Set-FixtureLabel -Path $target -LevelSpecification '(OI)(CI)Low'
-    Test-Assert -Name 'pinvoke-fallback-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
+    Test-Assert -Name 'native-fastpath-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
     if ($setLow.exitCode -ne 0) { return }
 
-    $dataDir = Join-Path $script:BaseDir 'data-pinvoke'
-    # A .cmd cannot be started with UseShellExecute=false, so the engine's icacls
-    # call fails and its SetNamedSecurityInfoW fallback must take over.
+    $dataDir = Join-Path $script:BaseDir 'data-native-fastpath'
+    # Broken icacls seam: the native fast path must not need to spawn icacls at all.
     $fakeIcacls = Join-Path $script:BaseDir 'fake-icacls.cmd'
     New-FixtureFile $fakeIcacls ("@echo off`r`nexit /b 5`r`n")
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $target, '-SkipDirs', 'node_modules', '-DataDir', $dataDir, '-IcaclsPath', $fakeIcacls)
-    Test-EventContract -Run $run -NamePrefix 'pinvoke-fallback'
-    Test-Assert -Name 'pinvoke-fallback-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
+    Test-EventContract -Run $run -NamePrefix 'native-fastpath'
+    Test-Assert -Name 'native-fastpath-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
     $result = Get-ResultEvent $run
     if ($null -ne $result) {
-        Test-Assert -Name 'pinvoke-fallback-fixed' -Condition ([int]$result.fixed -gt 0) -Detail ('fixed=' + [int]$result.fixed)
-        Test-Assert -Name 'pinvoke-fallback-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
-        Test-Assert -Name 'pinvoke-fallback-failed-empty' -Condition (@($result.failed).Count -eq 0) -Detail ('failed=' + @($result.failed).Count)
-        $methods = $result.methods
-        $pinvokeCount = 0
-        $icaclsCount = 0
-        if ($null -ne $methods -and $null -ne $methods.PSObject.Properties['pinvoke']) { $pinvokeCount = [int]$methods.pinvoke }
-        if ($null -ne $methods -and $null -ne $methods.PSObject.Properties['icacls']) { $icaclsCount = [int]$methods.icacls }
-        Test-Assert -Name 'pinvoke-fallback-method' -Condition ($pinvokeCount -gt 0) -Detail ('methods.pinvoke=' + $pinvokeCount + ' methods.icacls=' + $icaclsCount + ' fixed=' + [int]$result.fixed + ' remaining=' + [int]$result.remaining)
+        Test-Assert -Name 'native-fastpath-fixed' -Condition ([int]$result.fixed -gt 0) -Detail ('fixed=' + [int]$result.fixed)
+        Test-Assert -Name 'native-fastpath-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
+        Test-Assert -Name 'native-fastpath-failed-empty' -Condition (@($result.failed).Count -eq 0) -Detail ('failed=' + @($result.failed).Count)
+        $nativeCount = 0
+        if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['native']) { $nativeCount = [int]$result.methods.native }
+        Test-Assert -Name 'native-fastpath-method' -Condition ($nativeCount -gt 0) -Detail ('methods.native=' + $nativeCount + ' methods.pinvoke=' + [int]$result.methods.pinvoke + ' methods.icacls=' + [int]$result.methods.icacls + ' fixed=' + [int]$result.fixed + ' remaining=' + [int]$result.remaining)
     }
-    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $target, '-SkipDirs', 'node_modules')
-    Test-Assert -Name 'pinvoke-fallback-rescan' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
+    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $target, '-SkipDirs', 'node_modules')
+    Test-Assert -Name 'native-fastpath-rescan' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
 }
 
 function Test-RepairNeedsGrant {
@@ -1114,8 +1132,11 @@ function Test-RepairNeedsGrant {
     # 2) strip inherited + explicit permissions so the owner has no WRITE_OWNER
     $stripInheritance = Invoke-IcaclsOnPath -Path $file -Arguments '/inheritance:r'
     $removeExplicit = Invoke-IcaclsOnPath -Path $file -Arguments ('/remove:g *' + $userSid)
-    if ($stripInheritance.exitCode -ne 0 -or $removeExplicit.exitCode -ne 0) {
-        Add-Skip -Name 'repair-needs-grant' -Detail ('could not construct an ACL-less fixture: inheritance=' + $stripInheritance.exitCode + ' remove=' + $removeExplicit.exitCode + ' ' + $stripInheritance.output + ' ' + $removeExplicit.output)
+    # Keep read/execute for BUILTIN\Users so the object stays readable; WRITE_OWNER
+    # remains absent, which is what the temporary-grant path has to work around.
+    $grantRead = Invoke-IcaclsOnPath -Path $file -Arguments '/grant *S-1-5-32-545:(RX)'
+    if ($stripInheritance.exitCode -ne 0 -or $removeExplicit.exitCode -ne 0 -or $grantRead.exitCode -ne 0) {
+        Add-Skip -Name 'repair-needs-grant' -Detail ('could not construct an ACL-less fixture: inheritance=' + $stripInheritance.exitCode + ' remove=' + $removeExplicit.exitCode + ' read=' + $grantRead.exitCode + ' ' + $stripInheritance.output + ' ' + $removeExplicit.output)
         return
     }
     $labelAfterStrip = Get-LabelInfo $file
@@ -1149,8 +1170,96 @@ function Test-RepairNeedsGrant {
     Test-Assert -Name 'needs-grant-label-medium' -Condition ($labelAfterRepair.ok -and $labelAfterRepair.level -eq 'Medium') -Detail ('level=' + $labelAfterRepair.level + ' explicit=' + $labelAfterRepair.explicit)
     $daclAfter = Get-DaclSddl $file
     Test-Assert -Name 'needs-grant-dacl-restored' -Condition ($daclAfter.ok -and ([string]$daclAfter.sddl -eq [string]$daclBefore.sddl)) -Detail ('before=' + [string]$daclBefore.sddl + ' after=' + [string]$daclAfter.sddl)
-    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $dir, '-SkipDirs', 'node_modules')
+    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $dir, '-SkipDirs', 'node_modules')
     Test-Assert -Name 'needs-grant-rescan' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
+}
+
+function Test-RepairFastPath {
+    param([int]$GrantFileCount = 3000)
+    $root = Join-Path $script:BaseDir 'fast-repair'
+    New-FixtureDirectory $root
+    $directDir = Join-Path $root 'direct'
+    $grantDir = Join-Path $root 'grant'
+    New-FixtureDirectory $directDir
+    New-FixtureDirectory $grantDir
+    for ($index = 0; $index -lt 20; $index++) {
+        New-FixtureFile (Join-Path $directDir ('d{0:D2}.txt' -f $index)) 'x'
+    }
+    $setupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($index = 0; $index -lt $GrantFileCount; $index++) {
+        New-FixtureFile (Join-Path $grantDir ('g{0:D4}.txt' -f $index)) 'x'
+    }
+    $setupStopwatch.Stop()
+    $setDirectLow = Set-FixtureLabel -Path $directDir -LevelSpecification '(OI)(CI)Low'
+    $setGrantLow = Set-FixtureLabel -Path $grantDir -LevelSpecification '(OI)(CI)Low'
+    Test-Assert -Name 'fast-repair-setup-low' -Condition (($setDirectLow.exitCode -eq 0) -and ($setGrantLow.exitCode -eq 0)) -Detail ('direct=' + $setDirectLow.exitCode + ' grant=' + $setGrantLow.exitCode)
+    if (($setDirectLow.exitCode -ne 0) -or ($setGrantLow.exitCode -ne 0)) { return }
+
+    $userSid = ''
+    try { $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $userSid = '' }
+
+    # Remove all inherited permissions from the grant subtree so the owner no longer
+    # has WRITE_OWNER; /T applies to every child explicitly (propagation is unreliable).
+    # BUILTIN\Users read/execute is granted FIRST (while the tree is still listable via
+    # its inherited ACL), then inheritance is stripped: this keeps attributes/labels
+    # readable while WRITE_OWNER stays absent.
+    $grantRead = Invoke-IcaclsOnPath -Path $grantDir -Arguments '/grant *S-1-5-32-545:(RX) /T'
+    $stripInheritance = Invoke-IcaclsOnPath -Path $grantDir -Arguments '/inheritance:r /T'
+    if (($grantRead.exitCode -ne 0) -or ($stripInheritance.exitCode -ne 0)) {
+        Add-Skip -Name 'repair-fast-path' -Detail ('could not construct the DACL fixture: grantRead=' + $grantRead.exitCode + ' inheritance=' + $stripInheritance.exitCode)
+        return
+    }
+    $sampleDirectFile = Join-Path $directDir 'd00.txt'
+    $sampleGrantFile = Join-Path $grantDir 'g0000.txt'
+    $directInfo = Get-LabelInfo $sampleDirectFile
+    $grantInfo = Get-LabelInfo $sampleGrantFile
+    Test-Assert -Name 'fast-repair-setup-labels' -Condition (($directInfo.level -eq 'Low') -and ($grantInfo.level -eq 'Low')) -Detail ('direct=' + $directInfo.level + ' grant=' + $grantInfo.level)
+    $directAttempt = Set-FixtureLabel -Path $sampleGrantFile -LevelSpecification 'Medium'
+    Test-Assert -Name 'fast-repair-sample-needs-grant' -Condition ($directAttempt.exitCode -ne 0) -Detail ('exit=' + $directAttempt.exitCode)
+    $grantDaclBefore = Get-DaclSddl $sampleGrantFile
+    $directDaclBefore = Get-DaclSddl $sampleDirectFile
+    Test-Assert -Name 'fast-repair-setup-dacl-read' -Condition ($grantDaclBefore.ok -and $directDaclBefore.ok) -Detail ('grantDacl=' + [string]$grantDaclBefore.sddl)
+
+    $dataDir = Join-Path $script:BaseDir 'data-fast-repair'
+    $repairStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
+    $repairStopwatch.Stop()
+    Test-EventContract -Run $run -NamePrefix 'fast-repair'
+    Test-Assert -Name 'fast-repair-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
+    $result = Get-ResultEvent $run
+    if ($null -ne $result) {
+        Test-Assert -Name 'fast-repair-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
+        Test-Assert -Name 'fast-repair-failed-empty' -Condition (@($result.failed).Count -eq 0) -Detail ('failed=' + @($result.failed).Count)
+        Test-Assert -Name 'fast-repair-fixed' -Condition ([int]$result.fixed -eq [int]$result.hits) -Detail ('fixed=' + [int]$result.fixed + ' hits=' + [int]$result.hits)
+        $nativeCount = 0
+        $grantCount = 0
+        $icaclsCount = 0
+        if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['native']) { $nativeCount = [int]$result.methods.native }
+        if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['grant']) { $grantCount = [int]$result.methods.grant }
+        if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['icacls']) { $icaclsCount = [int]$result.methods.icacls }
+        Test-Assert -Name 'fast-repair-native-method' -Condition ($nativeCount -gt 0) -Detail ('methods.native=' + $nativeCount + ' methods.grant=' + $grantCount + ' methods.icacls=' + $icaclsCount)
+        Test-Assert -Name 'fast-repair-grant-method' -Condition ($grantCount -gt 0) -Detail ('methods.grant=' + $grantCount)
+    }
+    $grantDaclAfter = Get-DaclSddl $sampleGrantFile
+    $directDaclAfter = Get-DaclSddl $sampleDirectFile
+    Test-Assert -Name 'fast-repair-grant-dacl-restored' -Condition ($grantDaclAfter.ok -and ([string]$grantDaclAfter.sddl -eq [string]$grantDaclBefore.sddl)) -Detail ('before=' + [string]$grantDaclBefore.sddl + ' after=' + [string]$grantDaclAfter.sddl)
+    Test-Assert -Name 'fast-repair-direct-dacl-unchanged' -Condition ($directDaclAfter.ok -and ([string]$directDaclAfter.sddl -eq [string]$directDaclBefore.sddl)) -Detail ('before=' + [string]$directDaclBefore.sddl + ' after=' + [string]$directDaclAfter.sddl)
+    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $root, '-SkipDirs', 'node_modules')
+    Test-Assert -Name 'fast-repair-rescan' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
+    $hitCount = 0
+    if ($null -ne $result) { $hitCount = [int]$result.hits }
+    $perFileMs = 0
+    if ($GrantFileCount -gt 0) { $perFileMs = [math]::Round(([double]$repairStopwatch.ElapsedMilliseconds / [double]$GrantFileCount), 2) }
+    Add-Info -Name 'repair-fast-path-throughput' -Detail ('grantFiles=' + $GrantFileCount + ' directFiles=20 ' + 'hits=' + $hitCount + ' repairWallMs=' + $repairStopwatch.ElapsedMilliseconds + ' perGrantFileMs=' + $perFileMs + ' setupMs=' + $setupStopwatch.ElapsedMilliseconds)
+
+    # The stripped DACLs (protected/empty) would block enumeration and recursive
+    # deletion later. Re-grant the owner full control on the root first so /T can
+    # enumerate, then on every child before the suite-wide fixture cleanup runs.
+    if (-not [string]::IsNullOrEmpty($userSid)) {
+        $rootFix = Invoke-IcaclsOnPath -Path $grantDir -Arguments ('/grant *' + $userSid + ':(OI)(CI)F')
+        $childFix = Invoke-IcaclsOnPath -Path $grantDir -Arguments ('/grant *' + $userSid + ':(OI)(CI)F /T')
+        Add-Info -Name 'fast-repair-cleanup-acl' -Detail ('rootRestore exit=' + $rootFix.exitCode + ' recursiveRestore exit=' + $childFix.exitCode)
+    }
 }
 
 function Test-DataDirExclusion {
@@ -1195,6 +1304,180 @@ function Test-DataDirExclusion {
             Test-Assert -Name 'datadir-exclusion-repair-failure' -Condition ($run.exitCode -eq 2) -Detail ('exit=' + $run.exitCode + ' failed=' + @($result.failed).Count + ' remaining=' + [int]$result.remaining)
         }
     }
+}
+
+function Test-QuickScan {
+    param($Fixtures, $DeepOutcome)
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
+    Test-EventContract -Run $run -NamePrefix 'scan-quick'
+    Test-ResultContract -Run $run -NamePrefix 'scan-quick'
+    $result = Get-ResultEvent $run
+    if ($null -eq $result) { return }
+    Test-Assert -Name 'scan-quick-result-depth' -Condition ([string]$result.depth -eq 'quick') -Detail ('depth=' + [string]$result.depth)
+    Test-Assert -Name 'scan-quick-result-engine' -Condition ([string]$result.engine -eq 'csharp') -Detail ('engine=' + [string]$result.engine)
+    $scanMsProperty = $result.PSObject.Properties['scanMs']
+    Test-Assert -Name 'scan-quick-result-scanms' -Condition ($null -ne $scanMsProperty -and [long]$result.scanMs -ge 0) -Detail ('scanMs=' + [string]$result.scanMs)
+    Test-ScanReport -Result $result -Prefix 'scan-quick' -ExpectedDepth 'quick'
+
+    $quickHits = @(Get-EventsOfType $run 'hit')
+    $nonExplicit = @($quickHits | Where-Object { -not [bool]$_.explicit })
+    Test-Assert -Name 'scan-quick-explicit-hit-only' -Condition ($nonExplicit.Count -eq 0) -Detail ('non-explicit hit lines=' + $nonExplicit.Count)
+    Test-Assert -Name 'scan-quick-hit-lines-match-explicit' -Condition ($quickHits.Count -eq [int]$result.explicitCount) -Detail ('hitLines=' + $quickHits.Count + ' explicitCount=' + [int]$result.explicitCount)
+
+    Test-Assert -Name 'scan-quick-hits-equal-deep' -Condition ([int]$result.hits -eq [int]$DeepOutcome.result.hits) -Detail ('quick=' + [int]$result.hits + ' deep=' + [int]$DeepOutcome.result.hits)
+    Test-Assert -Name 'scan-quick-explicit-equal-deep' -Condition ([int]$result.explicitCount -eq [int]$DeepOutcome.result.explicitCount) -Detail ('quick=' + [int]$result.explicitCount + ' deep=' + [int]$DeepOutcome.result.explicitCount)
+    Test-Assert -Name 'scan-quick-inherited-equal-deep' -Condition ([int]$result.inheritedCount -eq [int]$DeepOutcome.result.inheritedCount) -Detail ('quick=' + [int]$result.inheritedCount + ' deep=' + [int]$DeepOutcome.result.inheritedCount)
+    Test-Assert -Name 'scan-quick-scanned-equal-deep' -Condition ([int]$result.scanned -eq [int]$DeepOutcome.result.scanned) -Detail ('quick=' + [int]$result.scanned + ' deep=' + [int]$DeepOutcome.result.scanned)
+    Test-Assert -Name 'scan-quick-rootlabel-equal-deep' -Condition ([string]$result.rootLabel -eq [string]$DeepOutcome.result.rootLabel) -Detail ('quick=' + [string]$result.rootLabel + ' deep=' + [string]$DeepOutcome.result.rootLabel)
+
+    $deepExplicit = @($DeepOutcome.hits | Where-Object { [bool]$_.explicit })
+    $quickMap = Get-HitMap $quickHits
+    $deepMap = Get-HitMap $deepExplicit
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($key in $deepMap.Keys) {
+        if (-not $quickMap.ContainsKey($key)) { [void]$missing.Add($deepMap[$key].path) }
+    }
+    $extra = New-Object System.Collections.ArrayList
+    foreach ($key in $quickMap.Keys) {
+        if (-not $deepMap.ContainsKey($key)) { [void]$extra.Add($quickMap[$key].path) }
+    }
+    Test-Assert -Name 'scan-quick-explicit-set-missing' -Condition ($missing.Count -eq 0) -Detail (($missing | Select-Object -First 5) -join '; ')
+    Test-Assert -Name 'scan-quick-explicit-set-extra' -Condition ($extra.Count -eq 0) -Detail (($extra | Select-Object -First 5) -join '; ')
+
+    $expectedExitCode = 2
+    if ([int]$result.hits -eq 0) { $expectedExitCode = 0 }
+    Test-Assert -Name 'scan-quick-exit-code' -Condition ($run.exitCode -eq $expectedExitCode) -Detail ('exit=' + $run.exitCode + ' hits=' + [int]$result.hits)
+    Test-Assert -Name 'scan-quick-progress' -Condition (@(Get-EventsOfType $run 'progress').Count -gt 0) -Detail ''
+}
+
+function Test-QuickExplicitHitsInSandbox {
+    if ($script:FullMode) { return }
+    # The DSH sandbox temp root is an EXPLICIT Low directory, which gives the
+    # sandbox suite a real explicit-Low object to verify quick-mode hit emission
+    # (no integrity label writes required, scan is read-only).
+    $sandboxRoot = $env:TEMP
+    $rootInfo = Get-LabelInfo $sandboxRoot
+    if (-not ($rootInfo.ok -and $rootInfo.level -eq 'Low' -and [bool]$rootInfo.explicit)) {
+        Add-Skip -Name 'scan-quick-explicit-emission' -Detail 'sandbox temp root is not an explicit-Low object in this environment'
+        return
+    }
+    # The report directory lives inside the scanned sandbox temp root; clear it
+    # before each scan so quick and deep see exactly the same object set.
+    Clear-ScanReports
+    $quickRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $sandboxRoot, '-SkipDirs', 'node_modules,.git')
+    Clear-ScanReports
+    $deepRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $sandboxRoot, '-SkipDirs', 'node_modules,.git')
+    $quickResult = Get-ResultEvent $quickRun
+    $deepResult = Get-ResultEvent $deepRun
+    Test-Assert -Name 'scan-quick-explicit-deep-exit' -Condition ($deepRun.exitCode -eq 2) -Detail ('deep exit=' + $deepRun.exitCode)
+    Test-Assert -Name 'scan-quick-explicit-quick-exit' -Condition ($quickRun.exitCode -eq 2) -Detail ('quick exit=' + $quickRun.exitCode)
+    if ($null -eq $quickResult -or $null -eq $deepResult) { return }
+    Test-Assert -Name 'scan-quick-explicit-count-matches' -Condition ([int]$quickResult.explicitCount -eq [int]$deepResult.explicitCount) -Detail ('quick=' + [int]$quickResult.explicitCount + ' deep=' + [int]$deepResult.explicitCount)
+    Test-Assert -Name 'scan-quick-explicit-hits-match' -Condition ([int]$quickResult.hits -eq [int]$deepResult.hits) -Detail ('quick=' + [int]$quickResult.hits + ' deep=' + [int]$deepResult.hits)
+    Test-Assert -Name 'scan-quick-explicit-nonzero' -Condition ([int]$quickResult.explicitCount -ge 1) -Detail ('explicitCount=' + [int]$quickResult.explicitCount)
+    $quickHits = @(Get-EventsOfType $quickRun 'hit')
+    $deepExplicitHits = @(Get-EventsOfType $deepRun 'hit' | Where-Object { [bool]$_.explicit })
+    Test-Assert -Name 'scan-quick-explicit-emission-count' -Condition ($quickHits.Count -eq $deepExplicitHits.Count) -Detail ('quick hitLines=' + $quickHits.Count + ' deep explicit hits=' + $deepExplicitHits.Count)
+    $quickMap = Get-HitMap $quickHits
+    $deepMap = Get-HitMap $deepExplicitHits
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($key in $deepMap.Keys) { if (-not $quickMap.ContainsKey($key)) { [void]$missing.Add($deepMap[$key].path) } }
+    $extra = New-Object System.Collections.ArrayList
+    foreach ($key in $quickMap.Keys) { if (-not $deepMap.ContainsKey($key)) { [void]$extra.Add($quickMap[$key].path) } }
+    Test-Assert -Name 'scan-quick-explicit-emission-missing' -Condition ($missing.Count -eq 0) -Detail (($missing | Select-Object -First 5) -join '; ')
+    Test-Assert -Name 'scan-quick-explicit-emission-extra' -Condition ($extra.Count -eq 0) -Detail (($extra | Select-Object -First 5) -join '; ')
+    Test-Assert -Name 'scan-quick-explicit-root-hit' -Condition ($quickMap.ContainsKey($sandboxRoot.ToLowerInvariant())) -Detail ('root=' + $sandboxRoot)
+    $labelsOk = $true
+    foreach ($hit in $quickHits) {
+        $info = Get-LabelInfo ([string]$hit.path)
+        if (-not ($info.ok -and $info.level -eq 'Low' -and [bool]$info.explicit)) { $labelsOk = $false }
+    }
+    Test-Assert -Name 'scan-quick-explicit-hit-labels' -Condition $labelsOk -Detail ('hit lines=' + $quickHits.Count)
+}
+
+function Test-QuickBench {
+    $benchRoot = Join-Path $script:BaseDir 'bench-quick'
+    New-FixtureDirectory $benchRoot
+    for ($directoryIndex = 0; $directoryIndex -lt 200; $directoryIndex++) {
+        $directory = Join-Path $benchRoot ('dir{0:D3}' -f $directoryIndex)
+        New-FixtureDirectory $directory
+        for ($fileIndex = 0; $fileIndex -lt 10; $fileIndex++) {
+            New-FixtureFile (Join-Path $directory ('file{0:D2}.txt' -f $fileIndex)) 'x'
+        }
+    }
+    if ($script:FullMode) {
+        $setLow = Set-FixtureLabel -Path $benchRoot -LevelSpecification '(OI)(CI)Low'
+        Test-Assert -Name 'quick-bench-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
+        if ($setLow.exitCode -ne 0) { return }
+    }
+    $deepStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $deepRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $benchRoot, '-SkipDirs', 'node_modules,.git')
+    $deepStopwatch.Stop()
+    $quickStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $quickRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $benchRoot, '-SkipDirs', 'node_modules,.git')
+    $quickStopwatch.Stop()
+    $deepResult = Get-ResultEvent $deepRun
+    $quickResult = Get-ResultEvent $quickRun
+    Test-Assert -Name 'quick-bench-deep-exit' -Condition ($deepRun.exitCode -eq 2) -Detail ('deep exit=' + $deepRun.exitCode)
+    Test-Assert -Name 'quick-bench-quick-exit' -Condition ($quickRun.exitCode -eq 2) -Detail ('quick exit=' + $quickRun.exitCode)
+    if ($null -eq $deepResult -or $null -eq $quickResult) { return }
+    Test-Assert -Name 'quick-bench-scanned-equal' -Condition ([int]$quickResult.scanned -eq [int]$deepResult.scanned) -Detail ('quick=' + [int]$quickResult.scanned + ' deep=' + [int]$deepResult.scanned)
+    Test-Assert -Name 'quick-bench-hits-equal' -Condition ([int]$quickResult.hits -eq [int]$deepResult.hits) -Detail ('quick=' + [int]$quickResult.hits + ' deep=' + [int]$deepResult.hits)
+    $deepHitLines = @(Get-EventsOfType $deepRun 'hit')
+    $quickHitLines = @(Get-EventsOfType $quickRun 'hit')
+    Test-Assert -Name 'quick-bench-deep-streams-all' -Condition ($deepHitLines.Count -eq [int]$deepResult.hits) -Detail ('deep hitLines=' + $deepHitLines.Count + ' hits=' + [int]$deepResult.hits)
+    Test-Assert -Name 'quick-bench-quick-streams-explicit' -Condition ($quickHitLines.Count -eq [int]$quickResult.explicitCount) -Detail ('quick hitLines=' + $quickHitLines.Count + ' explicit=' + [int]$quickResult.explicitCount)
+    $deepWallMs = [long]$deepStopwatch.ElapsedMilliseconds
+    $quickWallMs = [long]$quickStopwatch.ElapsedMilliseconds
+    $ratio = 0
+    if ($deepWallMs -gt 0) { $ratio = [math]::Round(([double]$quickWallMs / [double]$deepWallMs), 2) }
+    $scanMs = 0
+    if ($null -ne $quickResult.PSObject.Properties['scanMs']) { $scanMs = [long]$quickResult.scanMs }
+    Add-Info -Name 'quick-vs-deep-2000-files' -Detail ('items=' + [int]$quickResult.scanned + ' quickWallMs=' + $quickWallMs + ' deepWallMs=' + $deepWallMs + ' wallRatio=' + $ratio + ' quickScanMs=' + $scanMs + ' deepDurationMs=' + [int]$deepResult.durationMs)
+    Test-Assert -Name 'quick-bench-quick-faster' -Condition ($quickWallMs -lt $deepWallMs) -Detail ('quick=' + $quickWallMs + 'ms deep=' + $deepWallMs + 'ms ratio=' + $ratio)
+}
+
+function Test-ScanReport {
+    param($Result, [string]$Prefix, [string]$ExpectedDepth)
+    if ($null -eq $Result) { return }
+    $reportPathProperty = $Result.PSObject.Properties['reportPath']
+    Test-Assert -Name ($Prefix + '-report-path-field') -Condition ($null -ne $reportPathProperty) -Detail ''
+    if ($null -eq $reportPathProperty) { return }
+    $reportPath = [string]$Result.reportPath
+    Test-Assert -Name ($Prefix + '-report-exists') -Condition ([System.IO.File]::Exists($reportPath)) -Detail ('reportPath=' + $reportPath)
+    if (-not [System.IO.File]::Exists($reportPath)) { return }
+    try {
+        $reportText = [System.IO.File]::ReadAllText($reportPath, $script:Utf8NoBom)
+        $report = $reportText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Add-Fail -Name ($Prefix + '-report-json') -Detail $_.Exception.Message
+        return
+    }
+    Test-Assert -Name ($Prefix + '-report-depth') -Condition ([string]$report.depth -eq $ExpectedDepth) -Detail ('depth=' + [string]$report.depth)
+    $countsOk = ([int]$report.scanned -eq [int]$Result.scanned) -and
+        ([int]$report.hits -eq [int]$Result.hits) -and
+        ([int]$report.explicitCount -eq [int]$Result.explicitCount) -and
+        ([int]$report.inheritedCount -eq [int]$Result.inheritedCount)
+    Test-Assert -Name ($Prefix + '-report-counts') -Condition $countsOk -Detail ('report scanned=' + [int]$report.scanned + ' hits=' + [int]$report.hits + ' explicit=' + [int]$report.explicitCount + ' inherited=' + [int]$report.inheritedCount)
+    $reportItems = @($report.items)
+    if ($ExpectedDepth -eq 'quick') {
+        Test-Assert -Name ($Prefix + '-report-items-explicit') -Condition ($reportItems.Count -eq [int]$Result.explicitCount) -Detail ('items=' + $reportItems.Count + ' explicitCount=' + [int]$Result.explicitCount)
+        Test-Assert -Name ($Prefix + '-report-items-scope') -Condition ([string]$report.itemsScope -eq 'explicit') -Detail ('itemsScope=' + [string]$report.itemsScope)
+    } else {
+        Test-Assert -Name ($Prefix + '-report-items-all') -Condition ($reportItems.Count -eq [int]$Result.hits) -Detail ('items=' + $reportItems.Count + ' hits=' + [int]$Result.hits)
+        Test-Assert -Name ($Prefix + '-report-items-scope') -Condition ([string]$report.itemsScope -eq 'all') -Detail ('itemsScope=' + [string]$report.itemsScope)
+    }
+    $fieldsOk = $true
+    foreach ($item in $reportItems) {
+        if ($null -eq $item.PSObject.Properties['path'] -or
+            $null -eq $item.PSObject.Properties['relativePath'] -or
+            $null -eq $item.PSObject.Properties['kind'] -or
+            $null -eq $item.PSObject.Properties['explicit'] -or
+            $null -eq $item.PSObject.Properties['label']) {
+            $fieldsOk = $false
+        }
+    }
+    Test-Assert -Name ($Prefix + '-report-item-fields') -Condition $fieldsOk -Detail ('items=' + $reportItems.Count)
 }
 
 function Test-SnapshotDocument {
@@ -1288,7 +1571,7 @@ function Test-RepairSuccess {
         Test-Assert -Name 'repair-ok-restore-parse' -Condition (Test-ScriptParses -Path ([string]$result.restorePath)) -Detail ('restorePath=' + [string]$result.restorePath)
     }
 
-    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
+    $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
     Test-Assert -Name 'repair-ok-rescan-exit' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
     Test-Assert -Name 'repair-ok-rescan-zero-hits' -Condition (@(Get-EventsOfType $rescan 'hit').Count -eq 0) -Detail ('hits=' + @(Get-EventsOfType $rescan 'hit').Count)
 
@@ -1349,7 +1632,7 @@ function Test-E1Propagation {
     $autoRecovered = (-not $childAfter.ok -or $childAfter.level -ne 'Low')
     Add-Info -Name 'e1-propagation-observation' -Detail ('root set (OI)(CI)Medium without /T; child auto-recovered=' + $autoRecovered + ' child level=' + $childAfter.level + ' inherited=' + $childAfter.inherited)
 
-    $scanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $e1Root, '-SkipDirs', 'node_modules')
+    $scanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $e1Root, '-SkipDirs', 'node_modules')
     $hits = @(Get-EventsOfType $scanRun 'hit')
     $consistent = $false
     if ($autoRecovered) {
@@ -1361,6 +1644,7 @@ function Test-E1Propagation {
 }
 
 function Test-EngineParityPwsh7 {
+    param($Fixtures)
     $pwshPath = Find-Pwsh7
     if (-not $pwshPath) {
         Add-Skip -Name 'engine-parity-pwsh7' -Detail 'pwsh 7 not found'
@@ -1378,6 +1662,25 @@ function Test-EngineParityPwsh7 {
         $altIntegrity = [string]$events[0].integrity
         Test-Assert -Name 'engine-parity-pwsh7-integrity' -Condition (-not [string]::IsNullOrEmpty($altIntegrity)) -Detail ('integrity=' + $altIntegrity)
         Test-Assert -Name 'engine-parity-pwsh7-canwrite' -Condition ([bool]$events[0].canWriteLabel -eq [bool]$script:CanWriteLabel) -Detail ('canWriteLabel=' + [bool]$events[0].canWriteLabel)
+    }
+    if ($null -ne $Fixtures) {
+        # Earlier full-mode cases (repair success, restore round-trip, E1, needs-grant)
+        # mutate the fixture labels, so a deep outcome captured at the start of the
+        # suite is stale here. Capture a fresh PS5.1 deep baseline for the CURRENT
+        # fixture state and compare the pwsh 7 C# quick scan against it.
+        $baselineRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
+        $baselineResult = Get-ResultEvent $baselineRun
+        $quickRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules') -HostPath $pwshPath
+        $quickResult = Get-ResultEvent $quickRun
+        Test-Assert -Name 'engine-parity-pwsh7-quick-exit' -Condition ($quickRun.exitCode -eq $baselineRun.exitCode) -Detail ('pwsh7 quick exit=' + $quickRun.exitCode + ' ps51 deep exit=' + $baselineRun.exitCode)
+        if ($null -ne $quickResult -and $null -ne $baselineResult) {
+            $countsMatch = ([int]$quickResult.hits -eq [int]$baselineResult.hits) -and
+                ([int]$quickResult.explicitCount -eq [int]$baselineResult.explicitCount) -and
+                ([int]$quickResult.inheritedCount -eq [int]$baselineResult.inheritedCount) -and
+                ([int]$quickResult.scanned -eq [int]$baselineResult.scanned) -and
+                ([string]$quickResult.rootLabel -eq [string]$baselineResult.rootLabel)
+            Test-Assert -Name 'engine-parity-pwsh7-quick-counts' -Condition $countsMatch -Detail ('pwsh7 quick hits=' + [int]$quickResult.hits + ' explicit=' + [int]$quickResult.explicitCount + ' inherited=' + [int]$quickResult.inheritedCount + ' scanned=' + [int]$quickResult.scanned + ' | ps51 deep baseline hits=' + [int]$baselineResult.hits + ' explicit=' + [int]$baselineResult.explicitCount + ' inherited=' + [int]$baselineResult.inheritedCount + ' scanned=' + [int]$baselineResult.scanned)
+        }
     }
 }
 
@@ -1461,6 +1764,10 @@ try {
     Test-SkipDirs -ScanOutcome $scanOutcome -Fixtures $fixtures -Prefix $prefix
     Test-LongPath -ScanOutcome $scanOutcome -Fixtures $fixtures -Prefix $prefix
 
+    # ---- quick scan (C# scanner): explicit-only output, counts match deep -
+    Test-QuickScan -Fixtures $fixtures -DeepOutcome $scanOutcome
+    Test-QuickExplicitHitsInSandbox
+
     # ---- localized (Chinese/space) path as -Root --------------------------
     Test-LocalizedRoot -Fixtures $fixtures -Prefix $prefix
 
@@ -1469,7 +1776,7 @@ try {
 
     # ---- clean fixture (full mode only) -----------------------------------
     if ($script:FullMode) {
-        $cleanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-Root', $fixtures.cleanDir, '-SkipDirs', 'node_modules')
+        $cleanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $fixtures.cleanDir, '-SkipDirs', 'node_modules')
         Test-EventContract -Run $cleanRun -NamePrefix 'clean'
         $cleanHits = @(Get-EventsOfType $cleanRun 'hit')
         $cleanResult = Get-ResultEvent $cleanRun
@@ -1485,7 +1792,7 @@ try {
 
     # ---- Repair failure path ---------------------------------------------
     if ($script:FullMode) {
-        Test-PinvokeFallback
+        Test-NativeFastPath
     } else {
         Test-RepairFailure -Fixtures $fixtures
     }
@@ -1496,19 +1803,24 @@ try {
         Test-RestoreRoundtrip -Fixtures $fixtures -ExpectedHits $expectedHits -RepairResult $repairResult
         Test-E1Propagation
         Test-RepairNeedsGrant
+        Test-RepairFastPath
         Add-Skip -Name 'repair-failure-path' -Detail 'failure path needs label writes to be denied; covered by the sandbox-mode run of this script'
     } else {
         Add-Skip -Name 'repair-success' -Detail 'requires label writes (sandbox denies icacls /setintegritylevel)'
         Add-Skip -Name 'restore-roundtrip' -Detail 'requires label writes'
         Add-Skip -Name 'e1-propagation-experiment' -Detail 'requires label writes (see Lead host-side E1 result)'
         Add-Skip -Name 'repair-needs-grant' -Detail 'requires label writes + DACL manipulation (sandbox denies /setintegritylevel)'
+        Add-Skip -Name 'repair-fast-path' -Detail 'requires label writes + DACL manipulation (sandbox denies /setintegritylevel)'
     }
 
     # ---- DataDir inside -Root must be excluded from traversal -------------
     Test-DataDirExclusion
 
+    # ---- quick vs deep timing on a 2000 file fixture ----------------------
+    Test-QuickBench
+
     # ---- PS7 parity -------------------------------------------------------
-    Test-EngineParityPwsh7
+    Test-EngineParityPwsh7 -Fixtures $fixtures
 } catch {
     $failureDetail = $_.Exception.Message
     if ($_.ScriptStackTrace) { $failureDetail = $failureDetail + ' @ ' + ($_.ScriptStackTrace -replace "`r?`n", ' | ') }
