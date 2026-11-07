@@ -71,6 +71,9 @@
     'job-not-found': true,
     'invalid-request': true,
     'engine-unavailable': true,
+    'snapshot-not-found': true,
+    'open-folder-failed': true,
+    forbidden: true,
     'internal-error': true,
     'network-error': true,
     'bad-response': true,
@@ -200,6 +203,8 @@
     'repair.rescan.found': '复扫仍发现 {count} 个 Low 完整性对象',
     'repair.snapshot': '快照文件',
     'repair.restore': '恢复文件',
+    'repair.openFolder': '打开文件夹',
+    'repair.openingFolder': '正在打开…',
     'repair.pathMissing': '宿主未返回路径',
     'repair.failures': '失败列表',
     'repair.failuresMore': '另有 {count} 条失败未显示',
@@ -225,6 +230,9 @@
     'error.engine-unavailable': '完整性引擎不可用或受限',
     'error.job-not-found': '任务已失效，请重新检查',
     'error.invalid-request': '请求参数无效',
+    'error.snapshot-not-found': '没有可打开的快照文件',
+    'error.open-folder-failed': '打开文件夹失败',
+    'error.forbidden': '没有权限执行该操作',
     'error.internal-error': '宿主内部错误',
     'error.network-error': '无法连接宿主服务',
     'error.bad-response': '宿主返回了无效响应',
@@ -352,6 +360,8 @@
     'repair.rescan.found': 'Rescan still finds {count} Low integrity objects',
     'repair.snapshot': 'Snapshot file',
     'repair.restore': 'Restore file',
+    'repair.openFolder': 'Open folder',
+    'repair.openingFolder': 'Opening…',
     'repair.pathMissing': 'Host did not report a path',
     'repair.failures': 'Failures',
     'repair.failuresMore': '{count} more failures not shown',
@@ -377,6 +387,9 @@
     'error.engine-unavailable': 'The integrity engine is unavailable or restricted',
     'error.job-not-found': 'Job expired, please check again',
     'error.invalid-request': 'Invalid request parameters',
+    'error.snapshot-not-found': 'No snapshot file to open',
+    'error.open-folder-failed': 'Could not open the folder',
+    'error.forbidden': 'Not allowed to perform this action',
     'error.internal-error': 'Host internal error',
     'error.network-error': 'Cannot reach the host service',
     'error.bad-response': 'The host returned an invalid response',
@@ -1279,7 +1292,7 @@
   }
 
   /**
-   * 一行「标签 + 路径 + 复制」。
+   * 一行「标签 + 路径 + 复制」；可选「打开文件夹」按钮。
    *
    * @param h - React.createElement。
    * @param t - locale 绑定函数。
@@ -1287,9 +1300,11 @@
    * @param label - 行标题。
    * @param path - 路径文本；空串时显示「宿主未返回路径」。
    * @param key - React key。
+   * @param openAction - 可选：点击打开所在文件夹。
+   * @param opening - 是否正在打开。
    * @returns 行元素。
    */
-  function artifactRow(h, t, actions, label, path, key) {
+  function artifactRow(h, t, actions, label, path, key, openAction, opening) {
     var value = typeof path === 'string' ? path : '';
     var pathNode =
       value !== ''
@@ -1306,7 +1321,17 @@
             },
           })
         : null;
-    return h('div', { className: 'fi-col', key: key }, h('span', { className: 'fi-label' }, label), h('div', { className: 'fi-row' }, pathNode, copyNode));
+    var openNode =
+      value !== '' && typeof openAction === 'function'
+        ? actionButton(h, {
+            label: opening === true ? t('repair.openingFolder') : t('repair.openFolder'),
+            variant: 'ghost',
+            small: true,
+            disabled: opening === true,
+            onClick: openAction,
+          })
+        : null;
+    return h('div', { className: 'fi-col', key: key }, h('span', { className: 'fi-label' }, label), h('div', { className: 'fi-row' }, pathNode, copyNode, openNode));
   }
 
   /**
@@ -1873,8 +1898,34 @@
           }),
         ),
       );
-      children.push(artifactRow(h, t, actions, t('repair.snapshot'), job.snapshotPath, 'snapshot'));
-      children.push(artifactRow(h, t, actions, t('repair.restore'), job.restorePath, 'restore'));
+      children.push(
+        artifactRow(
+          h,
+          t,
+          actions,
+          t('repair.snapshot'),
+          job.snapshotPath,
+          'snapshot',
+          function () {
+            actions.openArtifactFolder(job.id, 'snapshot');
+          },
+          state.openingFolder === true,
+        ),
+      );
+      children.push(
+        artifactRow(
+          h,
+          t,
+          actions,
+          t('repair.restore'),
+          job.restorePath,
+          'restore',
+          function () {
+            actions.openArtifactFolder(job.id, 'restore');
+          },
+          state.openingFolder === true,
+        ),
+      );
     } else if (job.status === 'cancelled') {
       children.push(banner(h, { tone: 'info', title: t('job.cancelled'), key: 'title' }));
       children.push(
@@ -2026,7 +2077,20 @@
     var reportJob = state.scanJob !== null ? state.scanJob : state.job !== null && state.job.action === 'scan' ? state.job : null;
     var reportPath = reportJob !== null ? reportJob.reportPath : '';
     if (reportPath !== '' && reportPath !== state.exportPath) {
-      rows.push(artifactRow(h, t, actions, t('artifact.report'), reportPath, 'report'));
+      rows.push(
+        artifactRow(
+          h,
+          t,
+          actions,
+          t('artifact.report'),
+          reportPath,
+          'report',
+          function () {
+            actions.openArtifactFolder(reportJob.id, 'report');
+          },
+          state.openingFolder === true,
+        ),
+      );
     }
     if (state.logPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.log'), state.logPath, 'log'));
     if (rows.length === 0) return null;
@@ -2427,6 +2491,29 @@
         });
       }
 
+      /** 打开快照/恢复文件或引擎报告所在文件夹（Host 校验路径后由系统资源管理器打开）。 */
+      function openArtifactFolder(jobId, target) {
+        if (typeof jobId !== 'string' || jobId === '' || state.openingFolder === true) return;
+        var mySession = sessionId;
+        var artifactTarget = target === 'restore' ? 'restore' : target === 'report' ? 'report' : 'snapshot';
+        setState(function (prev) {
+          return Object.assign({}, prev, { openingFolder: true, actionError: null });
+        });
+        requestJson({ path: '/open-folder', method: 'POST', body: { jobId: jobId, target: artifactTarget } }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          setState(function (prev) {
+            if (res.ok) return Object.assign({}, prev, { openingFolder: false });
+            return Object.assign({}, prev, {
+              openingFolder: false,
+              actionError: {
+                code: res.code,
+                message: res.message,
+              },
+            });
+          });
+        });
+      }
+
       /** 命中清单分页：从已加载条数开始再取一页。 */
       function loadMore() {
         var jobId = state.itemsJobId;
@@ -2774,6 +2861,7 @@
         cancelJob: cancelJob,
         exportList: exportList,
         generateLog: generateLog,
+        openArtifactFolder: openArtifactFolder,
         loadMore: loadMore,
       };
 
@@ -2821,6 +2909,7 @@
       logging: false,
       logPath: '',
       logError: null,
+      openingFolder: false,
       confirmOpen: false,
       starting: false,
       cancelling: false,

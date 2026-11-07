@@ -31,6 +31,12 @@
   plus a soft "quick is faster" assertion (no flaky hard threshold).
   Every scan now writes a report file (<DataDir>\reports\scan-*.json) and its
   result.reportPath is asserted (existence, counts, items scope, item fields).
+  Repair runs assert the current C# repair contract: zero hit events, progress
+  phases restricted to enumerate/repair/verify carrying scanned/total/hits/fixed
+  (enumerate total=null), result.repairEngine="csharp" and numeric result.timings
+  {scanMs,snapshotMs,restoreMs,repairMs,verifyMs,totalMs}. A moderate repair
+  fixture asserts that repair progress is throttled (event count << hit count)
+  and the throughput INFO line records the phase timings.
   FULL mode also covers the in-process fast repair path: normal objects are fixed
   through P/Invoke, DACL-less objects through the in-process temporary grant, and
   a 3000 grant-file fixture records the repair throughput (INFO).
@@ -679,6 +685,148 @@ function Test-ResultContract {
 }
 
 # ---------------------------------------------------------------------------
+# Repair contract helpers (C# RepairRunner):
+#   * Repair never streams `hit` events (scan modes unchanged);
+#   * progress phases are enumerate/repair/verify with scanned/total/hits/fixed
+#     (enumerate total=null; repair total=hit count; verify total=verify candidates);
+#   * result keeps the old fields plus repairEngine="csharp" and
+#     timings{scanMs,snapshotMs,restoreMs,repairMs,verifyMs,totalMs}.
+# ---------------------------------------------------------------------------
+function Test-IsNumericValue {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) { return $true }
+    return $false
+}
+
+function Get-PropertyState {
+    param($Object, [string]$Property)
+    $exists = $false
+    $value = $null
+    if ($null -ne $Object) {
+        $member = $Object.PSObject.Properties[$Property]
+        if ($null -ne $member) {
+            $exists = $true
+            $value = $member.Value
+        }
+    }
+    return @{ exists = $exists; value = $value }
+}
+
+function Get-TimingInfoText {
+    param($Result)
+    $parts = New-Object System.Collections.ArrayList
+    $timingsState = Get-PropertyState -Object $Result -Property 'timings'
+    foreach ($field in @('scanMs', 'snapshotMs', 'restoreMs', 'repairMs', 'verifyMs', 'preReadMs', 'nativeSetMs', 'grantReadMs', 'grantWriteMs', 'grantLabelRestoreMs', 'grantVerifyMs', 'grantFallbacks', 'totalMs')) {
+        $text = 'n/a'
+        if ($timingsState.exists) {
+            $state = Get-PropertyState -Object $timingsState.value -Property $field
+            if ($state.exists) { $text = [string]$state.value }
+        }
+        [void]$parts.Add($field + '=' + $text)
+    }
+    return ($parts -join ' ')
+}
+
+function Test-RepairEventContract {
+    param($Run, [string]$NamePrefix)
+    Test-EventContract -Run $Run -NamePrefix $NamePrefix
+    $hitEvents = @(Get-EventsOfType $Run 'hit')
+    Test-Assert -Name ($NamePrefix + '-no-hit-events') -Condition ($hitEvents.Count -eq 0) -Detail ('hit events=' + $hitEvents.Count + ' (Repair must not stream hits)')
+    $progressEvents = @(Get-EventsOfType $Run 'progress')
+    $allowedPhases = @('enumerate', 'repair', 'verify')
+    $badPhases = New-Object System.Collections.ArrayList
+    foreach ($progress in $progressEvents) {
+        if ($allowedPhases -notcontains [string]$progress.phase) { [void]$badPhases.Add([string]$progress.phase) }
+    }
+    Test-Assert -Name ($NamePrefix + '-progress-phases') -Condition ($badPhases.Count -eq 0) -Detail ('unexpected repair progress phases: ' + (($badPhases | Sort-Object -Unique) -join ','))
+    $fieldProblems = New-Object System.Collections.ArrayList
+    $totalProblems = New-Object System.Collections.ArrayList
+    foreach ($progress in $progressEvents) {
+        $phase = [string]$progress.phase
+        foreach ($field in @('scanned', 'hits', 'fixed')) {
+            $state = Get-PropertyState -Object $progress -Property $field
+            if (-not $state.exists) { [void]$fieldProblems.Add($phase + '.' + $field + '=missing') }
+            elseif (-not (Test-IsNumericValue -Value $state.value)) { [void]$fieldProblems.Add($phase + '.' + $field + '=not-numeric') }
+        }
+        $totalState = Get-PropertyState -Object $progress -Property 'total'
+        if (-not $totalState.exists) {
+            [void]$fieldProblems.Add($phase + '.total=missing')
+        } elseif ($phase -eq 'enumerate') {
+            if ($null -ne $totalState.value) { [void]$totalProblems.Add('enumerate.total must be null, got ' + [string]$totalState.value) }
+        } elseif (-not (Test-IsNumericValue -Value $totalState.value)) {
+            [void]$totalProblems.Add($phase + '.total must be numeric, got ' + [string]$totalState.value)
+        }
+    }
+    Test-Assert -Name ($NamePrefix + '-progress-fields') -Condition ($fieldProblems.Count -eq 0) -Detail (($fieldProblems | Select-Object -First 5) -join '; ')
+    Test-Assert -Name ($NamePrefix + '-progress-total') -Condition ($totalProblems.Count -eq 0) -Detail (($totalProblems | Select-Object -First 5) -join '; ')
+}
+
+function Test-RepairResultContract {
+    param($Run, [string]$NamePrefix)
+    Test-ResultContract -Run $Run -NamePrefix $NamePrefix
+    $result = Get-ResultEvent $Run
+    if ($null -eq $result) { return $null }
+    Test-Assert -Name ($NamePrefix + '-result-mode') -Condition ([string]$result.mode -eq 'repair') -Detail ('mode=' + [string]$result.mode)
+    Test-Assert -Name ($NamePrefix + '-result-repairengine') -Condition ([string]$result.repairEngine -eq 'csharp') -Detail ('repairEngine=' + [string]$result.repairEngine)
+    $requiredRepair = @('fixed', 'failed', 'failedTotal', 'remaining', 'daclRestoreFailures', 'methods', 'snapshotPath', 'restorePath')
+    $missingRepair = New-Object System.Collections.ArrayList
+    foreach ($property in $requiredRepair) {
+        if ($null -eq $result.PSObject.Properties[$property]) { [void]$missingRepair.Add($property) }
+    }
+    Test-Assert -Name ($NamePrefix + '-result-repair-fields') -Condition ($missingRepair.Count -eq 0) -Detail ('missing: ' + ($missingRepair -join ','))
+    $daclState = Get-PropertyState -Object $result -Property 'daclRestoreFailures'
+    Test-Assert -Name ($NamePrefix + '-result-dacl-restore-failures') -Condition ($daclState.exists -and (Test-IsNumericValue -Value $daclState.value) -and ([int]$daclState.value -ge 0)) -Detail ('daclRestoreFailures=' + [string]$daclState.value)
+    $failedAccounted = @($result.failed).Count
+    $failedTotalState = Get-PropertyState -Object $result -Property 'failedTotal'
+    if ($failedTotalState.exists -and (Test-IsNumericValue -Value $failedTotalState.value)) { $failedAccounted = [int]$failedTotalState.value }
+    $accountedCount = [int]$result.fixed + $failedAccounted
+    Test-Assert -Name ($NamePrefix + '-result-fixed-failed-sum') -Condition ($accountedCount -eq [int]$result.hits) -Detail ('fixed + failedTotal=' + $accountedCount + ' hits=' + [int]$result.hits + ' failedList=' + @($result.failed).Count + ' failedTotal=' + [string]$failedTotalState.value)
+    $timingsState = Get-PropertyState -Object $result -Property 'timings'
+    Test-Assert -Name ($NamePrefix + '-result-timings') -Condition ($timingsState.exists) -Detail ''
+    if ($timingsState.exists) {
+        $badTimings = New-Object System.Collections.ArrayList
+        foreach ($field in @('scanMs', 'snapshotMs', 'restoreMs', 'repairMs', 'verifyMs', 'preReadMs', 'nativeSetMs', 'grantReadMs', 'grantWriteMs', 'grantLabelRestoreMs', 'grantVerifyMs', 'grantFallbacks', 'totalMs')) {
+            $state = Get-PropertyState -Object $timingsState.value -Property $field
+            if (-not $state.exists) { [void]$badTimings.Add($field + '=missing') }
+            elseif (-not (Test-IsNumericValue -Value $state.value)) { [void]$badTimings.Add($field + '=not-numeric') }
+            elseif ([double]$state.value -lt 0) { [void]$badTimings.Add($field + '=negative') }
+        }
+        Test-Assert -Name ($NamePrefix + '-result-timings-fields') -Condition ($badTimings.Count -eq 0) -Detail (($badTimings | Select-Object -First 6) -join '; ')
+    }
+    return $result
+}
+
+function Test-RepairProgressContract {
+    param($Run, $Result, [string]$NamePrefix)
+    $progressEvents = @(Get-EventsOfType $Run 'progress')
+    $repairProgress = @($progressEvents | Where-Object { [string]$_.phase -eq 'repair' })
+    Test-Assert -Name ($NamePrefix + '-progress-repair-present') -Condition ($repairProgress.Count -gt 0) -Detail ('repair progress events=' + $repairProgress.Count)
+    if ($null -eq $Result) { return }
+    $expectedTotal = [long]$Result.hits
+    $expectedFixed = [long]$Result.fixed
+    $totalValues = New-Object System.Collections.ArrayList
+    $maxFixed = [long](-1)
+    $sawFixed = $false
+    foreach ($progress in $repairProgress) {
+        $totalState = Get-PropertyState -Object $progress -Property 'total'
+        if ($totalState.exists -and (Test-IsNumericValue -Value $totalState.value)) {
+            [void]$totalValues.Add([long]$totalState.value)
+        }
+        $fixedState = Get-PropertyState -Object $progress -Property 'fixed'
+        if ($fixedState.exists -and (Test-IsNumericValue -Value $fixedState.value)) {
+            $sawFixed = $true
+            $fixedValue = [long]$fixedState.value
+            if ($fixedValue -gt $maxFixed) { $maxFixed = $fixedValue }
+        }
+    }
+    $hasExpectedTotal = $false
+    foreach ($value in $totalValues) { if ($value -eq $expectedTotal) { $hasExpectedTotal = $true } }
+    Test-Assert -Name ($NamePrefix + '-progress-repair-total') -Condition $hasExpectedTotal -Detail ('repair total values=' + (($totalValues | Sort-Object -Unique) -join ',') + ' result.hits=' + $expectedTotal)
+    Test-Assert -Name ($NamePrefix + '-progress-repair-fixed') -Condition ($sawFixed -and ($maxFixed -eq $expectedFixed)) -Detail ('progress fixed max=' + $maxFixed + ' result.fixed=' + $expectedFixed)
+}
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 function Initialize-FullFixtures {
@@ -1051,9 +1199,11 @@ function Test-RepairFailure {
 
     $dataDir = Join-Path $script:BaseDir 'data-repair-fail'
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $repairTarget, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
-    Test-EventContract -Run $run -NamePrefix 'repair-fail'
+    # New repair contract: no streamed hit events; progress phases are
+    # enumerate/repair/verify and the result carries repairEngine + timings.
+    Test-RepairEventContract -Run $run -NamePrefix 'repair-fail'
     Test-Assert -Name 'repair-fail-exit-code' -Condition ($run.exitCode -eq 2) -Detail ('exit=' + $run.exitCode)
-    $result = Get-ResultEvent $run
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'repair-fail'
     if ($null -ne $result) {
         $failedArray = @($result.failed)
         Test-Assert -Name 'repair-fail-result-failed-nonempty' -Condition ($failedArray.Count -gt 0) -Detail ('failed=' + $failedArray.Count)
@@ -1069,6 +1219,7 @@ function Test-RepairFailure {
         $snapshotCheck = Test-SnapshotDocument -SnapshotPath ([string]$result.snapshotPath) -ExpectedHitCount $scanHits.Count -Prefix 'repair-fail'
         Test-Assert -Name 'repair-fail-snapshot-document' -Condition $snapshotCheck -Detail ('hitCount expected=' + $scanHits.Count)
         Test-Assert -Name 'repair-fail-restore-parse' -Condition (Test-ScriptParses -Path ([string]$result.restorePath)) -Detail ('restorePath=' + [string]$result.restorePath)
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'repair-fail'
     }
     $repairErrors = @(Get-EventsOfType $run 'error' | Where-Object { [string]$_.phase -eq 'repair' })
     $withOutput = @($repairErrors | Where-Object { -not [string]::IsNullOrEmpty([string]$_.output) })
@@ -1097,9 +1248,9 @@ function Test-NativeFastPath {
     $fakeIcacls = Join-Path $script:BaseDir 'fake-icacls.cmd'
     New-FixtureFile $fakeIcacls ("@echo off`r`nexit /b 5`r`n")
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $target, '-SkipDirs', 'node_modules', '-DataDir', $dataDir, '-IcaclsPath', $fakeIcacls)
-    Test-EventContract -Run $run -NamePrefix 'native-fastpath'
+    Test-RepairEventContract -Run $run -NamePrefix 'native-fastpath'
     Test-Assert -Name 'native-fastpath-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
-    $result = Get-ResultEvent $run
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'native-fastpath'
     if ($null -ne $result) {
         Test-Assert -Name 'native-fastpath-fixed' -Condition ([int]$result.fixed -gt 0) -Detail ('fixed=' + [int]$result.fixed)
         Test-Assert -Name 'native-fastpath-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
@@ -1107,6 +1258,7 @@ function Test-NativeFastPath {
         $nativeCount = 0
         if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['native']) { $nativeCount = [int]$result.methods.native }
         Test-Assert -Name 'native-fastpath-method' -Condition ($nativeCount -gt 0) -Detail ('methods.native=' + $nativeCount + ' methods.pinvoke=' + [int]$result.methods.pinvoke + ' methods.icacls=' + [int]$result.methods.icacls + ' fixed=' + [int]$result.fixed + ' remaining=' + [int]$result.remaining)
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'native-fastpath'
     }
     $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $target, '-SkipDirs', 'node_modules')
     Test-Assert -Name 'native-fastpath-rescan' -Condition ($rescan.exitCode -eq 0) -Detail ('exit=' + $rescan.exitCode)
@@ -1155,9 +1307,9 @@ function Test-RepairNeedsGrant {
     # 4) the engine must repair it through the temporary WRITE_OWNER grant fallback
     $dataDir = Join-Path $script:BaseDir 'data-needs-grant'
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $dir, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
-    Test-EventContract -Run $run -NamePrefix 'needs-grant'
+    Test-RepairEventContract -Run $run -NamePrefix 'needs-grant'
     Test-Assert -Name 'needs-grant-exit-code' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
-    $result = Get-ResultEvent $run
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'needs-grant'
     if ($null -ne $result) {
         Test-Assert -Name 'needs-grant-fixed' -Condition ([int]$result.fixed -eq 1) -Detail ('fixed=' + [int]$result.fixed + ' hits=' + [int]$result.hits)
         Test-Assert -Name 'needs-grant-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
@@ -1165,6 +1317,7 @@ function Test-RepairNeedsGrant {
         $grantCount = 0
         if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['grant']) { $grantCount = [int]$result.methods.grant }
         Test-Assert -Name 'needs-grant-method' -Condition ($grantCount -gt 0) -Detail ('methods.grant=' + $grantCount)
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'needs-grant'
     }
     $labelAfterRepair = Get-LabelInfo $file
     Test-Assert -Name 'needs-grant-label-medium' -Condition ($labelAfterRepair.ok -and $labelAfterRepair.level -eq 'Medium') -Detail ('level=' + $labelAfterRepair.level + ' explicit=' + $labelAfterRepair.explicit)
@@ -1224,9 +1377,9 @@ function Test-RepairFastPath {
     $repairStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
     $repairStopwatch.Stop()
-    Test-EventContract -Run $run -NamePrefix 'fast-repair'
+    Test-RepairEventContract -Run $run -NamePrefix 'fast-repair'
     Test-Assert -Name 'fast-repair-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
-    $result = Get-ResultEvent $run
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'fast-repair'
     if ($null -ne $result) {
         Test-Assert -Name 'fast-repair-remaining' -Condition ([int]$result.remaining -eq 0) -Detail ('remaining=' + [int]$result.remaining)
         Test-Assert -Name 'fast-repair-failed-empty' -Condition (@($result.failed).Count -eq 0) -Detail ('failed=' + @($result.failed).Count)
@@ -1239,6 +1392,10 @@ function Test-RepairFastPath {
         if ($null -ne $result.methods -and $null -ne $result.methods.PSObject.Properties['icacls']) { $icaclsCount = [int]$result.methods.icacls }
         Test-Assert -Name 'fast-repair-native-method' -Condition ($nativeCount -gt 0) -Detail ('methods.native=' + $nativeCount + ' methods.grant=' + $grantCount + ' methods.icacls=' + $icaclsCount)
         Test-Assert -Name 'fast-repair-grant-method' -Condition ($grantCount -gt 0) -Detail ('methods.grant=' + $grantCount)
+        $fallbackCount = -1
+        if ($null -ne $result.timings -and $null -ne $result.timings.PSObject.Properties['grantFallbacks']) { $fallbackCount = [int]$result.timings.grantFallbacks }
+        Test-Assert -Name 'fast-repair-grant-combined-write' -Condition ($fallbackCount -eq 0) -Detail ('grantFallbacks=' + $fallbackCount + ' (combined DACL+label write must be used; >0 means it fell back)')
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'fast-repair'
     }
     $grantDaclAfter = Get-DaclSddl $sampleGrantFile
     $directDaclAfter = Get-DaclSddl $sampleDirectFile
@@ -1250,7 +1407,8 @@ function Test-RepairFastPath {
     if ($null -ne $result) { $hitCount = [int]$result.hits }
     $perFileMs = 0
     if ($GrantFileCount -gt 0) { $perFileMs = [math]::Round(([double]$repairStopwatch.ElapsedMilliseconds / [double]$GrantFileCount), 2) }
-    Add-Info -Name 'repair-fast-path-throughput' -Detail ('grantFiles=' + $GrantFileCount + ' directFiles=20 ' + 'hits=' + $hitCount + ' repairWallMs=' + $repairStopwatch.ElapsedMilliseconds + ' perGrantFileMs=' + $perFileMs + ' setupMs=' + $setupStopwatch.ElapsedMilliseconds)
+    $timingText = Get-TimingInfoText -Result $result
+    Add-Info -Name 'repair-fast-path-throughput' -Detail ('grantFiles=' + $GrantFileCount + ' directFiles=20 ' + 'hits=' + $hitCount + ' repairWallMs=' + $repairStopwatch.ElapsedMilliseconds + ' perGrantFileMs=' + $perFileMs + ' setupMs=' + $setupStopwatch.ElapsedMilliseconds + ' ' + $timingText)
 
     # The stripped DACLs (protected/empty) would block enumeration and recursive
     # deletion later. Re-grant the owner full control on the root first so /T can
@@ -1259,6 +1417,129 @@ function Test-RepairFastPath {
         $rootFix = Invoke-IcaclsOnPath -Path $grantDir -Arguments ('/grant *' + $userSid + ':(OI)(CI)F')
         $childFix = Invoke-IcaclsOnPath -Path $grantDir -Arguments ('/grant *' + $userSid + ':(OI)(CI)F /T')
         Add-Info -Name 'fast-repair-cleanup-acl' -Detail ('rootRestore exit=' + $rootFix.exitCode + ' recursiveRestore exit=' + $childFix.exitCode)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Repair progress throttling (runs in FULL and SANDBOX): a moderate hit set must
+# produce far fewer `repair` progress lines than repaired objects, otherwise a
+# 100k-object repair would flood the Host with JSON lines. This also covers the
+# SANDBOX failure path (label writes denied -> exit 2) safely.
+# ---------------------------------------------------------------------------
+function Test-RepairProgressThrottle {
+    param([int]$FileCount = 80)
+    $root = Join-Path $script:BaseDir 'repair-throttle'
+    New-FixtureDirectory $root
+    for ($index = 0; $index -lt $FileCount; $index++) {
+        New-FixtureFile (Join-Path $root ('t{0:D3}.txt' -f $index)) 'x'
+    }
+    if ($script:FullMode) {
+        $setLow = Set-FixtureLabel -Path $root -LevelSpecification '(OI)(CI)Low'
+        Test-Assert -Name 'repair-throttle-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
+        if ($setLow.exitCode -ne 0) { return }
+    }
+    $dataDir = Join-Path $script:BaseDir 'data-repair-throttle'
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
+    Test-RepairEventContract -Run $run -NamePrefix 'repair-throttle'
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'repair-throttle'
+    if ($null -eq $result) { return }
+    $hits = [int]$result.hits
+    if ($script:FullMode) {
+        Test-Assert -Name 'repair-throttle-exit-full' -Condition (($run.exitCode -eq 0) -and ([int]$result.remaining -eq 0)) -Detail ('exit=' + $run.exitCode + ' remaining=' + [int]$result.remaining + ' hits=' + $hits + ' fixed=' + [int]$result.fixed)
+    } else {
+        Test-Assert -Name 'repair-throttle-exit-sandbox' -Condition (($run.exitCode -eq 2) -and ([int]$result.remaining -gt 0)) -Detail ('exit=' + $run.exitCode + ' remaining=' + [int]$result.remaining + ' hits=' + $hits + ' failed=' + @($result.failed).Count)
+    }
+    $progressEvents = @(Get-EventsOfType $run 'progress')
+    $repairProgress = @($progressEvents | Where-Object { [string]$_.phase -eq 'repair' })
+    $verifyProgress = @($progressEvents | Where-Object { [string]$_.phase -eq 'verify' })
+    $throttled = ($repairProgress.Count -gt 0) -and ($repairProgress.Count -lt $hits)
+    Test-Assert -Name 'repair-progress-throttled' -Condition $throttled -Detail ('repair progress events=' + $repairProgress.Count + ' hits=' + $hits + ' (progress must be throttled well below the object count)')
+    $eventsPerHit = 0
+    if ($hits -gt 0) { $eventsPerHit = [math]::Round(([double]$repairProgress.Count / [double]$hits), 3) }
+    Add-Info -Name 'repair-progress-throttle' -Detail ('hits=' + $hits + ' fixtureFiles=' + $FileCount + ' repairProgressEvents=' + $repairProgress.Count + ' verifyProgressEvents=' + $verifyProgress.Count + ' eventsPerHit=' + $eventsPerHit)
+}
+
+function Test-ZeroHitRepair {
+    # A read-only system directory with no Low labels exercises the zero-hit Repair
+    # contract: exit 0, no snapshot/restore script, empty failure/error lists.
+    $candidate = Join-Path $env:SystemRoot 'System32\drivers\etc'
+    if (-not [System.IO.Directory]::Exists($candidate)) {
+        Add-Skip -Name 'repair-zero-hit' -Detail 'no read-only system directory available'
+        return
+    }
+    $probeRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $candidate, '-SkipDirs', 'node_modules')
+    $probeResult = Get-ResultEvent $probeRun
+    if ($null -eq $probeResult -or [int]$probeResult.hits -ne 0) {
+        Add-Skip -Name 'repair-zero-hit' -Detail ('candidate has Low hits; probe exit=' + $probeRun.exitCode)
+        return
+    }
+    $dataDir = Join-Path $script:BaseDir 'data-zero-hit'
+    New-FixtureDirectory $dataDir
+    $snapshotDir = Join-Path $dataDir 'snapshots'
+    $before = 0
+    if ([System.IO.Directory]::Exists($snapshotDir)) {
+        $before = @([System.IO.Directory]::GetFiles($snapshotDir, 'snapshot-*.json')).Count
+    }
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $candidate, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
+    Test-RepairEventContract -Run $run -NamePrefix 'repair-zero-hit'
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'repair-zero-hit'
+    Test-Assert -Name 'repair-zero-hit-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
+    if ($null -ne $result) {
+        $countsOk = ([int]$result.hits -eq 0) -and ([int]$result.fixed -eq 0) -and ([int]$result.remaining -eq 0) -and (@($result.failed).Count -eq 0)
+        Test-Assert -Name 'repair-zero-hit-counts' -Condition $countsOk -Detail ('hits=' + [int]$result.hits + ' fixed=' + [int]$result.fixed + ' failed=' + @($result.failed).Count)
+        Test-Assert -Name 'repair-zero-hit-no-snapshot' -Condition ([string]::IsNullOrEmpty([string]$result.snapshotPath)) -Detail ('snapshotPath=' + [string]$result.snapshotPath)
+        Test-Assert -Name 'repair-zero-hit-no-restore' -Condition ([string]::IsNullOrEmpty([string]$result.restorePath)) -Detail ('restorePath=' + [string]$result.restorePath)
+        $after = 0
+        if ([System.IO.Directory]::Exists($snapshotDir)) {
+            $after = @([System.IO.Directory]::GetFiles($snapshotDir, 'snapshot-*.json')).Count
+        }
+        Test-Assert -Name 'repair-zero-hit-no-snapshot-file' -Condition ($after -eq $before) -Detail ('snapshot files before=' + $before + ' after=' + $after)
+    }
+}
+
+function Test-RepairPropagationScope {
+    # FULL-only observation: repairing a Low directory uses an inheritable
+    # (OI)(CI)Medium label, so Windows may propagate the inherited Medium ACE to
+    # existing children - including skip dirs / DataDir-in-Root / non-hit children.
+    # This records the actual behaviour; C10 "non-hit unchanged" needs a product
+    # decision based on the FULL result (see HANDOFF §4.2).
+    $root = Join-Path $script:BaseDir 'repair-propagation'
+    New-FixtureDirectory $root
+    New-FixtureDirectory (Join-Path $root 'kept')
+    New-FixtureFile (Join-Path $root 'kept\kept-file.txt') 'x'
+    $skipDir = Join-Path $root 'node_modules'
+    New-FixtureDirectory $skipDir
+    New-FixtureFile (Join-Path $skipDir 'skip-file.txt') 'x'
+    $dataDir = Join-Path $root 'data-in-root'
+    New-FixtureDirectory $dataDir
+    New-FixtureFile (Join-Path $dataDir 'data-file.txt') 'x'
+    $explicitMedium = Join-Path $root 'explicit-medium.txt'
+    New-FixtureFile $explicitMedium 'x'
+    [void](Set-FixtureLabel -Path $explicitMedium -LevelSpecification 'Medium')
+    $setLow = Set-FixtureLabel -Path $root -LevelSpecification '(OI)(CI)Low'
+    Test-Assert -Name 'repair-propagation-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
+    if ($setLow.exitCode -ne 0) { return }
+    $watch = @($skipDir, (Join-Path $skipDir 'skip-file.txt'), $dataDir, (Join-Path $dataDir 'data-file.txt'), $explicitMedium)
+    $before = @{}
+    foreach ($path in $watch) {
+        $info = Get-LabelInfo $path
+        $before[$path] = @{ level = [string]$info.level; sddl = [string]$info.sddl }
+    }
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
+    Test-Assert -Name 'repair-propagation-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
+    $result = Get-ResultEvent $run
+    $changed = New-Object System.Collections.ArrayList
+    foreach ($path in $watch) {
+        $info = Get-LabelInfo $path
+        if ([string]$info.sddl -ne [string]$before[$path].sddl) {
+            [void]$changed.Add((Split-Path -Leaf $path) + ' ' + $before[$path].level + '->' + [string]$info.level)
+        }
+    }
+    $hitCount = 0
+    if ($null -ne $result) { $hitCount = [int]$result.hits }
+    Add-Info -Name 'repair-propagation-scope' -Detail ('watched=' + $watch.Count + ' changed=' + $changed.Count + ' hits=' + $hitCount + ' [' + (($changed | Select-Object -First 6) -join '; ') + ']')
+    if ($changed.Count -gt 0) {
+        Add-Info -Name 'repair-propagation-observed' -Detail 'Windows propagated the directory (OI)(CI)Medium label to skipped/non-hit children; C10 "non-hit unchanged" needs a product decision (see HANDOFF 4.2)'
     }
 }
 
@@ -1278,20 +1559,17 @@ function Test-DataDirExclusion {
     Test-Assert -Name 'datadir-exclusion-pre-existing-low' -Condition ($preInfo.ok -and $preInfo.level -eq 'Low') -Detail ('level=' + $preInfo.level)
 
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
-    Test-EventContract -Run $run -NamePrefix 'datadir-exclusion'
-    $hits = @(Get-EventsOfType $run 'hit')
-    Test-Assert -Name 'datadir-exclusion-hit-count' -Condition ($hits.Count -eq 2) -Detail ('hits=' + $hits.Count + ' expected=2 (root + visible.txt, DataDir subtree excluded)')
-    $dataLower = $dataDir.ToLowerInvariant().TrimEnd('\')
-    $badHits = New-Object System.Collections.ArrayList
-    foreach ($hit in $hits) {
-        $pathLower = ([string]$hit.path).ToLowerInvariant()
-        if ($pathLower -eq $dataLower -or $pathLower.StartsWith($dataLower + '\')) { [void]$badHits.Add([string]$hit.path) }
-    }
-    Test-Assert -Name 'datadir-exclusion-hits' -Condition ($badHits.Count -eq 0) -Detail ('hits under DataDir: ' + (($badHits | Select-Object -First 3) -join '; '))
-    $result = Get-ResultEvent $run
+    # Repair no longer streams `hit` events: count via result.hits and prove the
+    # exclusion from the pre-mutation snapshot document.
+    Test-RepairEventContract -Run $run -NamePrefix 'datadir-exclusion'
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'datadir-exclusion'
     if ($null -ne $result) {
+        Test-Assert -Name 'datadir-exclusion-result-hits' -Condition ([int]$result.hits -eq 2) -Detail ('result.hits=' + [int]$result.hits + ' expected=2 (root + visible.txt, DataDir subtree excluded)')
         Test-Assert -Name 'datadir-exclusion-snapshot' -Condition ([System.IO.File]::Exists([string]$result.snapshotPath)) -Detail ('snapshotPath=' + [string]$result.snapshotPath)
         Test-Assert -Name 'datadir-exclusion-snapshot-dir' -Condition ([System.IO.Directory]::Exists((Join-Path $dataDir 'snapshots'))) -Detail ((Join-Path $dataDir 'snapshots'))
+        Test-SnapshotExcludesPath -SnapshotPath ([string]$result.snapshotPath) -ExcludedPath $dataDir -ExpectedHitCount 2 -Prefix 'datadir-exclusion'
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'datadir-exclusion'
+        $dataLower = $dataDir.ToLowerInvariant().TrimEnd('\')
         $badFailures = New-Object System.Collections.ArrayList
         foreach ($entry in @($result.failed)) {
             $pathLower = ([string]$entry.path).ToLowerInvariant()
@@ -1507,6 +1785,33 @@ function Test-SnapshotDocument {
     return $ok
 }
 
+function Test-SnapshotExcludesPath {
+    param([string]$SnapshotPath, [string]$ExcludedPath, [int]$ExpectedHitCount, [string]$Prefix)
+    if ([string]::IsNullOrEmpty($SnapshotPath) -or -not [System.IO.File]::Exists($SnapshotPath)) {
+        Add-Fail -Name ($Prefix + '-snapshot-exists') -Detail ('snapshotPath=' + $SnapshotPath)
+        return
+    }
+    Test-Assert -Name ($Prefix + '-snapshot-exists') -Condition $true -Detail ('snapshotPath=' + $SnapshotPath)
+    try {
+        $text = [System.IO.File]::ReadAllText($SnapshotPath, $script:Utf8NoBom)
+        $document = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Add-Fail -Name ($Prefix + '-snapshot-json') -Detail $_.Exception.Message
+        return
+    }
+    Test-Assert -Name ($Prefix + '-snapshot-hitcount') -Condition ([int]$document.hitCount -eq $ExpectedHitCount) -Detail ('hitCount=' + [int]$document.hitCount + ' expected=' + $ExpectedHitCount)
+    $hits = @($document.hits)
+    Test-Assert -Name ($Prefix + '-snapshot-hits-count') -Condition ($hits.Count -eq $ExpectedHitCount) -Detail ('snapshot hits=' + $hits.Count + ' expected=' + $ExpectedHitCount)
+    $excludedLower = $ExcludedPath.ToLowerInvariant().TrimEnd('\')
+    $bad = New-Object System.Collections.ArrayList
+    foreach ($hit in $hits) {
+        $pathLower = ([string]$hit.path).ToLowerInvariant()
+        if ($pathLower -eq $excludedLower) { [void]$bad.Add([string]$hit.path); continue }
+        if ($pathLower.StartsWith($excludedLower + '\')) { [void]$bad.Add([string]$hit.path) }
+    }
+    Test-Assert -Name ($Prefix + '-snapshot-excludes-path') -Condition ($bad.Count -eq 0) -Detail ('snapshot hits under excluded path: ' + (($bad | Select-Object -First 3) -join '; '))
+}
+
 function Test-ScriptParses {
     param([string]$Path)
     if (-not [System.IO.File]::Exists($Path)) { return $false }
@@ -1558,9 +1863,9 @@ function Test-RepairSuccess {
     $beforeSnapshot = Get-NonHitSddlSnapshot -Fixtures $Fixtures
     $dataDir = Join-Path $script:BaseDir 'data-repair-ok'
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Repair', '-Root', $Fixtures.root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir)
-    Test-EventContract -Run $run -NamePrefix 'repair-ok'
+    Test-RepairEventContract -Run $run -NamePrefix 'repair-ok'
     Test-Assert -Name 'repair-ok-exit-code' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode)
-    $result = Get-ResultEvent $run
+    $result = Test-RepairResultContract -Run $run -NamePrefix 'repair-ok'
     if ($null -ne $result) {
         Test-Assert -Name 'repair-ok-fixed' -Condition ([int]$result.fixed -eq $ExpectedHits.Count) -Detail ('fixed=' + [int]$result.fixed + ' expected=' + $ExpectedHits.Count)
         Test-Assert -Name 'repair-ok-failed-empty' -Condition (@($result.failed).Count -eq 0) -Detail ('failed=' + @($result.failed).Count)
@@ -1569,6 +1874,7 @@ function Test-RepairSuccess {
         Test-Assert -Name 'repair-ok-restore-exists' -Condition ([System.IO.File]::Exists([string]$result.restorePath)) -Detail ('restorePath=' + [string]$result.restorePath)
         Test-Assert -Name 'repair-ok-snapshot-document' -Condition (Test-SnapshotDocument -SnapshotPath ([string]$result.snapshotPath) -ExpectedHitCount $ScanOutcome.hits.Count -Prefix 'repair-ok') -Detail ('hits=' + $ScanOutcome.hits.Count)
         Test-Assert -Name 'repair-ok-restore-parse' -Condition (Test-ScriptParses -Path ([string]$result.restorePath)) -Detail ('restorePath=' + [string]$result.restorePath)
+        Test-RepairProgressContract -Run $run -Result $result -NamePrefix 'repair-ok'
     }
 
     $rescan = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
@@ -1813,8 +2119,19 @@ try {
         Add-Skip -Name 'repair-fast-path' -Detail 'requires label writes + DACL manipulation (sandbox denies /setintegritylevel)'
     }
 
+    # ---- repair progress throttling (both modes; label writes may fail in SANDBOX)
+    Test-RepairProgressThrottle
+
+    # ---- zero-hit Repair contract (no snapshot/restore, exit 0) -----------
+    Test-ZeroHitRepair
+
     # ---- DataDir inside -Root must be excluded from traversal -------------
     Test-DataDirExclusion
+
+    # ---- FULL-only: directory label propagation observation ---------------
+    if ($script:FullMode) {
+        Test-RepairPropagationScope
+    }
 
     # ---- quick vs deep timing on a 2000 file fixture ----------------------
     Test-QuickBench

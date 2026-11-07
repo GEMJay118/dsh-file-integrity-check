@@ -24,11 +24,11 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
   - **深度模式**：面板里的「深度扫描（逐文件清单）」开关，输出全部命中（含继承项），适合排查或需要逐文件清单时使用。
 - **命中口径**：区分「显式设置」与「继承自父级」，并在面板中说明继承项可能随父级恢复（Windows 不保证自动传播）。
 - **清单查看与导出**：面板内分页查看命中清单（路径 / 类型 / 显式或继承 / 复制完整路径）；扫描结束时引擎直接写出完整 JSON 报告，导出即返回该文件路径。
-- **一键清除**：修复时优先在进程内用 P/Invoke 直接设置 Medium（目录 `(OI)(CI)Medium`、文件 `Medium`），随后复扫验证。
-- **权限降级路径**：遇到对象缺少 `WRITE_OWNER`（DSH 沙箱创建的常见情况）时，在进程内临时授予当前用户 `WRITE_OWNER` → 改标签 → 还原 DACL，并校验 **DACL 逐字符还原**；失败才回退 `icacls` 获取可读错误。
-- **快照与恢复**：清除前保存命中对象的标签快照与 `restore-*.ps1`；可随时把对象恢复为 Low。
-- **失败日志**：清除失败时逐条列出对象、原因与 `icacls` 原始输出，可一键生成日志文件。
-- **进度体验**：运行中显示阶段、已扫描数量、扫描速率与预计剩余时间（total 已知时），随时可取消。
+- **一键清除**：修复在引擎内一次完成——扫描命中并写出快照 → 单遍逐对象把标签设为 Medium（目录 `(OI)(CI)Medium`、文件 `Medium`）→ 每个对象改完立即复读验证 → 只对失败候选再复验一次。修复阶段不再逐条输出命中，也不再整遍复扫。
+- **权限降级路径**：遇到对象缺少 `WRITE_OWNER`（DSH 沙箱创建的常见情况）且当前用户是对象 owner 时，在进程内临时授予 `WRITE_OWNER` → 改标签 → 还原原 DACL，并复读 SDDL **逐字符比较**确认还原一致；失败时记录可读诊断（Repair 不再逐对象回退 `icacls`；`icacls` 只在环境能力探测与恢复脚本里使用）。
+- **快照与恢复**：清除前保存命中对象的标签快照与 `restore-*.ps1`；可随时把对象恢复为 Low。清除结果里的「快照文件」行有 **打开文件夹** 按钮，可直接打开快照所在目录（Host 只允许打开 `snapshots` 目录）。
+- **失败日志**：清除失败时逐条列出对象、原因与诊断输出，可一键生成日志文件。
+- **进度体验**：运行中显示阶段（扫描 / 修复 / 验证）、已扫描或已修复数量、扫描速率与预计剩余时间（total 已知时），随时可取消；修复进度按批合并，不再每个对象一行。
 - **安全约束**：只接受 DSH 已注册工作区的规范化路径；拒绝盘根、用户主目录及其宽泛子目录、DSH 安装目录、相对路径；HTTP 只接受同源请求。
 
 ## 使用
@@ -39,8 +39,8 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
    - 未命中：显示「未发现 Low 标签」；
    - 命中：显示「发现 N 个 Low 对象（X 显式 / Y 继承自父级）」，可展开清单、导出 JSON。
      快速模式下清单只列显式项，继承项显示为聚合说明；需要逐文件清单时切到深度模式再扫描。
-4. 点击 **一键清除** → 确认条（含预计修复对象数、快照/恢复提示、活跃会话风险提示）→ 执行。
-5. 结果显示「清除成功（N 项）」或「清除失败（N 项失败）」，失败时可 **生成日志**，并显示日志路径。
+4. 点击 **一键清除** → 确认条（含预计修复对象数、快照/恢复提示、活跃会话风险提示）→ 执行。清除过程显示「扫描 / 修复标签 / 复扫验证」阶段与已修复数量。
+5. 结果显示「清除成功（N 项）」或「清除失败（N 项失败）」；失败项给出原因与诊断，可 **生成日志**，并显示日志路径。面板的「复扫」提示来自引擎对失败候选的终验（修复后不再整遍复扫），需要完整确认时可点「重新扫描」。
 
 > 提醒：只要还有 `workspace-write` 会话在写入，DSH 可能再次给工作区写入 Low 标签。插件不改变沙箱行为，也不承诺标签不再复发。
 
@@ -70,7 +70,7 @@ plugin_manager install_bundle  D:\path\to\dsh-file-integrity-check
 
 ```
 右侧栏面板 (client.js, React.createElement)
-   │ 同源 fetch  /dsh-low-integrity-check/*（quick / deep）
+   │ 同源 fetch  /dsh-low-integrity-check/*（quick / deep / repair）
    ▼
 Host 插件 (index.js, Cordis)
    │ 1. workspaceRegistry 解析会话所属工作区（客户端不传路径）
@@ -79,9 +79,10 @@ Host 插件 (index.js, Cordis)
    │ 4. spawn 隐藏 powershell.exe（windowsHide，非 DSH 会话）
    ▼
 引擎 (engine/integrity.ps1)  -Mode Env|Scan|Repair  -ScanDepth quick|deep
-   │ quick：内嵌 C# 扫描器（FindFirstFileExW + 标签读取 + 判定）
-   │ deep ：原 PowerShell 全量遍历
-   │ JSON Lines：env / progress / hit / error / result / fatal
+   │ Scan quick：内嵌 C# 扫描器（FindFirstFileExW + 标签读取 + 判定）
+   │ Scan deep ：原 PowerShell 全量遍历
+   │ Repair    ：内嵌 C# RepairSession（单遍扫描+快照 → 单遍修复 → 失败候选复验）
+   │ JSON Lines：env / progress / hit / error / result / fatal（Repair 不发 hit）
    │ Scan 结束时直写 <DataDir>\reports\scan-*.json（result.reportPath）
    ▼
 Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
@@ -90,10 +91,12 @@ Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
 
 关键实现点：
 
-- **标签读取**：P/Invoke `GetNamedSecurityInfoW` + `LABEL_SECURITY_INFORMATION` 读取 SDDL（普通用户可读，无需 SeSecurityPrivilege）；解析 `ML` ACE 的等级（`LW/ME/HI/SI`）与继承标志（`ID`）。quick 模式在 C# 内完成枚举与解析，避免逐对象跨 PowerShell 边界的开销。
+- **标签读取**：P/Invoke `GetNamedSecurityInfoW` + `LABEL_SECURITY_INFORMATION` 读取 SDDL（普通用户可读，无需 SeSecurityPrivilege）；解析 `ML` ACE 的等级（`LW/ME/HI/SI`）与继承标志（`ID`）。quick 模式在 C# 内完成枚举与解析；修复扫描改用 `GetAce` 直读 `ML` ACE，按需重建规范 SDDL 写入快照。
 - **扫描模式**：quick 只流式输出显式命中（继承项计数），默认用于日常检查；deep 输出全部命中，供逐文件排查。
-- **修复顺序**：显式 Low 目录（深度升序）→ 显式 Low 文件 → 复扫剩余对象逐个兜底；每个对象改完立即复读验证。不使用 `/T` 全树，避免改动非命中对象。
-- **修复快路径**：C# 进程内 `SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)` 直接设标签（`methods.native`）；Access denied 时进程内临时 DACL grant/还原（`methods.grant`），只有都失败才回退 `icacls` 拿可读错误。
+- **修复快照**：任何标签写入之前，先由 C# 单遍扫描把命中对象、原始标签与 SDDL 流式写入 `snapshot-*.json`，再由 PowerShell 写出 `restore-*.ps1`；两者都完成后才开始改标签。
+- **修复顺序**：按「对象类型 + 路径深度」分波推进（目录波→文件波，波内并行、波间串行，同波内无祖先/后代）；每个命中对象只修一次，改完立即复读验证；不使用 `/T` 全树，避免改动非命中对象。
+- **修复快路径**：C# 进程内 `SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)` 直接设标签（`methods.native`）；Access denied 且当前用户是 owner 时走进程内临时授权：一次读取 owner+DACL → 授权 → 设标签 → 还原 → 一次复读逐字符比较（`methods.grant`）。阶段 5 起「还原 DACL」与「写标签」合并为一次 `SetNamedSecurityInfo`；阶段 6 起默认 8 线程并行（按 kind+depth 分波）。失败只记录可读诊断，不再 spawn `icacls`。
+- **终验只覆盖失败候选**：修复结束后只复读失败候选；若候选已因父级恢复传播变为 Medium，则不计入失败。
 - **长路径/中文**：枚举与 P/Invoke 使用 `\\?\` 前缀；stdout 为 UTF-8 无 BOM 的 JSON Lines；支持中文、空格与 >260 字符路径。
 - **跳过**：默认跳过 `.git`、`node_modules`、`.pnpm-store`；不跟随 junction / 符号链接。
 
@@ -104,33 +107,33 @@ Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
 | 目录 | 内容 |
 |---|---|
 | `reports\scan-*.json` | 扫描完整报告（quick 只含显式 items，deep 含全部命中；导出直接返回该路径） |
-| `snapshots\snapshot-*.json` | 清除前的命中对象与原始标签/SDDL |
+| `snapshots\snapshot-*.json` | 清除前的命中对象与原始标签/SDDL（在任何标签改动之前写入） |
 | `snapshots\restore-*.ps1` | 把命中对象恢复为 Low 的独立脚本（PS 5.1 可执行） |
 | `exports\low-integrity-*.json` | 旧版导出（当引擎未提供 reportPath 时的后备） |
-| `logs\repair-*.log` | 失败日志（对象、原因、`icacls` 原始输出、环境预检） |
+| `logs\repair-*.log` | 失败日志（对象、原因、诊断输出、环境预检） |
 
 ## 开发与测试
 
 ```powershell
-# 语法与单测（36 项：路径安全 / 任务管理 / 引擎协议 / HTTP 路由）
+# 语法与单测（42 项：路径安全 / 任务管理 / 引擎协议 / HTTP 路由）
 npm test
 
 # 引擎夹具验收（需要能写完整性标签的普通用户会话）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 ```
 
-`test/run-fixtures.ps1` 会自动探测标签写权限：可写则跑 FULL（含修复成功、恢复回滚、继承传播实验、native/grant 修复快路径、报告文件断言、DataDir 排除等）；不可写则跑沙箱内可测子集并标注 SKIP。
+`test/run-fixtures.ps1` 会自动探测标签写权限：可写则跑 FULL（含修复成功、恢复回滚、继承传播实验、native/grant 修复快路径、Repair 事件/进度/结果契约、并行基准、报告文件断言、DataDir 排除等）；不可写则跑沙箱内可测子集并标注 SKIP。
 
-开发验收结果（DSH 0.2.2-rc.1 / Windows 11，2026-11-06）：
+开发验收结果（DSH 0.2.2-rc.1 / Windows 11，2026-11-07）：
 
-- 引擎 FULL 夹具（阶段 2 验收）：**PASS=184 / FAIL=0 / SKIP=1 / INFO=6**
-- 沙箱内回归（PS 5.1 与 pwsh 7）：均 **PASS=140 / FAIL=0 / SKIP=8**
-- Node / Host 测试：**36 项全过**（paths 15 / jobs 11 / engine 6 / routes 4）
-- 性能（同机对照）：
-  - 2000 文件夹具：quick ≈1.55s vs deep ≈13.4s（约 8.6×）
-  - 真实 122,575 项只读扫描：quick ≈38.8s vs 旧版 deep ≈6m46s（约 10.5×）
-  - 3000 个需临时授权文件 + 20 个普通文件的修复：约 38 秒（夹具 INFO `repairWallMs≈37.7s`；总时长仍由 Repair 的 3 遍深度扫描主导，逐对象 `icacls` 进程已消除）
-- 真实工作区：修复前 24 命中（1 显式根 + 23 继承），清除后复扫 **0 命中**、根与文件均为 Medium，非命中 DACL 抽样逐字符一致。
+- 引擎夹具：FULL **PASS=324 / FAIL=0 / SKIP=1 / INFO=9**；SANDBOX **PASS=222 / FAIL=0 / SKIP=8 / INFO=4**（约 48 秒）。
+- Node / Host 测试：**42 项全过**（paths 15 / jobs 16 / engine 6 / routes 5）。
+- 性能（阶段口径与完整数据见维护文档 HANDOFF）：
+  - **扫描**：真实 122,575 项 quick **≈7s**（C# 扫描器）；2000 文件夹具 quick ≈1.7s vs deep ≈25s。
+  - **修复（阶段 4，顺序版基线，真实 114k）**：110,133 命中 **≈25min**（≈13.6ms/对象），其中扫描 7.1s、快照 0.43s、restore 10.5s；瓶颈是逐对象临时 WRITE_OWNER 授权。
+  - **阶段 5**：临时授权把「还原 DACL + 写标签」合并为一次 `SetNamedSecurityInfo`（每对象 SD 写 3→2），FULL 断言合并写生效（`grantFallbacks=0`）。
+  - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）。真实 114k 复测预计 **≈14min** 量级（待回填）。
+- 真实工作区（历史，阶段 1 前）：修复前 24 命中，清除后复扫 **0 命中**、根与文件均为 Medium，非命中 DACL 抽样逐字符一致。
 
 ## 已知限制与非目标
 
@@ -139,9 +142,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 - 默认跳过 `.git` / `node_modules` / `.pnpm-store`；不做全盘扫描。
 - 不碰文件内容；不提供完整的 ACL 回滚，只提供标签快照与恢复脚本。
 - 本期不提供独立 CLI（引擎脚本可单独调用，后续可加薄封装）。
-- 需要普通用户对命中的「自有对象」具备 owner 身份；非 owner 对象会逐条报告失败并建议用管理员 PowerShell 重试。
-- Repair 的初始扫描 / 复扫 / 验证仍走 PowerShell deep 遍历；十万级目录时修复总时长主要由这几遍扫描决定（后续计划把 Repair 扫描也切到 C#）。
-- quick 扫描当前约 0.31 ms/项；后续可用 `GetSecurityDescriptorSacl` + `GetAce` 直读 ACE 再提速，目前未实现。
+- 需要普通用户对命中的「自有对象」具备 owner 身份；非 owner 对象会逐条报告失败并建议以 owner 或管理员身份重试。
+- Repair 为 C# 流水线 + 并行修复（阶段 6，默认 8 线程）：顺序版真实 114k 实测 ≈25min（≈13.6ms/对象），并行版 FULL 基准 **1.83×**（真实 114k 待复测，预计 ≈14min）；在真实复测回填前不要承诺更短时长。
+- 修复的终验只覆盖失败候选，不再整遍复扫；需要完整确认时可点「重新扫描」。继承项可能随父级恢复，但 Windows 不保证自动传播。
+- 修复扫描已用 `GetAce` 直读标签；quick 扫描仍走 SDDL 解析，换用 `GetAce` 的收益在 5,021 项夹具上未观察到（928 vs 922ms），是否切换待 benchmark。
+- 修复 Low 目录时会写入可继承的 `(OI)(CI)Medium` 标签；Windows 可能把该继承标签传播到其下已存在的子对象（包括本次跳过的 `node_modules`、数据目录内的子项和非命中子项）。FULL 验收会记录实际影响；在确认前不要把「非命中对象完全不变」当成承诺。
+- 零命中修复不会生成快照/恢复脚本（`snapshotPath`/`restorePath` 为空）。
 
 ## 目录结构
 
@@ -151,10 +157,10 @@ lib/
   runtime.js              registry/引擎探测/生命周期
   routes.js               HTTP API（同源、JSON、方法校验，depth 参数）
   paths.js                工作区解析与路径安全
-  jobs.js                 任务管理（互斥/超时/取消/导出/日志）
+  jobs.js                 任务管理（互斥/超时/取消/导出/日志；progress 转发 hits/fixed）
   engine.js               spawn 隐藏 PowerShell + JSONL 解析（engineInvocation 拼 argv）
 client.js                 右侧栏面板（纯 JS，无 JSX / 无平台包依赖；quick/deep、ETA、导出）
-engine/integrity.ps1      Env / Scan / Repair 引擎（PS 5.1 兼容；quick 用内嵌 C# 扫描器）
+engine/integrity.ps1      Env / Scan / Repair 引擎（PS 5.1 兼容；quick 与 Repair 用内嵌 C#）
 locale/                   插件管理器展示文案
 test/                     Node 单测与引擎夹具验收
 ```

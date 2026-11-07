@@ -276,6 +276,205 @@ test('engine failure without a result reports the exit code', async () => {
   manager.dispose()
 })
 
+test('repair progress carries hits/fixed/total and keeps items empty', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+  assert.equal(typeof engine.onEvent, 'function')
+
+  engine.onEvent({ type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true })
+
+  // enumerate phase: no usable total yet.
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 40 })
+  assert.equal(job.phase, 'enumerate')
+  assert.equal(job.total, null)
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 80, total: null })
+  assert.equal(job.total, null)
+
+  // repair phase: total is the hit count; hits/fixed are cumulative.
+  engine.onEvent({ type: 'progress', phase: 'repair', scanned: 1, total: 5, hits: 5, fixed: 1 })
+  assert.equal(job.phase, 'repair')
+  assert.equal(job.total, 5)
+  assert.equal(job.hits, 5)
+  assert.equal(job.fixed, 1)
+  // A stale/lower sample must not roll the cumulative counters back.
+  engine.onEvent({ type: 'progress', phase: 'repair', scanned: 2, total: 5, hits: 4, fixed: 0 })
+  assert.equal(job.hits, 5)
+  assert.equal(job.fixed, 1)
+  assert.equal(job.items.length, 0)
+
+  engine.onEvent({
+    type: 'result',
+    mode: 'repair',
+    scanned: 80,
+    hits: 5,
+    fixed: 3,
+    failed: [],
+    remaining: 0,
+    snapshotPath: 'C:\\fake\\data\\snapshots\\snapshot-1.json',
+    restorePath: 'C:\\fake\\data\\snapshots\\restore-1.ps1',
+  })
+  engine.resolveDone({ code: 0, stderr: '' })
+  const settled = await waitTerminal(manager, started.jobId)
+  assert.equal(settled.status, 'succeeded')
+  assert.equal(settled.hits, 5)
+  assert.equal(settled.fixed, 3)
+  assert.equal(settled.total, 5)
+  assert.equal(settled.items.length, 0)
+  const snapshot = manager.snapshot(settled)
+  assert.equal(snapshot.hits, 5)
+  assert.equal(snapshot.fixed, 3)
+  assert.equal(snapshot.total, 5)
+  assert.deepEqual(snapshot.items, [])
+  manager.dispose()
+})
+
+test('scan progress hits merge with streamed hit events and result overrides', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+
+  // quick mode: progress reports the full Low count (with null total) before
+  // any explicit hit line is streamed.
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 100 })
+  assert.equal(job.total, null)
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 200, hits: 3 })
+  assert.equal(job.hits, 3)
+
+  // only explicit Low objects are streamed as hit events, after the scan phase.
+  engine.onEvent({ type: 'hit', path: 'C:\\fake\\workspace\\a.txt', kind: 'file', explicit: true })
+  assert.equal(job.hits, 4)
+  assert.equal(job.items.length, 1)
+
+  // A stale/lower progress sample never rolls the merged count back.
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 240, hits: 1 })
+  assert.equal(job.hits, 4)
+
+  engine.onEvent({
+    type: 'result',
+    mode: 'scan',
+    depth: 'quick',
+    scanned: 250,
+    hits: 3,
+    explicitCount: 1,
+    inheritedCount: 2,
+    rootLabel: 'Low',
+  })
+  engine.resolveDone({ code: 2, stderr: '' })
+  const settled = await waitTerminal(manager, started.jobId)
+  assert.equal(settled.status, 'succeeded')
+  // The result event is authoritative: the transient merge over-count is dropped.
+  assert.equal(settled.hits, 3)
+  assert.equal(settled.explicitCount, 1)
+  assert.equal(settled.inheritedCount, 2)
+  assert.equal(settled.items.length, 1)
+  assert.equal(settled.total, null)
+  manager.dispose()
+})
+
+test('progress with a missing or null total keeps the previously known total', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+  engine.onEvent({ type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true })
+
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 10 })
+  assert.equal(job.total, null)
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 20, total: null })
+  assert.equal(job.total, null)
+
+  engine.onEvent({ type: 'progress', phase: 'repair', scanned: 1, total: 4, hits: 4, fixed: 1 })
+  assert.equal(job.total, 4)
+  // null total (verify phase transition) must not clear the known total.
+  engine.onEvent({ type: 'progress', phase: 'repair', scanned: 2, total: null, hits: 4, fixed: 2 })
+  assert.equal(job.total, 4)
+  // absent total must not clear it either.
+  engine.onEvent({ type: 'progress', phase: 'verify', scanned: 3 })
+  assert.equal(job.total, 4)
+
+  engine.onEvent({ type: 'result', mode: 'repair', scanned: 20, hits: 4, fixed: 2, failed: [], remaining: 0 })
+  engine.resolveDone({ code: 0, stderr: '' })
+  const settled = await waitTerminal(manager, started.jobId)
+  assert.equal(settled.status, 'succeeded')
+  assert.equal(settled.total, 4)
+  manager.dispose()
+})
+
+test('verify progress keeps the repair total and failedTotal overrides the capped list', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+  engine.onEvent({ type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true })
+
+  engine.onEvent({ type: 'progress', phase: 'repair', scanned: 1, total: 5, hits: 5, fixed: 1 })
+  assert.equal(job.total, 5)
+  // The verify phase total is the (small) failed-candidate count and must not
+  // replace the hit-count total used by the progress bar / ETA.
+  engine.onEvent({ type: 'progress', phase: 'verify', scanned: 1, total: 2, hits: 5, fixed: 4 })
+  assert.equal(job.total, 5)
+
+  // The engine caps result.failed at 1000 entries; failedTotal is authoritative.
+  engine.onEvent({
+    type: 'result',
+    mode: 'repair',
+    scanned: 5,
+    hits: 5,
+    fixed: 3,
+    failed: [
+      { path: 'C:\\fake\\workspace\\a.txt', message: 'x', output: '' },
+      { path: 'C:\\fake\\workspace\\b.txt', message: 'y', output: '' },
+    ],
+    failedTotal: 114330,
+    remaining: 2,
+    daclRestoreFailures: 0,
+  })
+  engine.resolveDone({ code: 2, stderr: '' })
+  const settled = await waitTerminal(manager, started.jobId)
+  assert.equal(settled.status, 'failed')
+  assert.equal(settled.total, 5)
+  assert.equal(settled.failedCount, 114330)
+  assert.equal(settled.failed.length, 2)
+  manager.dispose()
+})
+
+test('result.errors are merged into host errors without streamed raw events', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+  engine.onEvent({ type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true })
+  engine.onEvent({ type: 'progress', phase: 'enumerate', scanned: 3 })
+
+  // Repair no longer streams scan-time error events; the result carries them.
+  engine.onEvent({
+    type: 'result',
+    mode: 'repair',
+    scanned: 3,
+    hits: 3,
+    fixed: 3,
+    failed: [],
+    failedTotal: 0,
+    remaining: 0,
+    daclRestoreFailures: 0,
+    errors: [
+      { path: 'C:\\fake\\workspace\\locked.txt', message: 'Access is denied.' },
+      { path: 'C:\\fake\\workspace\\locked.txt', message: 'Access is denied.' },
+    ],
+  })
+  engine.resolveDone({ code: 0, stderr: '' })
+  const settled = await waitTerminal(manager, started.jobId)
+  assert.equal(settled.status, 'succeeded')
+  // De-duplicated by path + message; the count stays authoritative.
+  assert.equal(settled.errors.length, 1)
+  assert.equal(settled.errorCount, 1)
+  assert.equal(settled.errors[0].path, 'C:\\fake\\workspace\\locked.txt')
+  manager.dispose()
+})
+
 test('file stamp, safe segment and unique path helpers', async () => {
   assert.match(fileStamp(Date.UTC(2026, 10, 6, 7, 8, 9)), /^2026\d{4}-\d{6}$/)
   assert.equal(safeSegment('my work: v1?'), 'my work_ v1_')

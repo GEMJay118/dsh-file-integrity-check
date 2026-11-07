@@ -15,32 +15,39 @@
              result.reportPath points at it (the Host can export that file directly).
              -ScanDepth quick (default) uses the embedded C# scanner; deep keeps the
              legacy PowerShell traversal.
-    Repair - scan first (streaming hit lines), snapshot every hit into
-             <DataDir>\snapshots\snapshot-*.json plus a restore-*.ps1 script, then repair:
-               1. explicit-Low directories (shallowest first), icacls "(OI)(CI)Medium"
-               2. explicit-Low files, icacls "Medium"
-               3. rescan; any object still Low is repaired individually as a fallback
-             The repair does not assume that inherited-Low children recover when their
-             parent is repaired: the rescan step repairs every remaining object.
-             Fast path: each object is repaired in-process with SetNamedSecurityInfoW
-             (no icacls process). When that is denied because the object DACL does not
-             grant WRITE_OWNER (typical for objects created by a sandboxed/AppContainer
-             process), the engine saves the DACL, inserts a temporary WRITE_OWNER allow
-             ACE for the current owner, sets the label, restores the original DACL and
-             verifies the restored DACL byte-for-byte - all in-process, no icacls spawn.
-             This only runs when the current user owns the object. If the in-process
-             paths fail, the legacy icacls based fallback runs to produce a readable
-             error. Non-hit objects are never modified. A final verification pass over
-             the original hit set produces the "failed" / "remaining" result fields.
-             result.methods reports icacls / pinvoke / grant / native counts.
-             The restore-*.ps1 script restores EVERY snapshot hit explicitly as Low
+    Repair - runs in-process in the embedded C# RepairSession (no per-hit output and
+             no PowerShell per-object loop):
+               1. one scan pass reads every label (GetAce fast path), streams progress
+                  only, and writes <DataDir>\snapshots\snapshot-*.json BEFORE any
+                  mutation (same document shape: version/createdAt/root/rootLabel/
+                  hitCount/hits[{path,kind,explicit,label,sddl}]);
+               2. the PowerShell side writes the restore-*.ps1 script next to it,
+                  still before the first label write;
+               3. one repair pass repairs every hit exactly once (directories by depth
+                  ascending, then files by depth ascending) with
+                  SetNamedSecurityInfoW and re-reads the label immediately after every
+                  write. When a write is denied because the object DACL does not grant
+                  WRITE_OWNER (typical for objects created by a sandboxed/AppContainer
+                  process), the engine performs an in-process temporary WRITE_OWNER
+                  grant and restores the original DACL, comparing the restored DACL
+                  SDDL byte-for-byte (only when the current user owns the object);
+               4. the final verification pass re-reads only the failed candidates, so
+                  the old full rescan / full verification traversals are gone.
+             Non-hit objects are never targeted for a label write. Note that a repaired
+             directory receives an inheritable (OI)(CI)Medium label, so Windows may
+             propagate the inherited Medium ACE to its existing children - including
+             SkipDirs / DataDir-in-Root / non-hit children. This propagation face is
+             recorded in HANDOFF and needs a FULL fixture assertion. result.methods
+             reports icacls / pinvoke / grant / native counts (Repair no longer spawns
+             icacls). The
+             restore-*.ps1 script restores EVERY snapshot hit explicitly as Low
              (inherited entries become explicit Low) and uses the same temporary-grant
              fallback when the DACL denies the label write.
 
   Output is UTF-8 (no BOM) JSON Lines written to stdout; diagnostics must never be
   written to stdout (they go to stderr or are dropped). Line types:
     {"type":"env",...}
-    {"type":"progress","phase":"enumerate|repair|verify","scanned":n,"total":n|null,"hits":n}
+    {"type":"progress","phase":"enumerate|repair|verify","scanned":n,"total":n|null,"hits":n,"fixed":n}
     {"type":"hit","path","kind":"file"|"dir","explicit":bool,"label":"Low",...}
     {"type":"error","path","message"}                       scan / read problems
     {"type":"error","path","message","phase":"repair","output"}  repair attempt failures
@@ -76,8 +83,8 @@
     deep  - legacy PowerShell traversal; streams every Low hit and behaves exactly
             like previous engine versions. result carries depth:"deep",
             engine:"powershell".
-  -Mode Env and -Mode Repair are unaffected by this switch (Repair keeps the deep
-  PowerShell traversal so the snapshot/repair logic stays unchanged).
+  -Mode Env and -Mode Repair are unaffected by this switch (Repair uses the
+  embedded C# RepairSession and does not stream hit lines).
 
 .PARAMETER IcaclsPath
   icacls executable (test seam). Default: icacls.exe resolved from PATH/System32.
@@ -147,7 +154,11 @@ try {
 # ---------------------------------------------------------------------------
 $script:NativeTypeCode = @'
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace DshIntegrity
 {
@@ -157,6 +168,12 @@ namespace DshIntegrity
         public const uint LabelSecurityInformation = 0x00000010;
         public const uint SddlRevision1 = 1;
         public const int TokenIntegrityLevel = 18;
+        public const int MandatoryLabelAceType = 0x11;
+        public const byte InheritedAceFlag = 0x10;
+        public const uint MandatoryLabelNoWriteUp = 0x00000001;
+        public const ushort SaclAutoInherited = 0x0800; // SE_SACL_AUTO_INHERITED
+        public const int AclSizeInformationClass = 2;
+        public const uint OwnerSecurityInformation = 0x00000001;
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern uint GetNamedSecurityInfoW(
@@ -235,8 +252,37 @@ namespace DshIntegrity
             IntPtr ppSacl,
             out IntPtr ppSecurityDescriptor);
 
+        [DllImport("advapi32.dll", EntryPoint = "GetNamedSecurityInfoW", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetNamedSecurityInfoWithOwnerDaclW(
+            string pObjectName,
+            int ObjectType,
+            uint SecurityInfo,
+            out IntPtr ppsidOwner,
+            IntPtr ppsidGroup,
+            IntPtr ppDacl,
+            IntPtr ppSacl,
+            out IntPtr ppSecurityDescriptor);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool ConvertSidToStringSidW(IntPtr Sid, out IntPtr StringSid);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AcAclSizeInformation
+        {
+            public uint AceCount;
+            public uint AclBytesInUse;
+            public uint AclBytesFree;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetAclInformation(
+            IntPtr pAcl,
+            out AcAclSizeInformation pAclInformation,
+            uint nAclInformationLength,
+            int dwAclInformationClass);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetAce(IntPtr pAcl, uint dwAceIndex, out IntPtr pAce);
 
         public static string GetDaclSddl(string path, out int errorCode)
         {
@@ -509,6 +555,7 @@ namespace DshIntegrity
         // ------------------------------------------------------------------
         private const uint DaclSecurityInformation = 0x00000004;
         private const uint ProtectedDaclSecurityInformation = 0x80000000;
+        private const uint UnprotectedDaclSecurityInformation = 0x20000000;
         private const uint WriteOwnerAccess = 0x00080000;
         private const int GrantAccess = 1;
         private const int TrusteeFormIsSid = 0;
@@ -518,6 +565,7 @@ namespace DshIntegrity
 
         private static IntPtr mediumFileSacl = IntPtr.Zero;
         private static IntPtr mediumDirectorySacl = IntPtr.Zero;
+        private static readonly object mediumSaclLock = new object();
         private static IntPtr mediumFileSecurityDescriptor = IntPtr.Zero;
         private static IntPtr mediumDirectorySecurityDescriptor = IntPtr.Zero;
 
@@ -582,6 +630,15 @@ namespace DshIntegrity
             public int DaclErrorCode;
             public int DaclAfterErrorCode;
             public bool DaclRestored;
+            public bool OwnerMismatch;
+            public bool LabelOk;
+            public string LabelLevel;
+            public bool CombinedFallback;
+            public long ReadTicks;
+            public long GrantWriteTicks;
+            public long LabelRestoreTicks;
+            public long VerifyTicks;
+            public string OwnerSid;
             public string DaclBefore;
             public string DaclAfter;
             public string Message;
@@ -589,19 +646,24 @@ namespace DshIntegrity
 
         private static IntPtr GetMediumSacl(bool isDirectory)
         {
-            if (isDirectory)
+            // Repair may run several objects in parallel (phase 2): initialise the
+            // cached label SACLs exactly once under a lock.
+            lock (mediumSaclLock)
             {
-                if (mediumDirectorySacl == IntPtr.Zero)
+                if (isDirectory)
                 {
-                    BuildMediumSecurityDescriptor(true, out mediumDirectorySecurityDescriptor, out mediumDirectorySacl);
+                    if (mediumDirectorySacl == IntPtr.Zero)
+                    {
+                        BuildMediumSecurityDescriptor(true, out mediumDirectorySecurityDescriptor, out mediumDirectorySacl);
+                    }
+                    return mediumDirectorySacl;
                 }
-                return mediumDirectorySacl;
+                if (mediumFileSacl == IntPtr.Zero)
+                {
+                    BuildMediumSecurityDescriptor(false, out mediumFileSecurityDescriptor, out mediumFileSacl);
+                }
+                return mediumFileSacl;
             }
-            if (mediumFileSacl == IntPtr.Zero)
-            {
-                BuildMediumSecurityDescriptor(false, out mediumFileSecurityDescriptor, out mediumFileSacl);
-            }
-            return mediumFileSacl;
         }
 
         private static void BuildMediumSecurityDescriptor(bool isDirectory, out IntPtr securityDescriptor, out IntPtr sacl)
@@ -649,6 +711,9 @@ namespace DshIntegrity
             return 0;
         }
 
+        // Legacy three-read grant helper. RepairSession now uses
+        // SetLabelToMediumWithTemporaryGrantOptimized below; this entry point is
+        // kept only for compatibility with older/other callers.
         public static GrantSetResult SetLabelToMediumWithTemporaryGrant(string path, bool isDirectory, string userSid)
         {
             GrantSetResult result = new GrantSetResult();
@@ -739,6 +804,7 @@ namespace DshIntegrity
                 {
                     uint restoreInformation = DaclSecurityInformation;
                     if ((control & SeDaclProtected) != 0) restoreInformation = restoreInformation | ProtectedDaclSecurityInformation;
+                    else restoreInformation = restoreInformation | UnprotectedDaclSecurityInformation;
                     IntPtr restoreDacl = daclPresent ? originalDacl : IntPtr.Zero;
                     uint restoreResult = SetNamedSecurityInfoW(
                         path,
@@ -764,6 +830,533 @@ namespace DshIntegrity
                 if (newAcl != IntPtr.Zero) LocalFree(newAcl);
                 if (sid != IntPtr.Zero) LocalFree(sid);
                 if (securityDescriptor != IntPtr.Zero) LocalFree(securityDescriptor);
+            }
+            return result;
+        }
+
+        // ------------------------------------------------------------------
+        // Fast mandatory-label reader (GetAce based). This avoids the SDDL
+        // string round-trip on the hot Scan/Repair path; the canonical label
+        // SDDL is reconstructed from the ACE when a snapshot needs it.
+        // ------------------------------------------------------------------
+        public static LabelReadResult GetLabelInfoFast(string path, bool includeSddl)
+        {
+            LabelReadResult result = new LabelReadResult();
+            IntPtr securityDescriptor;
+            uint callResult = GetNamedSecurityInfoW(
+                path,
+                SeFileObject,
+                LabelSecurityInformation,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                out securityDescriptor);
+            if (callResult != 0)
+            {
+                result.Ok = false;
+                result.ErrorCode = unchecked((int)callResult);
+                result.Level = "Unknown";
+                return result;
+            }
+            result.Ok = true;
+            try
+            {
+                bool saclPresent;
+                IntPtr sacl;
+                bool saclDefaulted;
+                if (!GetSecurityDescriptorSacl(securityDescriptor, out saclPresent, out sacl, out saclDefaulted) || !saclPresent || sacl == IntPtr.Zero)
+                {
+                    result.HasLabel = false;
+                    result.Level = "None";
+                    if (includeSddl) { result.Sddl = ""; }
+                    return result;
+                }
+
+                ushort control = 0;
+                uint revision = 0;
+                GetSecurityDescriptorControl(securityDescriptor, out control, out revision);
+                bool autoInherited = ((control & SaclAutoInherited) != 0);
+
+                AcAclSizeInformation aclInfo;
+                int aclInfoSize = Marshal.SizeOf(typeof(AcAclSizeInformation));
+                if (!GetAclInformation(sacl, out aclInfo, (uint)aclInfoSize, AclSizeInformationClass))
+                {
+                    return ParseLabelSddlFallback(path, result);
+                }
+
+                bool explicitFound = false;
+                bool inheritedFound = false;
+                byte explicitAceFlags = 0;
+                byte inheritedAceFlags = 0;
+                uint explicitMask = 0;
+                uint inheritedMask = 0;
+                int explicitRid = 0;
+                int inheritedRid = 0;
+                string explicitLevel = null;
+                string inheritedLevel = null;
+
+                uint aceCount = aclInfo.AceCount;
+                for (uint aceIndex = 0; aceIndex < aceCount; aceIndex++)
+                {
+                    IntPtr ace;
+                    if (!GetAce(sacl, aceIndex, out ace)) { continue; }
+                    byte aceType = Marshal.ReadByte(ace, 0);
+                    if (aceType != MandatoryLabelAceType) { continue; }
+                    byte aceFlags = Marshal.ReadByte(ace, 1);
+                    uint mask = unchecked((uint)Marshal.ReadInt32(ace, 4));
+                    bool inheritedAce = ((aceFlags & InheritedAceFlag) != 0);
+                    IntPtr sid = new IntPtr(ace.ToInt64() + 8);
+                    int rid;
+                    string level;
+                    if (!TryReadMandatorySid(sid, out rid, out level))
+                    {
+                        return ParseLabelSddlFallback(path, result);
+                    }
+                    if (inheritedAce)
+                    {
+                        if (!inheritedFound)
+                        {
+                            inheritedFound = true;
+                            inheritedAceFlags = aceFlags;
+                            inheritedMask = mask;
+                            inheritedRid = rid;
+                            inheritedLevel = level;
+                        }
+                    }
+                    else
+                    {
+                        if (!explicitFound)
+                        {
+                            explicitFound = true;
+                            explicitAceFlags = aceFlags;
+                            explicitMask = mask;
+                            explicitRid = rid;
+                            explicitLevel = level;
+                        }
+                    }
+                }
+
+                if (explicitFound)
+                {
+                    result.HasLabel = true;
+                    result.Explicit = true;
+                    result.Inherited = false;
+                    result.Level = explicitLevel;
+                    result.AceFlags = explicitAceFlags;
+                    result.Mask = explicitMask;
+                    result.Rid = explicitRid;
+                }
+                else if (inheritedFound)
+                {
+                    result.HasLabel = true;
+                    result.Explicit = false;
+                    result.Inherited = true;
+                    result.Level = inheritedLevel;
+                    result.AceFlags = inheritedAceFlags;
+                    result.Mask = inheritedMask;
+                    result.Rid = inheritedRid;
+                }
+                else
+                {
+                    result.HasLabel = false;
+                    result.Level = "None";
+                    if (includeSddl) { result.Sddl = ""; }
+                    return result;
+                }
+
+                result.AutoInherited = autoInherited;
+                if (includeSddl)
+                {
+                    if (result.Mask != MandatoryLabelNoWriteUp)
+                    {
+                        return ParseLabelSddlFallback(path, result);
+                    }
+                    result.Sddl = BuildLabelSddl(result.AceFlags, result.Mask, result.Rid, autoInherited);
+                }
+                return result;
+            }
+            finally
+            {
+                LocalFree(securityDescriptor);
+            }
+        }
+
+        public static string GetLabelLevelFast(string path, out int errorCode)
+        {
+            LabelReadResult result = GetLabelInfoFast(path, false);
+            errorCode = result.Ok ? 0 : result.ErrorCode;
+            return result.Level;
+        }
+
+        private static bool TryReadMandatorySid(IntPtr sid, out int rid, out string level)
+        {
+            rid = 0;
+            level = "Unknown";
+            if (sid == IntPtr.Zero) { return false; }
+            byte revision = Marshal.ReadByte(sid, 0);
+            byte subAuthorityCount = Marshal.ReadByte(sid, 1);
+            if (revision != 1 || subAuthorityCount != 1) { return false; }
+            long authority = 0;
+            for (int index = 0; index < 6; index++)
+            {
+                authority = (authority << 8) | (long)Marshal.ReadByte(sid, 2 + index);
+            }
+            if (authority != 16) { return false; }
+            rid = Marshal.ReadInt32(sid, 8);
+            level = LevelFromRidValue(rid);
+            return true;
+        }
+
+        private static string LevelFromRidValue(int rid)
+        {
+            switch (rid)
+            {
+                case 0: return "Untrusted";
+                case 4096: return "Low";
+                case 8192: return "Medium";
+                case 12288: return "High";
+                case 16384: return "System";
+                case 20480: return "Protected";
+                default: return "S-1-16-" + rid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
+        private static string BuildLabelSddl(byte aceFlags, uint mask, int rid, bool autoInherited)
+        {
+            string flags = "";
+            if ((aceFlags & 0x01) != 0) { flags += "OI"; }
+            if ((aceFlags & 0x02) != 0) { flags += "CI"; }
+            if ((aceFlags & 0x04) != 0) { flags += "NP"; }
+            if ((aceFlags & 0x08) != 0) { flags += "IO"; }
+            if ((aceFlags & InheritedAceFlag) != 0) { flags += "ID"; }
+            if ((aceFlags & 0x40) != 0) { flags += "SA"; }
+            if ((aceFlags & 0x80) != 0) { flags += "FA"; }
+            string levelText;
+            switch (rid)
+            {
+                case 4096: levelText = "LW"; break;
+                case 8192: levelText = "ME"; break;
+                case 12288: levelText = "HI"; break;
+                case 16384: levelText = "SI"; break;
+                default: levelText = "S-1-16-" + rid.ToString(System.Globalization.CultureInfo.InvariantCulture); break;
+            }
+            string maskText = "NW";
+            if (mask == 0x00000002) { maskText = "NR"; }
+            if (mask == 0x00000004) { maskText = "NX"; }
+            return (autoInherited ? "S:AI" : "S:") + "(ML;" + flags + ";" + maskText + ";;;" + levelText + ")";
+        }
+
+        private static LabelReadResult ParseLabelSddlFallback(string path, LabelReadResult result)
+        {
+            int errorCode = 0;
+            string sddl = GetLabelSddl(path, out errorCode);
+            if (errorCode != 0 || sddl == null)
+            {
+                result.Ok = false;
+                result.ErrorCode = errorCode;
+                result.Level = "Unknown";
+                return result;
+            }
+            result.Ok = true;
+            result.Sddl = sddl;
+            result.HasLabel = false;
+            result.Explicit = false;
+            result.Inherited = false;
+            result.Level = "None";
+            string explicitLevel = null;
+            string inheritedLevel = null;
+            int index = 0;
+            while (index < sddl.Length)
+            {
+                int open = sddl.IndexOf('(', index);
+                if (open < 0) { break; }
+                int close = sddl.IndexOf(')', open + 1);
+                if (close < 0) { break; }
+                string ace = sddl.Substring(open + 1, close - open - 1);
+                if (ace.StartsWith("ML;", StringComparison.Ordinal))
+                {
+                    string[] parts = ace.Split(';');
+                    if (parts.Length >= 6)
+                    {
+                        bool inheritedAce = (parts[1].IndexOf("ID", StringComparison.Ordinal) >= 0);
+                        string level = LevelFromSidName(parts[5]);
+                        if (inheritedAce)
+                        {
+                            if (inheritedLevel == null) { inheritedLevel = level; }
+                        }
+                        else
+                        {
+                            if (explicitLevel == null) { explicitLevel = level; }
+                        }
+                    }
+                }
+                index = close + 1;
+            }
+            if (explicitLevel != null)
+            {
+                result.HasLabel = true;
+                result.Explicit = true;
+                result.Level = explicitLevel;
+            }
+            else if (inheritedLevel != null)
+            {
+                result.HasLabel = true;
+                result.Inherited = true;
+                result.Level = inheritedLevel;
+            }
+            return result;
+        }
+
+        // Phase-1 performance pass: restore the original DACL and apply the Medium
+        // label in ONE SetNamedSecurityInfoW call. The current DACL (temporary
+        // grant) supplies WRITE_OWNER for the SACL part and the owner has implicit
+        // WRITE_DAC for the DACL part, so a single call passes the access check.
+        public static int SetLabelToMediumAndRestoreDacl(string path, bool isDirectory, IntPtr originalDacl, bool daclPresent, bool daclProtected)
+        {
+            IntPtr sacl = GetMediumSacl(isDirectory);
+            if (sacl == IntPtr.Zero)
+            {
+                return 87; // ERROR_INVALID_PARAMETER
+            }
+            uint securityInformation = LabelSecurityInformation | DaclSecurityInformation;
+            securityInformation |= daclProtected ? ProtectedDaclSecurityInformation : UnprotectedDaclSecurityInformation;
+            uint result = SetNamedSecurityInfoW(
+                path,
+                SeFileObject,
+                securityInformation,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                daclPresent ? originalDacl : IntPtr.Zero,
+                sacl);
+            return unchecked((int)result);
+        }
+
+        // ------------------------------------------------------------------
+        // Optimized temporary-WRITE_OWNER grant: one owner+DACL read, the
+        // "before" DACL SDDL comes from that same descriptor, then
+        // grant -> set label -> restore DACL and one re-read for the
+        // byte-for-byte DACL comparison (2 security-descriptor reads total).
+        // ------------------------------------------------------------------
+        public static GrantSetResult SetLabelToMediumWithTemporaryGrantOptimized(string path, bool isDirectory, string userSid)
+        {
+            GrantSetResult result = new GrantSetResult();
+            result.LabelCode = -1;
+            result.GrantCode = -1;
+            result.RestoreCode = -1;
+
+            IntPtr securityDescriptor = IntPtr.Zero;
+            IntPtr ownerSid = IntPtr.Zero;
+            IntPtr originalDacl = IntPtr.Zero;
+            IntPtr sid = IntPtr.Zero;
+            IntPtr newAcl = IntPtr.Zero;
+            bool daclPresent = false;
+            bool daclDefaulted = false;
+            ushort control = 0;
+            uint revision = 0;
+            bool grantApplied = false;
+            bool combinedApplied = false;
+            bool restoreNeeded = false;
+            long phaseStart = Stopwatch.GetTimestamp();
+
+            try
+            {
+                uint getResult = GetNamedSecurityInfoWithOwnerDaclW(
+                    path,
+                    SeFileObject,
+                    OwnerSecurityInformation | DaclSecurityInformation,
+                    out ownerSid,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out securityDescriptor);
+                if (getResult != 0)
+                {
+                    result.Message = "GetNamedSecurityInfoW(owner/dacl) failed: Win32 " + getResult.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+                if (!GetSecurityDescriptorDacl(securityDescriptor, out daclPresent, out originalDacl, out daclDefaulted))
+                {
+                    result.Message = "GetSecurityDescriptorDacl failed: Win32 " + Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+                GetSecurityDescriptorControl(securityDescriptor, out control, out revision);
+
+                string ownerText = null;
+                if (ownerSid != IntPtr.Zero)
+                {
+                    IntPtr ownerTextPointer;
+                    if (ConvertSidToStringSidW(ownerSid, out ownerTextPointer))
+                    {
+                        try
+                        {
+                            ownerText = Marshal.PtrToStringUni(ownerTextPointer);
+                        }
+                        finally
+                        {
+                            LocalFree(ownerTextPointer);
+                        }
+                    }
+                }
+                result.OwnerSid = ownerText;
+                if (userSid == null || ownerText == null || !string.Equals(ownerText, userSid, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.OwnerMismatch = true;
+                    result.Message = "access denied (Win32 5); object owner " + (ownerText == null ? "?" : ownerText) + " is not the current user " + (userSid == null ? "?" : userSid) + "; guidance: run the repair as the object owner or with administrator rights";
+                    return result;
+                }
+
+                IntPtr beforePointer;
+                uint beforeLength;
+                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        securityDescriptor,
+                        SddlRevision1,
+                        DaclSecurityInformation,
+                        out beforePointer,
+                        out beforeLength))
+                {
+                    result.DaclErrorCode = Marshal.GetLastWin32Error();
+                    result.Message = "the object DACL could not be read: Win32 " + result.DaclErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+                try
+                {
+                    result.DaclBefore = Marshal.PtrToStringUni(beforePointer);
+                }
+                finally
+                {
+                    LocalFree(beforePointer);
+                }
+
+                result.ReadTicks = Stopwatch.GetTimestamp() - phaseStart;
+                phaseStart = Stopwatch.GetTimestamp();
+
+                if (!ConvertStringSidToSidW(userSid, out sid))
+                {
+                    result.Message = "ConvertStringSidToSidW failed: Win32 " + Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+
+                EXPLICIT_ACCESS explicitAccess = new EXPLICIT_ACCESS();
+                explicitAccess.grfAccessPermissions = WriteOwnerAccess;
+                explicitAccess.grfAccessMode = GrantAccess;
+                explicitAccess.grfInheritance = NoInheritance;
+                explicitAccess.Trustee.pMultipleTrustee = IntPtr.Zero;
+                explicitAccess.Trustee.MultipleTrusteeOperation = 0;
+                explicitAccess.Trustee.TrusteeForm = TrusteeFormIsSid;
+                explicitAccess.Trustee.TrusteeType = TrusteeTypeIsUser;
+                explicitAccess.Trustee.ptstrName = sid;
+
+                uint aclResult = SetEntriesInAclW(1, ref explicitAccess, daclPresent ? originalDacl : IntPtr.Zero, out newAcl);
+                if (aclResult != 0)
+                {
+                    result.GrantCode = unchecked((int)aclResult);
+                    result.Message = "SetEntriesInAclW failed: Win32 " + aclResult.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+
+                uint grantResult = SetNamedSecurityInfoW(
+                    path,
+                    SeFileObject,
+                    DaclSecurityInformation | ProtectedDaclSecurityInformation,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    newAcl,
+                    IntPtr.Zero);
+                result.GrantCode = unchecked((int)grantResult);
+                if (grantResult != 0)
+                {
+                    result.Message = "applying temporary DACL grant failed: Win32 " + grantResult.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return result;
+                }
+                grantApplied = true;
+                result.GrantWriteTicks = Stopwatch.GetTimestamp() - phaseStart;
+                phaseStart = Stopwatch.GetTimestamp();
+
+                // ---- second write: restore the original DACL AND apply the label ----
+                int combinedCode = SetLabelToMediumAndRestoreDacl(
+                    path,
+                    isDirectory,
+                    daclPresent ? originalDacl : IntPtr.Zero,
+                    daclPresent,
+                    (control & SeDaclProtected) != 0);
+                if (combinedCode == 0)
+                {
+                    combinedApplied = true;
+                    result.LabelCode = 0;
+                    result.RestoreCode = 0;
+                }
+                else
+                {
+                    // Unexpected (the temporary grant should supply WRITE_OWNER):
+                    // fall back to two separate writes and let the FULL benchmark
+                    // report it via grantFallbacks.
+                    result.CombinedFallback = true;
+                    restoreNeeded = true;
+                    result.LabelCode = SetLabelToMedium(path, isDirectory);
+                    if (result.LabelCode != 0)
+                    {
+                        result.Message = "the label could not be set after a temporary WRITE_OWNER grant: Win32 " + result.LabelCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                }
+                result.LabelRestoreTicks = Stopwatch.GetTimestamp() - phaseStart;
+                phaseStart = Stopwatch.GetTimestamp();
+
+                // ---- verify: label level (DACL byte compare happens below) ----
+                LabelReadResult labelAfterGrant = GetLabelInfoFast(path, false);
+                result.LabelOk = labelAfterGrant.Ok && labelAfterGrant.Level == "Medium";
+                result.LabelLevel = labelAfterGrant.Ok ? labelAfterGrant.Level : "Unknown";
+                result.VerifyTicks = Stopwatch.GetTimestamp() - phaseStart;
+                phaseStart = Stopwatch.GetTimestamp();
+            }
+            finally
+            {
+                if (grantApplied)
+                {
+                    if (restoreNeeded)
+                    {
+                        uint restoreInformation = DaclSecurityInformation;
+                        if ((control & SeDaclProtected) != 0)
+                        {
+                            restoreInformation = restoreInformation | ProtectedDaclSecurityInformation;
+                        }
+                        else
+                        {
+                            // The original DACL was not protected; clear the protected
+                            // bit introduced by the temporary grant explicitly instead
+                            // of relying on the "neither flag" default behaviour.
+                            restoreInformation = restoreInformation | UnprotectedDaclSecurityInformation;
+                        }
+                        IntPtr restoreDacl = daclPresent ? originalDacl : IntPtr.Zero;
+                        uint restoreResult = SetNamedSecurityInfoW(
+                            path,
+                            SeFileObject,
+                            restoreInformation,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            restoreDacl,
+                            IntPtr.Zero);
+                        result.RestoreCode = unchecked((int)restoreResult);
+                    }
+                    long daclReadStart = Stopwatch.GetTimestamp();
+                    int afterErrorCode = 0;
+                    string daclAfter = GetDaclSddl(path, out afterErrorCode);
+                    result.DaclAfterErrorCode = afterErrorCode;
+                    result.DaclAfter = daclAfter;
+                    result.VerifyTicks += Stopwatch.GetTimestamp() - daclReadStart;
+                    result.DaclRestored = (combinedApplied || result.RestoreCode == 0) &&
+                        (result.DaclBefore != null) &&
+                        (daclAfter != null) &&
+                        string.Equals(result.DaclBefore, daclAfter, StringComparison.Ordinal);
+                }
+                else
+                {
+                    result.DaclAfter = result.DaclBefore;
+                    result.DaclRestored = true;
+                }
+                if (newAcl != IntPtr.Zero) { LocalFree(newAcl); }
+                if (sid != IntPtr.Zero) { LocalFree(sid); }
+                if (securityDescriptor != IntPtr.Zero) { LocalFree(securityDescriptor); }
             }
             return result;
         }
@@ -807,6 +1400,820 @@ namespace DshIntegrity
             {
                 CloseHandle(token);
             }
+        }
+    }
+
+    public sealed class LabelReadResult
+    {
+        public bool Ok;
+        public int ErrorCode;
+        public bool HasLabel;
+        public bool Explicit;
+        public bool Inherited;
+        public string Level;
+        public string Sddl;
+        public byte AceFlags;
+        public uint Mask;
+        public int Rid;
+        public bool AutoInherited;
+
+        public LabelReadResult()
+        {
+            this.Level = "Unknown";
+        }
+    }
+
+    public sealed class RepairHit
+    {
+        public string Path;
+        public string Win32Path;
+        public string Kind;
+        public bool Explicit;
+        public bool Inherited;
+        public string Sddl;
+        public int Depth;
+    }
+
+    public sealed class RepairFailure
+    {
+        public string Path;
+        public string Message;
+        public string Output;
+        // "label" = label write/verify failed (may recover through propagation),
+        // "dacl"  = label may be Medium but the DACL restore was NOT byte-for-byte
+        //           verified; this must never be dropped by the final verification.
+        public string Kind;
+        // Position in the wave-ordered hit list; parallel repair appends failures
+        // out of order, and the final list is sorted back by this value.
+        public int Sequence;
+    }
+
+    // Per-object result of the parallel repair worker (phase 2). All fields are
+    // filled by one worker thread and merged into RepairRunResult by that thread.
+    public sealed class RepairOutcome
+    {
+        public bool Fixed;
+        public int Method; // 0 = none, 1 = native, 2 = grant
+        public string Message;
+        public string Output;
+        public string Kind = "label";
+        public bool CombinedFallback;
+        public long PreReadTicks;
+        public long NativeSetTicks;
+        public long GrantReadTicks;
+        public long GrantWriteTicks;
+        public long GrantLabelRestoreTicks;
+        public long GrantVerifyTicks;
+    }
+
+    // Shared state for one repair wave (objects of the same kind and path depth,
+    // so no object in the wave is an ancestor of another one).
+    internal sealed class RepairWaveState
+    {
+        public List<RepairHit> Ordered;
+        public RepairRunResult Result;
+        public string CurrentUserSid;
+        public int Start;
+        public int End;
+        public int Next;
+        public int Active;
+        public int ProcessedCount;
+        public int FixedCount;
+        public string WorkerError;
+        public object FailLock = new object();
+        public System.Threading.ManualResetEventSlim Done = new System.Threading.ManualResetEventSlim(false);
+    }
+
+    public sealed class RepairError
+    {
+        public string Path;
+        public string Message;
+    }
+
+    public sealed class RepairScanResult
+    {
+        public int Scanned;
+        public int Hits;
+        public int ExplicitCount;
+        public int InheritedCount;
+        public string RootLabel;
+        public bool Truncated;
+        public long ScanMs;
+        public long SnapshotMs;
+        public string SnapshotError;
+        public List<RepairHit> HitList = new List<RepairHit>();
+        public List<RepairError> Errors = new List<RepairError>();
+
+        public RepairScanResult()
+        {
+            this.RootLabel = "Unknown";
+        }
+    }
+
+    public sealed class RepairRunResult
+    {
+        public int Fixed;
+        public int Remaining;
+        public int VerifyFailures;
+        public int DaclFailures;
+        public int Processed;
+        public int NativeCount;
+        public int GrantCount;
+        public int IcaclsCount;
+        public int PinvokeCount;
+        public int GrantFallbackCount;
+        public long PreReadTicks;
+        public long NativeSetTicks;
+        public long GrantReadTicks;
+        public long GrantWriteTicks;
+        public long GrantLabelRestoreTicks;
+        public long GrantVerifyTicks;
+        public long RepairMs;
+        public long VerifyMs;
+        public List<RepairFailure> Failed = new List<RepairFailure>();
+    }
+
+    public delegate void RepairProgressDelegate(string phase, int scanned, int total, int hits, int fixedCount);
+
+    // ----------------------------------------------------------------------
+    // In-process repair pipeline: one scan pass (writes the snapshot before any
+    // mutation), one repair pass (per-object label write + immediate re-read
+    // verification), and a final verification pass over failed candidates only.
+    // ----------------------------------------------------------------------
+    public static class RepairSession
+    {
+        private const uint LabelSecurityInformation = 0x00000010;
+        private const int SeFileObject = 1;
+        private const int MaxErrors = 500;
+        private const int MaxScannedItems = 1000000;
+        private const int ProgressItemStep = 200;
+        private const int ProgressMillisecondStep = 250;
+        private const int MaxFailureOutputLength = 4000;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const byte InheritedAceFlag = 0x10;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WIN32_FIND_DATA
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationTimeLow;
+            public uint ftCreationTimeHigh;
+            public uint ftLastAccessTimeLow;
+            public uint ftLastAccessTimeHigh;
+            public uint ftLastWriteTimeLow;
+            public uint ftLastWriteTimeHigh;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint dwReserved0;
+            public uint dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+            public string cAlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstFileExW(
+            string lpFileName,
+            int fInfoLevelId,
+            out WIN32_FIND_DATA lpFindFileData,
+            int fSearchOp,
+            IntPtr lpSearchFilter,
+            int dwAdditionalFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATA lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FindClose(IntPtr hFindFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileAttributesW(string lpFileName);
+
+        public static RepairScanResult Scan(
+            string rootNormal,
+            string[] skipDirNames,
+            string[] excludePrefixes,
+            string snapshotPath,
+            string version,
+            string createdAt,
+            RepairProgressDelegate progress)
+        {
+            RepairScanResult result = new RepairScanResult();
+            Stopwatch watch = Stopwatch.StartNew();
+
+            HashSet<string> skipLookup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (skipDirNames != null)
+            {
+                for (int index = 0; index < skipDirNames.Length; index++)
+                {
+                    string skipName = skipDirNames[index];
+                    if (skipName == null) { continue; }
+                    skipName = skipName.Trim();
+                    if (skipName.Length > 0) { skipLookup.Add(skipName); }
+                }
+            }
+
+            List<string> excludes = new List<string>();
+            if (excludePrefixes != null)
+            {
+                for (int index = 0; index < excludePrefixes.Length; index++)
+                {
+                    string exclude = excludePrefixes[index];
+                    if (exclude == null) { continue; }
+                    exclude = exclude.Trim();
+                    if (exclude.Length == 0) { continue; }
+                    exclude = exclude.TrimEnd('\\');
+                    if (exclude.Length > 0) { excludes.Add(exclude.ToLowerInvariant()); }
+                }
+            }
+
+            string rootWin32 = ToWin32Path(rootNormal);
+            uint rootAttributes = GetFileAttributesW(rootWin32);
+            bool rootIsDirectory = ((rootAttributes & FileAttributeDirectory) != 0);
+            bool rootIsReparse = ((rootAttributes & FileAttributeReparsePoint) != 0);
+
+            ProcessItem(result, rootWin32, rootNormal, rootIsDirectory, true);
+
+            List<string> directories = new List<string>();
+            if (rootIsDirectory && !rootIsReparse) { directories.Add(rootWin32); }
+
+            int lastProgressScanned = 0;
+            long lastProgressMilliseconds = 0;
+            bool truncated = false;
+
+            while (directories.Count > 0)
+            {
+                string directory = directories[directories.Count - 1];
+                directories.RemoveAt(directories.Count - 1);
+                string directoryNormal = NormalizePath(directory);
+                bool directoryHasTrailingBackslash = directory.EndsWith("\\", StringComparison.Ordinal);
+                string pattern = directoryHasTrailingBackslash ? directory + "*" : directory + "\\*";
+                WIN32_FIND_DATA findData;
+                IntPtr findHandle = FindFirstFileExW(pattern, 1, out findData, 0, IntPtr.Zero, 2);
+                if (findHandle == new IntPtr(-1))
+                {
+                    int enumerationError = Marshal.GetLastWin32Error();
+                    AddError(result, directoryNormal, "enumerate failed: " + DescribeWin32(enumerationError));
+                }
+                else
+                {
+                    try
+                    {
+                        bool hasMore = true;
+                        while (hasMore)
+                        {
+                            string fileName = findData.cFileName;
+                            if (fileName != null && fileName.Length > 0 && fileName != "." && fileName != "..")
+                            {
+                                bool isDirectory = ((findData.dwFileAttributes & FileAttributeDirectory) != 0);
+                                bool isReparse = ((findData.dwFileAttributes & FileAttributeReparsePoint) != 0);
+                                bool skipThis = (isDirectory && skipLookup.Contains(fileName));
+                                if (!skipThis)
+                                {
+                                    string childWin32 = directoryHasTrailingBackslash ? directory + fileName : directory + "\\" + fileName;
+                                    string childNormal = NormalizePath(childWin32);
+                                    if (IsExcluded(childNormal, excludes))
+                                    {
+                                        skipThis = true;
+                                    }
+                                    else
+                                    {
+                                        ProcessItem(result, childWin32, childNormal, isDirectory, false);
+                                        if (isDirectory && !isReparse) { directories.Add(childWin32); }
+                                    }
+                                }
+                            }
+                            hasMore = FindNextFileW(findHandle, out findData);
+                        }
+                    }
+                    finally
+                    {
+                        FindClose(findHandle);
+                    }
+                }
+
+                if (result.Scanned >= MaxScannedItems)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                long elapsed = watch.ElapsedMilliseconds;
+                if (progress != null && ((result.Scanned - lastProgressScanned) >= 2000 || (elapsed - lastProgressMilliseconds) >= ProgressMillisecondStep))
+                {
+                    progress("enumerate", result.Scanned, -1, result.Hits, 0);
+                    lastProgressScanned = result.Scanned;
+                    lastProgressMilliseconds = elapsed;
+                }
+            }
+
+            if (progress != null)
+            {
+                progress("enumerate", result.Scanned, -1, result.Hits, 0);
+            }
+            result.ScanMs = watch.ElapsedMilliseconds;
+            result.Truncated = result.Truncated || truncated;
+
+            if (result.Hits > 0)
+            {
+                Stopwatch snapshotWatch = Stopwatch.StartNew();
+                try
+                {
+                    WriteSnapshot(snapshotPath, version, createdAt, rootNormal, result.RootLabel, result.HitList);
+                }
+                catch (Exception snapshotException)
+                {
+                    result.SnapshotError = snapshotException.Message;
+                }
+                snapshotWatch.Stop();
+                result.SnapshotMs = snapshotWatch.ElapsedMilliseconds;
+            }
+            return result;
+        }
+
+        public static RepairRunResult Repair(RepairScanResult scan, RepairProgressDelegate progress, string currentUserSid)
+        {
+            RepairRunResult result = new RepairRunResult();
+            if (scan == null) { return result; }
+
+            List<RepairHit> ordered = new List<RepairHit>(scan.HitList);
+            ordered.Sort(CompareHits);
+            int totalHits = scan.Hits;
+            int fixedSoFar = 0;
+            int processedSoFar = 0;
+            long lastProgressMilliseconds = 0;
+            Stopwatch repairWatch = Stopwatch.StartNew();
+
+            // Phase 2: repair in waves. A wave contains objects of the same kind and
+            // path depth only, so no object inside a wave is an ancestor/descendant
+            // of another one (parent DACL/label propagation cannot race with a child
+            // operation). Waves run in sequence; objects inside a wave run on several
+            // threads. Progress callbacks are only invoked on this (PowerShell) thread.
+            // 32 logical cores are common here; the grant path is latency bound.
+            // Tuning result (2026-11-07, FULL 3000-grant benchmark): 4 workers=1.47x,
+            // 8 workers=1.83x, 16 workers=1.87x over the sequential baseline.
+            // Contention (Defender/NTFS security writes) saturates past 8, so 8 is
+            // the default; more threads only inflate per-op latency.
+            int workerCount = Math.Min(Environment.ProcessorCount, 8);
+            if (workerCount < 1) { workerCount = 1; }
+            int waveStart = 0;
+            while (waveStart < ordered.Count)
+            {
+                RepairHit first = ordered[waveStart];
+                int waveEnd = waveStart + 1;
+                while (waveEnd < ordered.Count && ordered[waveEnd].Kind == first.Kind && ordered[waveEnd].Depth == first.Depth)
+                {
+                    waveEnd++;
+                }
+                RepairWaveState wave = new RepairWaveState();
+                wave.Ordered = ordered;
+                wave.Result = result;
+                wave.CurrentUserSid = currentUserSid;
+                wave.Start = waveStart;
+                wave.End = waveEnd;
+                wave.Next = waveStart - 1;
+                wave.Active = Math.Min(workerCount, waveEnd - waveStart);
+                System.Threading.Thread[] threads = new System.Threading.Thread[wave.Active];
+                for (int w = 0; w < threads.Length; w++)
+                {
+                    threads[w] = new System.Threading.Thread(new System.Threading.ParameterizedThreadStart(RepairWaveWorker));
+                    threads[w].IsBackground = true;
+                    threads[w].Start(wave);
+                }
+                while (!wave.Done.Wait(50))
+                {
+                    EmitRepairProgress(progress, wave, processedSoFar, fixedSoFar, totalHits, repairWatch, ref lastProgressMilliseconds);
+                }
+                for (int w = 0; w < threads.Length; w++) { threads[w].Join(); }
+                if (wave.WorkerError != null)
+                {
+                    throw new InvalidOperationException(wave.WorkerError);
+                }
+                EmitRepairProgress(progress, wave, processedSoFar, fixedSoFar, totalHits, repairWatch, ref lastProgressMilliseconds);
+                processedSoFar += wave.ProcessedCount;
+                fixedSoFar += wave.FixedCount;
+                waveStart = waveEnd;
+            }
+
+            if (progress != null)
+            {
+                progress("repair", processedSoFar, totalHits, totalHits, fixedSoFar);
+            }
+            result.RepairMs = repairWatch.ElapsedMilliseconds;
+            result.Processed = processedSoFar;
+            result.Failed.Sort(new Comparison<RepairFailure>(CompareFailureSequence));
+
+            // Final verification runs only over the candidates that failed, so the
+            // old "read every original hit again" pass disappears. A candidate whose
+            // label recovered through propagation is dropped, EXCEPT when the failure
+            // was a DACL-restore mismatch: that is a security problem independent of
+            // the label state and must stay in the failure list (C11).
+            Stopwatch verifyWatch = Stopwatch.StartNew();
+            List<RepairFailure> survivors = new List<RepairFailure>();
+            int candidateCount = result.Failed.Count;
+            int verified = 0;
+            for (int index = 0; index < result.Failed.Count; index++)
+            {
+                RepairFailure failure = result.Failed[index];
+                LabelReadResult current = Native.GetLabelInfoFast(ToWin32Path(failure.Path), false);
+                verified++;
+                if (!current.Ok)
+                {
+                    result.VerifyFailures++;
+                    survivors.Add(failure);
+                }
+                else if (current.Level == "Low")
+                {
+                    result.Remaining++;
+                    survivors.Add(failure);
+                }
+                else if (failure.Kind == "dacl")
+                {
+                    result.DaclFailures++;
+                    survivors.Add(failure);
+                }
+                else
+                {
+                    // Label write failure that later recovered through propagation.
+                    fixedSoFar++;
+                }
+                if (progress != null && (verified % ProgressItemStep == 0 || verified == candidateCount))
+                {
+                    progress("verify", verified, candidateCount, totalHits, fixedSoFar);
+                }
+            }
+            result.Failed = survivors;
+            result.VerifyMs = verifyWatch.ElapsedMilliseconds;
+            result.Fixed = totalHits - result.Remaining - result.VerifyFailures - result.DaclFailures;
+            if (result.Fixed < 0) { result.Fixed = 0; }
+            return result;
+        }
+
+        private static int CompareFailureSequence(RepairFailure left, RepairFailure right)
+        {
+            return left.Sequence.CompareTo(right.Sequence);
+        }
+
+        // One repair worker thread: pulls hit indexes from the wave and merges the
+        // per-object outcome into the shared run result with atomic updates.
+        private static void RepairWaveWorker(object stateObject)
+        {
+            RepairWaveState wave = (RepairWaveState)stateObject;
+            try
+            {
+                while (true)
+                {
+                    int index = System.Threading.Interlocked.Increment(ref wave.Next);
+                    if (index >= wave.End) { break; }
+                    RepairHit hit = wave.Ordered[index];
+                    RepairOutcome outcome;
+                    try
+                    {
+                        outcome = RepairOne(hit, wave.CurrentUserSid);
+                    }
+                    catch (Exception exception)
+                    {
+                        outcome = new RepairOutcome();
+                        outcome.Message = "repair threw: " + exception.Message;
+                        outcome.Output = outcome.Message;
+                    }
+                    RepairRunResult r = wave.Result;
+                    System.Threading.Interlocked.Add(ref r.PreReadTicks, outcome.PreReadTicks);
+                    System.Threading.Interlocked.Add(ref r.NativeSetTicks, outcome.NativeSetTicks);
+                    System.Threading.Interlocked.Add(ref r.GrantReadTicks, outcome.GrantReadTicks);
+                    System.Threading.Interlocked.Add(ref r.GrantWriteTicks, outcome.GrantWriteTicks);
+                    System.Threading.Interlocked.Add(ref r.GrantLabelRestoreTicks, outcome.GrantLabelRestoreTicks);
+                    System.Threading.Interlocked.Add(ref r.GrantVerifyTicks, outcome.GrantVerifyTicks);
+                    if (outcome.CombinedFallback) { System.Threading.Interlocked.Increment(ref r.GrantFallbackCount); }
+                    if (outcome.Method == 1) { System.Threading.Interlocked.Increment(ref r.NativeCount); }
+                    else if (outcome.Method == 2) { System.Threading.Interlocked.Increment(ref r.GrantCount); }
+                    if (outcome.Fixed) { System.Threading.Interlocked.Increment(ref wave.FixedCount); }
+                    if (outcome.Message != null)
+                    {
+                        RepairFailure failure = new RepairFailure();
+                        failure.Path = hit.Path;
+                        failure.Message = outcome.Message;
+                        failure.Output = TrimLength(outcome.Output == null ? "" : outcome.Output, MaxFailureOutputLength);
+                        failure.Kind = outcome.Kind;
+                        failure.Sequence = index;
+                        lock (wave.FailLock) { r.Failed.Add(failure); }
+                    }
+                    System.Threading.Interlocked.Increment(ref wave.ProcessedCount);
+                }
+            }
+            catch (Exception workerException)
+            {
+                wave.WorkerError = workerException.ToString();
+            }
+            finally
+            {
+                if (System.Threading.Interlocked.Decrement(ref wave.Active) == 0)
+                {
+                    wave.Done.Set();
+                }
+            }
+        }
+
+        // Called only from the PowerShell thread (repair watchdog loop) so the
+        // progress delegate never crosses threads.
+        private static void EmitRepairProgress(RepairProgressDelegate progress, RepairWaveState wave, int baseProcessed, int baseFixed, int totalHits, Stopwatch repairWatch, ref long lastProgressMilliseconds)
+        {
+            if (progress == null) { return; }
+            long now = repairWatch.ElapsedMilliseconds;
+            if (now - lastProgressMilliseconds < ProgressMillisecondStep) { return; }
+            progress("repair", baseProcessed + wave.ProcessedCount, totalHits, totalHits, baseFixed + wave.FixedCount);
+            lastProgressMilliseconds = now;
+        }
+
+        // Per-object repair body, unchanged semantics from the sequential version:
+        // pre-read, native attempt, temporary-grant fallback, immediate verify.
+        private static RepairOutcome RepairOne(RepairHit hit, string currentUserSid)
+        {
+            RepairOutcome outcome = new RepairOutcome();
+            bool isDirectory = (hit.Kind == "dir");
+
+            long preReadStart = Stopwatch.GetTimestamp();
+            LabelReadResult before = Native.GetLabelInfoFast(hit.Win32Path, false);
+            outcome.PreReadTicks = Stopwatch.GetTimestamp() - preReadStart;
+            if (before.Ok && before.Level != "Low")
+            {
+                outcome.Fixed = true;
+                return outcome;
+            }
+
+            long nativeStart = Stopwatch.GetTimestamp();
+            int setCode = Native.SetLabelToMedium(hit.Win32Path, isDirectory);
+            outcome.NativeSetTicks = Stopwatch.GetTimestamp() - nativeStart;
+            if (setCode == 0)
+            {
+                LabelReadResult afterNative = Native.GetLabelInfoFast(hit.Win32Path, false);
+                if (afterNative.Ok && afterNative.Level == "Medium")
+                {
+                    outcome.Fixed = true;
+                    outcome.Method = 1;
+                }
+                else
+                {
+                    outcome.Message = afterNative.Ok
+                        ? ("label is still " + afterNative.Level + " after set")
+                        : ("label re-read failed: Win32 " + afterNative.ErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    outcome.Output = outcome.Message;
+                }
+                return outcome;
+            }
+            if (setCode != 5)
+            {
+                outcome.Message = "SetNamedSecurityInfoW failed: Win32 " + setCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (" + DescribeWin32(setCode) + ")";
+                outcome.Output = outcome.Message;
+                return outcome;
+            }
+
+            Native.GrantSetResult grant = Native.SetLabelToMediumWithTemporaryGrantOptimized(hit.Win32Path, isDirectory, currentUserSid);
+            if (grant != null)
+            {
+                outcome.GrantReadTicks = grant.ReadTicks;
+                outcome.GrantWriteTicks = grant.GrantWriteTicks;
+                outcome.GrantLabelRestoreTicks = grant.LabelRestoreTicks;
+                outcome.GrantVerifyTicks = grant.VerifyTicks;
+                outcome.CombinedFallback = grant.CombinedFallback;
+            }
+            if (grant != null && grant.LabelCode == 0 && grant.DaclRestored && grant.LabelOk)
+            {
+                outcome.Fixed = true;
+                outcome.Method = 2;
+                return outcome;
+            }
+            outcome.Message = BuildGrantFailureMessage(grant);
+            outcome.Output = BuildGrantFailureOutput(grant);
+            if (grant != null && !grant.DaclRestored)
+            {
+                outcome.Kind = "dacl";
+            }
+            else if (grant != null && grant.LabelCode == 0)
+            {
+                outcome.Message = "label is still " + (grant.LabelLevel == null ? "Unknown" : grant.LabelLevel) + " after set";
+                outcome.Output = outcome.Message;
+            }
+            return outcome;
+        }
+
+        private static void ProcessItem(RepairScanResult result, string win32Path, string outputPath, bool isDirectory, bool isRoot)
+        {
+            LabelReadResult label = Native.GetLabelInfoFast(win32Path, true);
+            if (!label.Ok)
+            {
+                result.Scanned++;
+                AddError(result, outputPath, DescribeWin32(label.ErrorCode));
+                if (isRoot) { result.RootLabel = "Unknown"; }
+                return;
+            }
+            if (isRoot) { result.RootLabel = label.Level; }
+            result.Scanned++;
+            if (label.Level != "Low") { return; }
+            result.Hits++;
+            if (label.Explicit) { result.ExplicitCount++; }
+            else { result.InheritedCount++; }
+            RepairHit hit = new RepairHit();
+            hit.Path = outputPath;
+            hit.Win32Path = win32Path;
+            hit.Kind = isDirectory ? "dir" : "file";
+            hit.Explicit = label.Explicit;
+            hit.Inherited = label.Inherited;
+            hit.Sddl = (label.Sddl == null) ? "" : label.Sddl;
+            hit.Depth = PathDepth(win32Path);
+            result.HitList.Add(hit);
+        }
+
+        private static int CompareHits(RepairHit left, RepairHit right)
+        {
+            bool leftDirectory = (left.Kind == "dir");
+            bool rightDirectory = (right.Kind == "dir");
+            if (leftDirectory != rightDirectory) { return leftDirectory ? -1 : 1; }
+            if (left.Depth != right.Depth) { return left.Depth.CompareTo(right.Depth); }
+            return string.Compare(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildGrantFailureMessage(Native.GrantSetResult grant)
+        {
+            if (grant == null)
+            {
+                return "access denied (Win32 5); the in-process temporary grant threw; guidance: run the repair as the object owner or with administrator rights";
+            }
+            string message = "access denied (Win32 5); the in-process temporary WRITE_OWNER grant failed";
+            if (!string.IsNullOrEmpty(grant.Message)) { message += ": " + grant.Message; }
+            if (!grant.DaclRestored)
+            {
+                message += "; the DACL was not restored byte-for-byte (before=" + (grant.DaclBefore == null ? "unreadable" : grant.DaclBefore) + " after=" + (grant.DaclAfter == null ? "unreadable" : grant.DaclAfter) + "); guidance: inspect and restore the ACL manually";
+            }
+            else
+            {
+                message += "; guidance: run the repair as the object owner or with administrator rights";
+            }
+            return message;
+        }
+
+        private static string BuildGrantFailureOutput(Native.GrantSetResult grant)
+        {
+            if (grant == null)
+            {
+                return "SetNamedSecurityInfoW: Win32 5 (access denied); in-process temporary grant threw";
+            }
+            string output = "SetNamedSecurityInfoW: Win32 5 (access denied)";
+            output += "; grantCode=" + grant.GrantCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            output += "; labelCode=" + grant.LabelCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            output += "; restoreCode=" + grant.RestoreCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            output += "; daclRestored=" + (grant.DaclRestored ? "true" : "false");
+            if (!grant.DaclRestored)
+            {
+                output += "; daclBefore=" + (grant.DaclBefore == null ? "" : grant.DaclBefore);
+                output += "; daclAfter=" + (grant.DaclAfter == null ? "" : grant.DaclAfter);
+            }
+            return output;
+        }
+
+        private static void WriteSnapshot(string snapshotPath, string version, string createdAt, string root, string rootLabel, List<RepairHit> hits)
+        {
+            string directory = Path.GetDirectoryName(snapshotPath);
+            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            UTF8Encoding encoding = new UTF8Encoding(false);
+            using (StreamWriter writer = new StreamWriter(snapshotPath, false, encoding))
+            {
+                writer.Write("{\"version\":");
+                WriteJsonString(writer, version);
+                writer.Write(",\"createdAt\":");
+                WriteJsonString(writer, createdAt);
+                writer.Write(",\"root\":");
+                WriteJsonString(writer, root);
+                writer.Write(",\"rootLabel\":");
+                WriteJsonString(writer, rootLabel);
+                writer.Write(",\"hitCount\":");
+                writer.Write(hits.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                writer.Write(",\"hits\":[");
+                for (int index = 0; index < hits.Count; index++)
+                {
+                    RepairHit hit = hits[index];
+                    if (index > 0) { writer.Write(","); }
+                    writer.Write("{\"path\":");
+                    WriteJsonString(writer, hit.Path);
+                    writer.Write(",\"kind\":");
+                    WriteJsonString(writer, hit.Kind);
+                    writer.Write(",\"explicit\":");
+                    writer.Write(hit.Explicit ? "true" : "false");
+                    writer.Write(",\"label\":\"Low\",\"sddl\":");
+                    WriteJsonString(writer, hit.Sddl);
+                    writer.Write("}");
+                }
+                writer.Write("]}");
+            }
+        }
+
+        private static void WriteJsonString(StreamWriter writer, string value)
+        {
+            if (value == null) { writer.Write("null"); return; }
+            writer.Write('"');
+            for (int index = 0; index < value.Length; index++)
+            {
+                char ch = value[index];
+                if (ch == '"') { writer.Write("\\\""); }
+                else if (ch == '\\') { writer.Write("\\\\"); }
+                else if (ch == '\b') { writer.Write("\\b"); }
+                else if (ch == '\t') { writer.Write("\\t"); }
+                else if (ch == '\n') { writer.Write("\\n"); }
+                else if (ch == '\f') { writer.Write("\\f"); }
+                else if (ch == '\r') { writer.Write("\\r"); }
+                else if (ch < ' ')
+                {
+                    writer.Write("\\u");
+                    writer.Write(((int)ch).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                else
+                {
+                    writer.Write(ch);
+                }
+            }
+            writer.Write('"');
+        }
+
+        private static void AddError(RepairScanResult result, string path, string message)
+        {
+            if (result.Errors.Count < MaxErrors)
+            {
+                RepairError error = new RepairError();
+                error.Path = path;
+                error.Message = message;
+                result.Errors.Add(error);
+            }
+            else
+            {
+                result.Truncated = true;
+            }
+        }
+
+        private static bool IsExcluded(string pathNormal, List<string> excludes)
+        {
+            if (excludes.Count == 0) { return false; }
+            string lower = pathNormal.ToLowerInvariant();
+            for (int index = 0; index < excludes.Count; index++)
+            {
+                string prefix = excludes[index];
+                if (lower.Equals(prefix, StringComparison.Ordinal) || lower.StartsWith(prefix + "\\", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static int PathDepth(string path)
+        {
+            if (path == null) { return 0; }
+            int depth = 1;
+            for (int index = 0; index < path.Length; index++)
+            {
+                if (path[index] == '\\') { depth++; }
+            }
+            return depth;
+        }
+
+        private static string TrimLength(string value, int maxLength)
+        {
+            if (value == null) { return ""; }
+            if (value.Length <= maxLength) { return value; }
+            return value.Substring(0, maxLength);
+        }
+
+        private static string DescribeWin32(int errorCode)
+        {
+            try
+            {
+                return new System.ComponentModel.Win32Exception(errorCode).Message + " (Win32 " + errorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+            }
+            catch
+            {
+                return "Win32 " + errorCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
+        private static string ToWin32Path(string path)
+        {
+            if (path == null) { return path; }
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return path; }
+            if (path.StartsWith(@"\\", StringComparison.Ordinal)) { return @"\\?\UNC\" + path.Substring(2); }
+            if (path.Length == 3 && path[1] == ':' && path[2] == '\\') { return path; }
+            return @"\\?\" + path;
+        }
+
+        private static string NormalizePath(string win32Path)
+        {
+            if (win32Path == null) { return null; }
+            if (win32Path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + win32Path.Substring(8); }
+            if (win32Path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return win32Path.Substring(4); }
+            return win32Path;
         }
     }
 }
@@ -1323,6 +2730,18 @@ function Write-ProgressEvent {
     Write-Event -Fields ([ordered]@{ type = 'progress'; phase = $Phase; scanned = $Scanned; total = $Total; hits = $Hits })
 }
 
+function Convert-TicksToMilliseconds {
+    param([long]$Ticks)
+    $frequency = [System.Diagnostics.Stopwatch]::Frequency
+    if ($frequency -le 0) { return 0 }
+    return [math]::Round(($Ticks * 1000.0) / $frequency, 2)
+}
+
+function Write-RepairProgressEvent {
+    param([string]$Phase, [int]$Scanned, $Total, [int]$Hits, [int]$Fixed)
+    Write-Event -Fields ([ordered]@{ type = 'progress'; phase = $Phase; scanned = $Scanned; total = $Total; hits = $Hits; fixed = $Fixed })
+}
+
 function Write-HitEvent {
     param($Hit)
     Write-Event -Fields ([ordered]@{
@@ -1523,24 +2942,9 @@ function Get-IntegrityLabelInfo {
     return (ConvertFrom-LabelSddl -Sddl $sddl)
 }
 
-function Get-LabelLevelFast {
-    param([string]$Win32Path)
-    $errorCode = 0
-    $level = $null
-    try {
-        $level = [DshIntegrity.Native]::GetLabelLevel($Win32Path, [ref]$errorCode)
-    } catch {
-        return @{ ok = $false; level = 'Unknown'; errorCode = -1; message = $_.Exception.Message }
-    }
-    if ($errorCode -ne 0) {
-        return @{ ok = $false; level = 'Unknown'; errorCode = $errorCode; message = (Get-Win32Message $errorCode) }
-    }
-    if ($null -eq $level) { $level = 'Unknown' }
-    return @{ ok = $true; level = [string]$level; errorCode = 0; message = '' }
-}
-
 # ---------------------------------------------------------------------------
-# Owner / DACL helpers (needed for the temporary-WRITE_OWNER repair fallback).
+# Owner / identity helper (the C# RepairSession performs the actual temporary
+# WRITE_OWNER repair fallback; PowerShell only needs the current user SID).
 # ---------------------------------------------------------------------------
 function Get-CurrentUserSid {
     if ($null -ne $script:CurrentUserSidCache) { return $script:CurrentUserSidCache }
@@ -1551,32 +2955,6 @@ function Get-CurrentUserSid {
     } catch { $sid = '' }
     $script:CurrentUserSidCache = $sid
     return $sid
-}
-
-function Get-IntegrityObjectDaclSddl {
-    param([string]$Win32Path)
-    $errorCode = 0
-    $sddl = [DshIntegrity.Native]::GetDaclSddl($Win32Path, [ref]$errorCode)
-    if ($errorCode -ne 0) {
-        return @{ ok = $false; sddl = $null; errorCode = $errorCode; message = (Get-Win32Message $errorCode) }
-    }
-    return @{ ok = $true; sddl = $sddl; errorCode = 0; message = '' }
-}
-
-function Get-IntegrityObjectOwnerSid {
-    param([string]$Win32Path)
-    $errorCode = 0
-    $sid = [DshIntegrity.Native]::GetOwnerSid($Win32Path, [ref]$errorCode)
-    if ($errorCode -ne 0) {
-        return @{ ok = $false; sid = $null; errorCode = $errorCode; message = (Get-Win32Message $errorCode) }
-    }
-    return @{ ok = $true; sid = $sid; errorCode = 0; message = '' }
-}
-
-function Get-IcaclsToolPath {
-    param([string]$NormalPath, [string]$Win32Path)
-    if ($NormalPath.Length -ge 255 -or $NormalPath.StartsWith('\\')) { return $Win32Path }
-    return $NormalPath
 }
 
 # ---------------------------------------------------------------------------
@@ -1706,276 +3084,6 @@ function Test-CanWriteLabel {
         if ($probeDirectory) { try { [System.IO.Directory]::Delete($probeDirectory, $false) } catch { } }
     }
     return $result
-}
-
-function Set-IntegrityLevelOnPath {
-    param(
-        [string]$NormalPath,
-        [string]$Win32Path,
-        [string]$Kind,
-        [string]$TargetLevel
-    )
-    $isDirectory = ($Kind -eq 'dir')
-
-    # Fast path 1: in-process SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION).
-    # No icacls process is spawned for the common case.
-    $nativeSetCode = -1
-    try {
-        if ($TargetLevel -eq 'Medium') {
-            $nativeSetCode = [DshIntegrity.Native]::SetLabelToMedium($Win32Path, $isDirectory)
-        } else {
-            $sddlLevel = ConvertTo-SddlLevelAbbreviation $TargetLevel
-            if ($isDirectory) {
-                $sddl = 'S:(ML;OICI;NW;;;' + $sddlLevel + ')'
-            } else {
-                $sddl = 'S:(ML;;NW;;;' + $sddlLevel + ')'
-            }
-            $nativeSetCode = [DshIntegrity.Native]::SetLabel($Win32Path, $sddl)
-        }
-    } catch {
-        $nativeSetCode = -1
-    }
-    if ($nativeSetCode -eq 0) {
-        return @{ ok = $true; method = 'native'; output = ''; message = ''; icaclsExitCode = 0 }
-    }
-
-    # Fast path 2: Access denied -> in-process temporary WRITE_OWNER DACL grant.
-    # The DACL is saved, the grant/restore happens via SetNamedSecurityInfoW and the
-    # restored DACL is compared byte-for-byte with the original SDDL.
-    $grantDiagnostics = $null
-    $failureMessage = 'in-process SetNamedSecurityInfoW failed: Win32 ' + $nativeSetCode + ' (' + (Get-Win32Message $nativeSetCode) + ')'
-    if ($TargetLevel -eq 'Medium' -and $nativeSetCode -eq 5) {
-        $ownerInfo = Get-IntegrityObjectOwnerSid -Win32Path $Win32Path
-        $currentSid = Get-CurrentUserSid
-        $guidance = 'guidance: run the repair as the object owner or with administrator rights'
-        if (-not $ownerInfo.ok) {
-            $failureMessage = 'access denied (Win32 5); the object owner could not be read (' + $ownerInfo.message + '); ' + $guidance
-        } elseif ([string]::IsNullOrEmpty($currentSid)) {
-            $failureMessage = 'access denied (Win32 5); the current user SID is unknown; ' + $guidance
-        } elseif (-not ([string]$ownerInfo.sid).Equals($currentSid, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $failureMessage = 'access denied (Win32 5); object owner ' + [string]$ownerInfo.sid + ' is not the current user ' + $currentSid + '; ' + $guidance
-        } else {
-            try {
-                $grantDiagnostics = [DshIntegrity.Native]::SetLabelToMediumWithTemporaryGrant($Win32Path, $isDirectory, $currentSid)
-            } catch {
-                $grantDiagnostics = $null
-                $failureMessage = 'access denied (Win32 5); in-process temporary grant threw: ' + $_.Exception.Message + '; ' + $guidance
-            }
-            if ($null -ne $grantDiagnostics) {
-                if ($grantDiagnostics.LabelCode -eq 0 -and $grantDiagnostics.DaclRestored) {
-                    return @{
-                        ok     = $true
-                        method = 'grant'
-                        output = ''
-                        message = 'access denied; in-process temporary WRITE_OWNER grant used and DACL restored'
-                        icaclsExitCode = 0
-                    }
-                }
-                $failureMessage = 'access denied (Win32 5); in-process temporary grant failed'
-                if ($grantDiagnostics.Message) {
-                    $failureMessage = $failureMessage + ': ' + [string]$grantDiagnostics.Message
-                }
-                if (-not $grantDiagnostics.DaclRestored) {
-                    $failureMessage = $failureMessage + '; the DACL was not restored byte-for-byte (before=' + [string]$grantDiagnostics.DaclBefore + ' after=' + [string]$grantDiagnostics.DaclAfter + '); guidance: inspect and restore the ACL manually'
-                } else {
-                    $failureMessage = $failureMessage + '; ' + $guidance
-                }
-            }
-        }
-    }
-
-    # Legacy fallback: icacls. Only reached for unusual/non-Medium failures; it is
-    # also what produces the human readable error text in the failed log.
-    $levelSpecification = $TargetLevel
-    if ($isDirectory) { $levelSpecification = '(OI)(CI)' + $TargetLevel }
-    $toolPath = Get-IcaclsToolPath -NormalPath $NormalPath -Win32Path $Win32Path
-    $arguments = (Quote-ProcessArgument $toolPath) + ' /setintegritylevel ' + (Quote-ProcessArgument $levelSpecification)
-    $call = Invoke-IcaclsProcess -Executable $script:IcaclsExecutable -ArgumentString $arguments
-    if ($call.exitCode -eq 0) {
-        return @{ ok = $true; method = 'icacls'; output = $call.output; message = ''; icaclsExitCode = 0 }
-    }
-
-    $combinedOutput = $call.output
-    if ($call.exitCode -eq 5) {
-        $legacyGrant = Set-IntegrityLevelWithOwnerGrant -NormalPath $NormalPath -Win32Path $Win32Path -Kind $Kind -TargetLevel $TargetLevel -OriginalOutput $call.output
-        if ($legacyGrant.ok) { return $legacyGrant }
-        if ($legacyGrant.message) { $failureMessage = $failureMessage + '; ' + [string]$legacyGrant.message }
-        $combinedOutput = [string]$legacyGrant.output
-    }
-
-    return @{
-        ok             = $false
-        method         = 'native+icacls'
-        output         = $combinedOutput
-        message        = $failureMessage
-        icaclsExitCode = $call.exitCode
-    }
-}
-
-function Set-IntegrityLevelWithOwnerGrant {
-    param(
-        [string]$NormalPath,
-        [string]$Win32Path,
-        [string]$Kind,
-        [string]$TargetLevel,
-        [string]$OriginalOutput
-    )
-    $baseMessage = 'access denied (icacls/Win32 5)'
-    $guidance = 'guidance: run the repair as the object owner or with administrator rights'
-    $aclBefore = Get-IntegrityObjectDaclSddl -Win32Path $Win32Path
-    if (-not $aclBefore.ok) {
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $OriginalOutput
-            message = ($baseMessage + '; the object DACL could not be read (' + $aclBefore.message + '); ' + $guidance)
-        }
-    }
-    $ownerInfo = Get-IntegrityObjectOwnerSid -Win32Path $Win32Path
-    if (-not $ownerInfo.ok) {
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $OriginalOutput
-            message = ($baseMessage + '; the object owner could not be read (' + $ownerInfo.message + '); ' + $guidance)
-        }
-    }
-    $currentSid = Get-CurrentUserSid
-    if ([string]::IsNullOrEmpty($currentSid)) {
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $OriginalOutput
-            message = ($baseMessage + '; the current user SID is unknown; ' + $guidance)
-        }
-    }
-    if (-not ([string]$ownerInfo.sid).Equals($currentSid, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $OriginalOutput
-            message = ($baseMessage + '; object owner ' + [string]$ownerInfo.sid + ' is not the current user ' + $currentSid + '; ' + $guidance)
-        }
-    }
-
-    $toolPath = Get-IcaclsToolPath -NormalPath $NormalPath -Win32Path $Win32Path
-    $grantArguments = (Quote-ProcessArgument $toolPath) + ' /grant *' + $currentSid + ':(WO)'
-    $grantCall = Invoke-IcaclsProcess -Executable $script:IcaclsExecutable -ArgumentString $grantArguments
-    if ($grantCall.exitCode -ne 0) {
-        $aclAfterGrant = Get-IntegrityObjectDaclSddl -Win32Path $Win32Path
-        $daclUnchanged = ($aclAfterGrant.ok -and ([string]$aclAfterGrant.sddl -eq [string]$aclBefore.sddl))
-        $suffix = ''
-        if (-not $daclUnchanged) {
-            $suffix = '; warning: the DACL changed while attempting the temporary grant, inspect it manually'
-        }
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = (($OriginalOutput + ' ' + $grantCall.output).Trim())
-            message = ($baseMessage + '; temporary WRITE_OWNER grant failed (icacls exit ' + $grantCall.exitCode + ')' + $suffix + '; ' + $guidance)
-        }
-    }
-
-    $labelSet = $false
-    $labelOutput = ''
-    $labelMessage = ''
-    $removeCall = $null
-    try {
-        $levelSpecification = $TargetLevel
-        if ($Kind -eq 'dir') { $levelSpecification = '(OI)(CI)' + $TargetLevel }
-        $setArguments = (Quote-ProcessArgument $toolPath) + ' /setintegritylevel ' + (Quote-ProcessArgument $levelSpecification)
-        $setCall = Invoke-IcaclsProcess -Executable $script:IcaclsExecutable -ArgumentString $setArguments
-        if ($setCall.exitCode -eq 0) {
-            $labelSet = $true
-        } else {
-            $labelOutput = $setCall.output
-            try {
-                $sddlLevel = ConvertTo-SddlLevelAbbreviation $TargetLevel
-                if ($Kind -eq 'dir') {
-                    $sddl = 'S:(ML;OICI;NW;;;' + $sddlLevel + ')'
-                } else {
-                    $sddl = 'S:(ML;;NW;;;' + $sddlLevel + ')'
-                }
-                $nativeResult = [DshIntegrity.Native]::SetLabel($Win32Path, $sddl)
-                if ($nativeResult -eq 0) {
-                    $labelSet = $true
-                } else {
-                    $labelMessage = 'the label could not be set even with a temporary WRITE_OWNER grant (icacls exit ' + $setCall.exitCode + '; P/Invoke Win32 ' + $nativeResult + ')'
-                }
-            } catch {
-                $labelMessage = 'the label could not be set even with a temporary WRITE_OWNER grant: ' + $_.Exception.Message
-            }
-        }
-    } finally {
-        $removeArguments = (Quote-ProcessArgument $toolPath) + ' /remove:g *' + $currentSid
-        $removeCall = Invoke-IcaclsProcess -Executable $script:IcaclsExecutable -ArgumentString $removeArguments
-    }
-    $removeOutput = ''
-    if ($null -ne $removeCall) { $removeOutput = [string]$removeCall.output }
-    $combinedOutput = (($OriginalOutput + ' ' + $labelOutput + ' ' + $removeOutput).Trim())
-
-    $aclAfter = Get-IntegrityObjectDaclSddl -Win32Path $Win32Path
-    $daclRestored = ($aclAfter.ok -and ([string]$aclAfter.sddl -eq [string]$aclBefore.sddl))
-    if (-not $daclRestored) {
-        $afterText = 'unreadable'
-        if ($aclAfter.ok) { $afterText = [string]$aclAfter.sddl }
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $combinedOutput
-            message = ($baseMessage + '; the temporary WRITE_OWNER grant was not fully reverted (DACL changed); guidance: inspect and restore the ACL manually. before=' + [string]$aclBefore.sddl + ' after=' + $afterText)
-        }
-    }
-    if (-not $labelSet) {
-        if (-not $labelMessage) { $labelMessage = 'the label could not be set after a temporary WRITE_OWNER grant' }
-        return @{
-            ok     = $false
-            method = 'grant'
-            output = $combinedOutput
-            message = ($baseMessage + '; ' + $labelMessage + '; ' + $guidance)
-        }
-    }
-    return @{
-        ok     = $true
-        method = 'grant'
-        output = $combinedOutput
-        message = 'access denied; temporary WRITE_OWNER grant used and DACL restored'
-        icaclsExitCode = 0
-    }
-}
-
-function Repair-SingleObject {
-    param([hashtable]$Hit, [string]$TargetLevel)
-    $before = Get-LabelLevelFast -Win32Path $Hit.win32Path
-    if ($before.ok -and $before.level -ne 'Low') {
-        return @{ status = 'already' }
-    }
-    $preReadMessage = ''
-    if (-not $before.ok) { $preReadMessage = 'pre-read failed: ' + $before.message }
-
-    $setResult = Set-IntegrityLevelOnPath -NormalPath $Hit.path -Win32Path $Hit.win32Path -Kind $Hit.kind -TargetLevel $TargetLevel
-    $after = Get-LabelLevelFast -Win32Path $Hit.win32Path
-    if ($after.ok -and $after.level -eq $TargetLevel) {
-        return @{ status = 'fixed'; method = $setResult.method; output = $setResult.output }
-    }
-
-    $message = ''
-    if ($setResult.ok) {
-        if (-not $after.ok) {
-            $message = 'label re-read failed after set: ' + $after.message
-        } else {
-            $message = 'label is still ' + $after.level + ' after set'
-        }
-    } else {
-        $message = $setResult.message
-    }
-    if ($preReadMessage) { $message = $message + ' (' + $preReadMessage + ')' }
-    return @{
-        status  = 'failed'
-        method  = $setResult.method
-        message = $message
-        output  = $setResult.output
-    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2433,23 +3541,8 @@ function Invoke-QuickScanMode {
     return 0
 }
 
-function Get-SnapshotTargets {
-    param([System.Collections.ArrayList]$Hits)
-    $targets = New-Object System.Collections.ArrayList
-    foreach ($hit in $Hits) {
-        [void]$targets.Add([ordered]@{
-                path     = $hit.path
-                kind     = $hit.kind
-                explicit = [bool]$hit.explicit
-                label    = 'Low'
-                sddl     = $hit.sddl
-            })
-    }
-    return $targets
-}
-
 function New-RestoreScriptText {
-    param([System.Collections.ArrayList]$Hits, [string]$RootPath, [string]$SnapshotPath)
+    param($Hits, [string]$RootPath, [string]$SnapshotPath)
     $builder = New-Object System.Text.StringBuilder
     [void]$builder.AppendLine('# dsh-file-integrity-check restore script')
     [void]$builder.AppendLine('# Generated: ' + (Get-Date).ToString('o'))
@@ -2592,19 +3685,61 @@ function Invoke-RepairMode {
         }
     } catch { }
 
-    $hits = New-Object System.Collections.ArrayList
-    $scan = Invoke-Traversal -RootNormal $rootCheck.rootNormal -SkipDirNames $script:SkipDirList -StreamHits $true -HitCollector $hits -ProgressPhase 'enumerate' -ExcludePaths $repairExclusions
+    $snapshotDirectory = Join-Path $dataDirectory 'snapshots'
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $snapshotPath = Join-Path $snapshotDirectory ('snapshot-' + $stamp + '.json')
+    $restorePath = Join-Path $snapshotDirectory ('restore-' + $stamp + '.ps1')
+    try {
+        if (-not [System.IO.Directory]::Exists($snapshotDirectory)) {
+            [void][System.IO.Directory]::CreateDirectory($snapshotDirectory)
+        }
+    } catch {
+        Write-Fatal -Code 'snapshot-failed' -Message ('Could not create the snapshot directory: ' + $_.Exception.Message)
+        return 3
+    }
 
-    $convertedErrors = ConvertTo-ResultErrors -ErrorList $scan.errors
-    $truncated = ([bool]$scan.truncated) -or ([bool]$convertedErrors.truncated)
+    # The C# pipeline reports progress through this delegate. total stays $null
+    # while the scan is still walking the tree (the final count is unknown).
+    $progressCallback = [DshIntegrity.RepairProgressDelegate] {
+        param([string]$phase, [int]$scanned, [int]$total, [int]$hits, [int]$fixedCount)
+        $totalValue = $null
+        if ($total -ge 0) { $totalValue = [int]$total }
+        Write-RepairProgressEvent -Phase $phase -Scanned $scanned -Total $totalValue -Hits $hits -Fixed $fixedCount
+    }
 
-    if ($hits.Count -eq 0) {
+    # ---- scan + snapshot (C#, before any mutation) ------------------------
+    try {
+        $scanResult = [DshIntegrity.RepairSession]::Scan(
+            [string]$rootCheck.rootNormal,
+            [string[]]$script:SkipDirList,
+            [string[]]$repairExclusions,
+            [string]$snapshotPath,
+            [string]$script:EngineVersion,
+            (Get-Date).ToString('o'),
+            $progressCallback)
+    } catch {
+        Write-Fatal -Code 'repair-scan-failed' -Message ('C# repair scan failed: ' + $_.Exception.Message)
+        return 3
+    }
+    if ($null -eq $scanResult) {
+        Write-Fatal -Code 'repair-scan-failed' -Message 'C# repair scan returned no result.'
+        return 3
+    }
+    if (-not [string]::IsNullOrEmpty([string]$scanResult.SnapshotError)) {
+        Write-Fatal -Code 'snapshot-failed' -Message ('Could not write the repair snapshot: ' + [string]$scanResult.SnapshotError)
+        return 3
+    }
+
+    $convertedErrors = ConvertTo-ResultErrors -ErrorList $scanResult.Errors
+    $truncated = ([bool]$scanResult.Truncated) -or ([bool]$convertedErrors.truncated)
+
+    if ([int]$scanResult.Hits -eq 0) {
         Write-Event -Fields ([ordered]@{
                 type           = 'result'
                 mode           = 'repair'
                 root           = $rootCheck.rootNormal
-                rootLabel      = $scan.rootLabel
-                scanned        = $scan.scanned
+                rootLabel      = [string]$scanResult.RootLabel
+                scanned        = [int]$scanResult.Scanned
                 hits           = 0
                 explicitCount  = 0
                 inheritedCount = 0
@@ -2612,7 +3747,12 @@ function Invoke-RepairMode {
                 truncated      = [bool]$truncated
                 fixed          = 0
                 failed         = (New-Object System.Collections.ArrayList)
+                failedTotal    = 0
                 remaining      = 0
+                daclRestoreFailures = 0
+                methods        = ([ordered]@{ icacls = 0; pinvoke = 0; grant = 0; native = 0 })
+                repairEngine   = 'csharp'
+                timings        = ([ordered]@{ scanMs = [long]$scanResult.ScanMs; snapshotMs = [long]$scanResult.SnapshotMs; restoreMs = 0; repairMs = 0; verifyMs = 0; preReadMs = 0; nativeSetMs = 0; grantReadMs = 0; grantWriteMs = 0; grantLabelRestoreMs = 0; grantVerifyMs = 0; grantFallbacks = 0; totalMs = [long]$stopwatch.ElapsedMilliseconds })
                 snapshotPath   = $null
                 restorePath    = $null
                 engineVersion  = $script:EngineVersion
@@ -2621,159 +3761,87 @@ function Invoke-RepairMode {
         return 0
     }
 
-    # ---- snapshot + restore script, before any mutation --------------------
-    $snapshotDirectory = Join-Path $dataDirectory 'snapshots'
-    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
-    $snapshotPath = Join-Path $snapshotDirectory ('snapshot-' + $stamp + '.json')
-    $restorePath = Join-Path $snapshotDirectory ('restore-' + $stamp + '.ps1')
-
+    # ---- restore script before any mutation (C10) -------------------------
+    $restoreStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        if (-not [System.IO.Directory]::Exists($snapshotDirectory)) {
-            [System.IO.Directory]::CreateDirectory($snapshotDirectory) | Out-Null
-        }
-        $snapshotDocument = [ordered]@{
-            version   = $script:EngineVersion
-            createdAt = (Get-Date).ToString('o')
-            root      = $rootCheck.rootNormal
-            rootLabel = $scan.rootLabel
-            hitCount  = $hits.Count
-            hits      = (Get-SnapshotTargets -Hits $hits)
-        }
-        Write-TextFileNoBom -Path $snapshotPath -Text (ConvertTo-JsonValue $snapshotDocument)
-        $restoreText = New-RestoreScriptText -Hits $hits -RootPath $rootCheck.rootNormal -SnapshotPath $snapshotPath
+        $restoreText = New-RestoreScriptText -Hits $scanResult.HitList -RootPath $rootCheck.rootNormal -SnapshotPath $snapshotPath
         Write-TextFileUtf8Bom -Path $restorePath -Text $restoreText
     } catch {
-        Write-Fatal -Code 'snapshot-failed' -Message ('Could not write repair snapshot: ' + $_.Exception.Message)
+        Write-Fatal -Code 'snapshot-failed' -Message ('Could not write the restore script: ' + $_.Exception.Message)
+        return 3
+    }
+    $restoreStopwatch.Stop()
+
+    # ---- repair (C# in-process; each object is verified right after the set) --
+    try {
+        $runResult = [DshIntegrity.RepairSession]::Repair($scanResult, $progressCallback, [string](Get-CurrentUserSid))
+    } catch {
+        Write-Fatal -Code 'repair-failed' -Message ('C# repair failed: ' + $_.Exception.Message)
         return 3
     }
 
-    # ---- repair bookkeeping ------------------------------------------------
-    $failed = New-Object System.Collections.ArrayList
-    $attemptRecords = @{}
-    $fixedCount = 0
-    $processedCount = 0
-    $methods = @{ icacls = 0; pinvoke = 0; grant = 0; native = 0 }
-
-    $recordFailureEvent = {
-        param($hit, $message, $output)
-        $key = $hit.path.ToLowerInvariant()
-        $attemptRecords[$key] = @{ path = $hit.path; message = [string]$message; output = [string]$output }
-        $text = [string]$message
-        $text = $text -replace "`r?`n", ' '
-        Write-Event -Fields ([ordered]@{
-                type    = 'error'
-                path    = $hit.path
-                message = $text
-                phase   = 'repair'
-                output  = [string]$output
-            })
-    }
-
-    $repairLayer = {
-        param($layerItems, $layerLabel)
-        if ($null -eq $layerItems) { return }
-        $items = @($layerItems)
-        if ($items.Count -eq 0) { return }
-        $layerTotal = $items.Count
-        $layerProcessed = 0
-        foreach ($hit in $items) {
-            $layerProcessed = $layerProcessed + 1
-            $outcome = Repair-SingleObject -Hit $hit -TargetLevel 'Medium'
-            if ($outcome.status -eq 'fixed') {
-                if ($outcome.method) { if ($methods.ContainsKey($outcome.method)) { $methods[$outcome.method] = $methods[$outcome.method] + 1 } }
-            } elseif ($outcome.status -eq 'failed') {
-                & $recordFailureEvent $hit $outcome.message $outcome.output
-            }
-            Write-ProgressEvent -Phase 'repair' -Scanned $layerProcessed -Total $layerTotal -Hits $scan.hits
+    # The final failure list only contains objects that are still Low, unverifiable,
+    # or whose temporary-grant DACL restore could not be verified byte-for-byte
+    # (the last category stays failed even when the label itself became Medium).
+    # result.failed is capped at 1000 entries so a "everything failed" run cannot
+    # produce a giant single JSON line; failedTotal keeps the authoritative count.
+    # Stream at most 1000 error events so the Host log stays bounded.
+    $failedList = New-Object System.Collections.ArrayList
+    $failedTotal = 0
+    $errorEventCount = 0
+    foreach ($failure in $runResult.Failed) {
+        $failedTotal = $failedTotal + 1
+        if ($failedList.Count -lt 1000) {
+            [void]$failedList.Add([ordered]@{
+                    path    = [string]$failure.Path
+                    message = [string]$failure.Message
+                    output  = [string]$failure.Output
+                })
         }
-        Write-ProgressEvent -Phase 'repair' -Scanned $layerTotal -Total $layerTotal -Hits $scan.hits
-    }
-
-    $explicitLowDirectories = @($hits | Where-Object { $_.kind -eq 'dir' -and $_.explicit } | Sort-Object -Property depth)
-    $explicitLowFiles = @($hits | Where-Object { $_.kind -eq 'file' -and $_.explicit } | Sort-Object -Property depth)
-    & $repairLayer $explicitLowDirectories 'explicit-dirs'
-    & $repairLayer $explicitLowFiles 'explicit-files'
-
-    # ---- fallback: rescan and repair anything still Low --------------------
-    $rescanHits = New-Object System.Collections.ArrayList
-    $rescan = Invoke-Traversal -RootNormal $rootCheck.rootNormal -SkipDirNames $script:SkipDirList -StreamHits $false -HitCollector $rescanHits -ProgressPhase 'repair' -ExcludePaths $repairExclusions
-    $rescanDirectories = @($rescanHits | Where-Object { $_.kind -eq 'dir' } | Sort-Object -Property depth)
-    $rescanFiles = @($rescanHits | Where-Object { $_.kind -eq 'file' } | Sort-Object -Property depth)
-    & $repairLayer $rescanDirectories 'fallback-dirs'
-    & $repairLayer $rescanFiles 'fallback-files'
-
-    # ---- final verification of the original hit set -----------------------
-    # result.failed is the FINAL failure list: only objects that are still Low
-    # (or can no longer be verified) after all repair layers are reported. Failed
-    # attempts that were later fixed by propagation are not listed here.
-    $remainingCount = 0
-    $verifyFailures = 0
-    $verifiedCount = 0
-    $finalProblems = @{}
-    foreach ($hit in $hits) {
-        $verifiedCount = $verifiedCount + 1
-        $key = $hit.path.ToLowerInvariant()
-        $info = Get-LabelLevelFast -Win32Path $hit.win32Path
-        if (-not $info.ok) {
-            $verifyFailures = $verifyFailures + 1
-            $finalProblems[$key] = @{ state = 'verify-failed'; message = ('verification failed: ' + $info.message) }
-        } elseif ($info.level -eq 'Low') {
-            $remainingCount = $remainingCount + 1
-            $finalProblems[$key] = @{ state = 'still-low'; message = 'still Low after repair' }
-        }
-        if (($verifiedCount % 200) -eq 0) {
-            Write-ProgressEvent -Phase 'verify' -Scanned $verifiedCount -Total $hits.Count -Hits $scan.hits
+        if ($errorEventCount -lt 1000) {
+            $text = [string]$failure.Message
+            $text = $text -replace "`r?`n", ' '
+            Write-Event -Fields ([ordered]@{
+                    type    = 'error'
+                    path    = [string]$failure.Path
+                    message = $text
+                    phase   = 'repair'
+                    output  = [string]$failure.Output
+                })
+            $errorEventCount = $errorEventCount + 1
         }
     }
-    Write-ProgressEvent -Phase 'verify' -Scanned $hits.Count -Total $hits.Count -Hits $scan.hits
 
-    # failure list = original hits that are still Low / unverifiable
-    foreach ($hit in $hits) {
-        $key = $hit.path.ToLowerInvariant()
-        if (-not $finalProblems.ContainsKey($key)) { continue }
-        $problem = $finalProblems[$key]
-        $message = [string]$problem.message
-        $output = ''
-        $record = $attemptRecords[$key]
-        if ($null -ne $record) {
-            if ($record.message) { $message = [string]$record.message }
-            $output = [string]$record.output
-        }
-        [void]$failed.Add([ordered]@{
-                path    = $hit.path
-                message = $message
-                output  = $output
-            })
-    }
-
-    $fixedCount = $hits.Count - $remainingCount - $verifyFailures
-    if ($fixedCount -lt 0) { $fixedCount = 0 }
-
-    $fixedCount = $hits.Count - $remainingCount - $verifyFailures
-    if ($fixedCount -lt 0) { $fixedCount = 0 }
+    # result.failed is capped at 1000 entries so a "everything failed" run cannot
+    # produce a giant single JSON line; failedTotal keeps the authoritative count.
+    if ($failedTotal -gt $failedList.Count) { $truncated = $true }
 
     Write-Event -Fields ([ordered]@{
             type           = 'result'
             mode           = 'repair'
             root           = $rootCheck.rootNormal
-            rootLabel      = $scan.rootLabel
-            scanned        = $scan.scanned
-            hits           = $scan.hits
-            explicitCount  = $scan.explicitCount
-            inheritedCount = $scan.inheritedCount
+            rootLabel      = [string]$scanResult.RootLabel
+            scanned        = [int]$scanResult.Scanned
+            hits           = [int]$scanResult.Hits
+            explicitCount  = [int]$scanResult.ExplicitCount
+            inheritedCount = [int]$scanResult.InheritedCount
             errors         = $convertedErrors.list
             truncated      = [bool]$truncated
-            fixed          = $fixedCount
-            failed         = $failed
-            remaining      = $remainingCount
-            methods        = ([ordered]@{ icacls = $methods['icacls']; pinvoke = $methods['pinvoke']; grant = $methods['grant']; native = $methods['native'] })
+            fixed          = [int]$runResult.Fixed
+            failed         = $failedList
+            failedTotal    = [int]$failedTotal
+            remaining      = [int]$runResult.Remaining
+            daclRestoreFailures = [int]$runResult.DaclFailures
+            methods        = ([ordered]@{ icacls = [int]$runResult.IcaclsCount; pinvoke = [int]$runResult.PinvokeCount; grant = [int]$runResult.GrantCount; native = [int]$runResult.NativeCount })
+            repairEngine   = 'csharp'
+            timings        = ([ordered]@{ scanMs = [long]$scanResult.ScanMs; snapshotMs = [long]$scanResult.SnapshotMs; restoreMs = [long]$restoreStopwatch.ElapsedMilliseconds; repairMs = [long]$runResult.RepairMs; verifyMs = [long]$runResult.VerifyMs; preReadMs = (Convert-TicksToMilliseconds -Ticks $runResult.PreReadTicks); nativeSetMs = (Convert-TicksToMilliseconds -Ticks $runResult.NativeSetTicks); grantReadMs = (Convert-TicksToMilliseconds -Ticks $runResult.GrantReadTicks); grantWriteMs = (Convert-TicksToMilliseconds -Ticks $runResult.GrantWriteTicks); grantLabelRestoreMs = (Convert-TicksToMilliseconds -Ticks $runResult.GrantLabelRestoreTicks); grantVerifyMs = (Convert-TicksToMilliseconds -Ticks $runResult.GrantVerifyTicks); grantFallbacks = [int]$runResult.GrantFallbackCount; totalMs = [long]$stopwatch.ElapsedMilliseconds })
             snapshotPath   = $snapshotPath
             restorePath    = $restorePath
             engineVersion  = $script:EngineVersion
             durationMs     = [int]$stopwatch.ElapsedMilliseconds
         })
 
-    if ($remainingCount -gt 0 -or $failed.Count -gt 0) { return 2 }
+    if ([int]$runResult.Remaining -gt 0 -or $failedList.Count -gt 0) { return 2 }
     return 0
 }
 
