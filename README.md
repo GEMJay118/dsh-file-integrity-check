@@ -3,8 +3,6 @@
 > 一个 Windows 专用的 DSH（DeepSeek Harness）插件：在右侧栏检查当前工作区残留的 **Low 完整性标签**，确认后一键恢复为 **Medium**，并支持导出清单、复扫验证与失败日志。
 >
 > 仓库名 `dsh-file-integrity-check` 是项目目录名；插件包名与 DSH 插件 id 为 **`dsh-low-integrity-check`**。
->
-> 开发与维护文档：[AGENTS.md](AGENTS.md)（技术约束与已知坑）、[docs/HANDOFF.md](docs/HANDOFF.md)（当前状态/待办/验证边界）、[docs/DECISIONS.md](docs/DECISIONS.md)（关键取舍与理由）。
 
 ## 背景：为什么需要它
 
@@ -159,7 +157,4 @@ client.js                 右侧栏面板（纯 JS，无 JSX / 无平台包依�
 engine/integrity.ps1      Env / Scan / Repair 引擎（PS 5.1 兼容；quick 用内嵌 C# 扫描器）
 locale/                   插件管理器展示文案
 test/                     Node 单测与引擎夹具验收
-AGENTS.md                 开发约束、测试命令、已知坑（给后续 agent/开发者）
-docs/HANDOFF.md           当前状态、P0/P1 待办、验证边界
-docs/DECISIONS.md         关键取舍与理由
 ```
