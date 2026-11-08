@@ -30,6 +30,7 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
 - **失败诊断**：清除失败时在面板内逐条列出对象、原因与可读诊断（Win32 码 / owner 不匹配 / DACL 前后值 / guidance），不再生成日志文件。
 - **产物目录可配置**：默认产物写在 `%DSH_HOME%\low-integrity-check\`；可在 DSH **设置 → 文件完整性检查** 里输入或选择其他本地目录，保存后从下一次检查/清除开始生效，面板底部显示当前目录。
 - **自动清理过期产物**：设置页可选保留 **3 / 7 / 15 / 30 天或自定义 1–3650 天**（默认 30）；只清理**当前产物目录**下 `reports\`（`scan-*.json`）与 `snapshots\`（`snapshot-*.json`、`restore-*.ps1`）中严格命名的引擎产物，不递归、不删目录、不碰其他文件；最近 15 分钟的新文件与仍被任务引用的文件受保护。插件激活后、每个任务结束、每 6 小时与保存设置后自动执行，设置页显示上次清理时间/删除数/释放空间。
+- **会话行紫点提醒**：由本会话发起的检查/清除任务结束（成功 / 失败 / 取消）且尚未查看时，左侧会话列表该行的状态圆圈位置显示一个紫色实心圆点（悬停提示「点击会话行标记为已读」）；点击该会话行后恢复原样。已读状态只记录在浏览器 `sessionStorage`，不写入工作区或 Host 配置。2026-11-08 经用户真机验证：任务结束显示紫点、点击会话行恢复原样。
 - **进度体验**：运行中显示阶段（扫描 / 修复 / 验证）、已扫描或已修复数量、扫描速率与预计剩余时间（total 已知时），随时可取消；修复进度按批合并，不再每个对象一行。
 - **安全约束**：只接受 DSH 已注册工作区的规范化路径；拒绝盘根、用户主目录及其宽泛子目录、DSH 安装目录、相对路径；HTTP 只接受同源请求；产物目录同样由 Host 校验（带盘符绝对路径、工作区外、非盘根/用户主目录/DSH 数据与安装目录）。
 
@@ -148,6 +149,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
   - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）。真实 114k 复测预计 **≈14min** 量级（待回填）。
 - 真实工作区（历史，阶段 1 前）：修复前 24 命中，清除后复扫 **0 命中**、根与文件均为 Medium，非命中 DACL 抽样逐字符一致。
 
+> 文档维护：新内容并入对应章节，避免追加式续写与重复表述；被取代的旧表述随更新删除。
+
 ## 已知限制与非目标
 
 - 不改变 DSH 沙箱行为，也不承诺 Low 标签不再复发（`workspace-write` 写入后可能重新出现）。
@@ -164,6 +167,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 - 产物目录/保留天数设置：**2026-11-08 真机已验证** `configEditor` 写 profile patch + volatile 持久化（profile 中为 `dataDir=D:\low-integrity-check`、`retentionDays=3`）、`GET /settings` 与 `/diagnostics` 返回、Config schema 投影（inspector `status=schema`）、设置页注册（`settings.section` id `low-integrity` order 50）并被实际使用；**页面视觉/文案、「选择文件夹」真机行为、真实任务 → 新 `-DataDir` 联调仍待人工确认**；不做 `realpath`，junction/符号链接指向受保护目录的绕过属已知口径。
 - 自动清理真机验证（2026-11-08）：① 激活后触发已产生 `lastCleanup`；② 保存设置后触发——在 `D:\low-integrity-check\reports` 放 2020 年假报告 `scan-20200101-000000-abcdef.json` 与用户文件 `notes.txt`，`POST /settings {retentionDays:3}` 后 4 秒内假报告被删（`lastCleanup.deletedCount=1`、`freedBytes=15`），`notes.txt` 原样保留（测试文件随后已清理）。**仍未验证**：每 6 小时与任务终态触发在真机上的时间行为；file symlink 防护（本机无开发者模式，测试 1 skip）；真实大目录、并发写报告、网络盘；设置页视觉/文案待人工确认。非法 `retentionDays` 会回退默认 30 天并在 `/diagnostics` 报 `retentionError`。
 - 自动清理只作用于当前生效产物目录，切换目录后旧目录不会自动清理；删除不可恢复，保留天数请按需设置。
+- 会话行紫点已于 2026-11-08 经用户真机验证（任务结束显示、点击恢复、非未读行不遮挡宿主状态点）；16px 单元格观感与 `color-mix` 色相、与 `schedule-mark` 同格布局、虚拟列表复用点击、多标签 `sessionStorage`/`visibilitychange` 等细节未单独验证。该功能仅改 `client.js`，不影响任务与产物正确性。
 - 切换产物目录只影响之后启动的任务（任务开始时固定），不迁移旧目录产物；`.` 与 `..` 会被规范化，配置值需用户自行确认指向预期目录。
 
 ## 目录结构
@@ -178,7 +182,7 @@ lib/
   cleanup.js              过期产物自动清理（白名单/realpath 防护/保护窗口）
   jobs.js                 任务管理（互斥/超时/取消/导出；job.dataDir 固定；终态回调）
   engine.js               spawn 隐藏 PowerShell + JSONL 解析（engineInvocation 拼 argv）
-client.js                 右侧栏面板 + DSH 设置页「文件完整性检查」（产物目录 + 自动清理；纯 JS，无 JSX / 无平台包依赖）
+client.js                 右侧栏面板 + DSH 设置页「文件完整性检查」（产物目录 + 自动清理）+ 会话行未读紫点（纯 JS，无 JSX / 无平台包依赖）
 engine/integrity.ps1      Env / Scan / Repair 引擎（PS 5.1 兼容；quick 与 Repair 用内嵌 C#）
 locale/                   插件管理器展示文案
 test/                     Node 单测与引擎夹具验收

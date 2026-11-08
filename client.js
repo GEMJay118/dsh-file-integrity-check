@@ -12,6 +12,8 @@
  *   重置并从 sessionStorage['dsh-fi:' + sessionId] 恢复任务。
  * - 设置页：注册到「设置」的 settings.section，读取/保存产物目录与自动清理保留天数
  *   （GET/POST /settings），并展示上次清理结果；面板底部同时展示当前产物目录（来自 /health）。
+ * - 会话行紫点：注册 sidebar.session.row.leading occupant；本会话任务结束后显示紫色圆点，
+ *   点击会话行即清除（sessionStorage 记录已读 jobId）。
  *
  * Host API 契约（与本文件并行实现的宿主半侧）：
  *   GET  /health                                   → { ok, version, platform, engine, registry, warnings,
@@ -54,6 +56,10 @@
   var ROUTE_SEGMENT = '/dsh-low-integrity-check';
   /** 会话级任务恢复的 sessionStorage 键前缀。 */
   var STORAGE_PREFIX = 'dsh-fi:';
+  /** 会话行紫点的「已读」标记键前缀（值为已读到的 jobId）。 */
+  var ACK_PREFIX = 'dsh-fi-ack:';
+  /** 会话行未读状态的轮询间隔（毫秒）。 */
+  var UNREAD_POLL_MS = 2500;
   /** 运行中任务轮询间隔（毫秒）。 */
   var POLL_INTERVAL_MS = 800;
   /** 命中清单每页条数（首屏与「加载更多」一致）。 */
@@ -109,6 +115,9 @@
     'tab.title': '文件完整性检查',
     'tab.description': '检查工作区中完整性标签为 Low 的文件与目录，并可一键清除。',
     'header.subtitle': 'Low 完整性标签检查与清除',
+
+    'session.unreadTitle': '文件完整性检查任务已完成（未读）',
+    'session.unreadHint': '点击会话行标记为已读',
 
     'badge.readonly': '只读',
     'badge.running': '运行中',
@@ -304,6 +313,9 @@
     'tab.title': 'File integrity check',
     'tab.description': 'Inspect files and directories whose integrity label is Low in the workspace, and clear them in one click.',
     'header.subtitle': 'Low integrity label inspection and repair',
+
+    'session.unreadTitle': 'File integrity check finished (unread)',
+    'session.unreadHint': 'Click the session row to mark it read',
 
     'badge.readonly': 'Read-only',
     'badge.running': 'Running',
@@ -564,6 +576,10 @@
     '.fi-settings-input:disabled{opacity:.6;}',
     '.fi-settings-number{width:120px;}',
     '.fi-seg{display:flex;align-items:center;gap:4px;flex-wrap:wrap;}',
+    '.fi-session-leading{width:16px;height:20px;flex:none;display:inline-flex;align-items:center;justify-content:center;}',
+    '.fi-session-dot{display:block;width:8px;height:8px;box-sizing:border-box;border-radius:999px;flex:none;}',
+    '.fi-session-dot-idle{border:1.5px solid var(--dsw-alias-state-idle-primary);background:transparent;}',
+    '.fi-session-dot-unread{background:color-mix(in srgb, var(--dsw-alias-brand-primary) 55%, var(--dsw-alias-state-error-primary) 45%);}',
   ].join('\n');
 
   /** 当前挂载数：多个面板可能同时挂载，靠引用计数决定何时移除 style 标签。 */
@@ -1455,6 +1471,314 @@
       if (typeof props.tab.sessionId === 'string' && props.tab.sessionId !== '') return props.tab.sessionId;
     }
     return '';
+  }
+
+  //#endregion
+
+  //#region 会话行未读状态（任务结束紫点）
+
+  /**
+   * 枚举 sessionStorage 里本插件记录的「会话 → 当前任务」映射。
+   *
+   * @param storage - sessionStorage（可能为 null）。
+   * @returns {Array<{ sessionId: string, jobId: string }>}。
+   */
+  function trackedJobsOf(storage) {
+    if (storage === null) return [];
+    var out = [];
+    try {
+      for (var i = 0; i < storage.length; i++) {
+        var key = storage.key(i);
+        if (typeof key !== 'string' || key.indexOf(STORAGE_PREFIX) !== 0) continue;
+        var sessionId = key.slice(STORAGE_PREFIX.length);
+        if (sessionId === '') continue;
+        var value = storage.getItem(key);
+        if (typeof value === 'string' && value !== '') out.push({ sessionId: sessionId, jobId: value });
+      }
+    } catch (error) {
+      return [];
+    }
+    return out;
+  }
+
+  /**
+   * 造「任务结束未读」watcher：轮询被跟踪任务的状态，维护会话 id → 是否未读。
+   *
+   * 单例（每个插件 factory 一个），所有会话行 occupant 共享同一份状态与订阅。
+   *
+   * @returns { isUnread, subscribe, ack, start }。
+   */
+  function createUnreadWatcher() {
+    /** 会话 id → 是否未读（真源只在这个闭包里）。 */
+    var unread = {};
+    var subscribers = [];
+    var timer = null;
+    var visibilityHandler = null;
+    var started = false;
+    var stopped = false;
+    var inFlight = false;
+
+    /**
+     * 某会话当前是否未读。
+     *
+     * @param sessionId - 会话 id。
+     * @returns true 表示应显示紫点。
+     */
+    function isUnread(sessionId) {
+      var sid = typeof sessionId === 'string' ? sessionId : '';
+      return sid !== '' && unread[sid] === true;
+    }
+
+    /**
+     * 订阅未读状态变化。
+     *
+     * @param fn - 变化回调（无参数）。
+     * @returns 取消订阅函数；坏参数返回空操作。
+     */
+    function subscribe(fn) {
+      if (typeof fn !== 'function') return function () {};
+      subscribers.push(fn);
+      return function () {
+        var index = subscribers.indexOf(fn);
+        if (index !== -1) subscribers.splice(index, 1);
+      };
+    }
+
+    /** 通知所有订阅者；单个回调异常不影响其他订阅者。 */
+    function notify() {
+      var list = subscribers.slice();
+      for (var i = 0; i < list.length; i++) {
+        try {
+          list[i]();
+        } catch (error) {
+          console.warn(LOG_PREFIX + ' 未读状态订阅回调失败（已忽略）：', error);
+        }
+      }
+    }
+
+    /**
+     * 读取某会话已经「已读」到的 jobId。
+     *
+     * @param storage - sessionStorage。
+     * @param sessionId - 会话 id。
+     * @returns 已读 jobId；没有时 ''。
+     */
+    function readAck(storage, sessionId) {
+      try {
+        var value = storage.getItem(ACK_PREFIX + sessionId);
+        return typeof value === 'string' ? value : '';
+      } catch (error) {
+        return '';
+      }
+    }
+
+    /**
+     * 标记某会话已读：记住当前 jobId、清掉未读并通知。
+     *
+     * @param sessionId - 会话 id。
+     */
+    function ack(sessionId) {
+      var sid = typeof sessionId === 'string' ? sessionId : '';
+      if (sid === '') return;
+      var storage = storageOf();
+      if (storage !== null) {
+        var jobId = readStoredJob(sid);
+        if (jobId !== '') {
+          try {
+            storage.setItem(ACK_PREFIX + sid, jobId);
+          } catch (error) {
+            /* 写满/被禁用：只影响下次刷新，本次清除照常 */
+          }
+        }
+      }
+      if (unread[sid] === true) {
+        delete unread[sid];
+        notify();
+      }
+    }
+
+    /**
+     * 清掉「当前没有任务映射」的会话未读（映射消失说明任务已不可跟踪）。
+     *
+     * @param tracked - 当前枚举到的任务映射。
+     * @returns 是否有变化。
+     */
+    function pruneUntracked(tracked) {
+      var seen = {};
+      for (var i = 0; i < tracked.length; i++) seen[tracked[i].sessionId] = true;
+      var changed = false;
+      var keys = Object.keys(unread);
+      for (var j = 0; j < keys.length; j++) {
+        if (seen[keys[j]] !== true) {
+          delete unread[keys[j]];
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
+    /**
+     * 应用一批任务查询结果，更新未读映射。
+     *
+     * 规则：terminal（succeeded/failed/cancelled）且 ack !== jobId → 未读；
+     * running → 已读；404 → 清映射并已读；其他错误 → 保持原状。
+     *
+     * @param storage - sessionStorage。
+     * @param tracked - 本轮枚举到的任务映射。
+     * @param results - [{ pair, res }]。
+     * @returns 状态是否有变化。
+     */
+    function applyResults(storage, tracked, results) {
+      var changed = false;
+      for (var i = 0; i < results.length; i++) {
+        var pair = results[i].pair;
+        var res = results[i].res;
+        var sid = pair.sessionId;
+        if (res !== null && res.ok === true) {
+          var rawJob =
+            res.data !== null && typeof res.data === 'object' && res.data.job !== null && typeof res.data.job === 'object'
+              ? res.data.job
+              : null;
+          var status = rawJob === null ? '' : asString(rawJob.status);
+          if (status === 'running') {
+            if (unread[sid] === true) {
+              delete unread[sid];
+              changed = true;
+            }
+          } else if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+            if (readAck(storage, sid) === pair.jobId) {
+              if (unread[sid] === true) {
+                delete unread[sid];
+                changed = true;
+              }
+            } else if (unread[sid] !== true) {
+              unread[sid] = true;
+              changed = true;
+            }
+          }
+        } else if (res !== null && res.ok === false && (res.code === 'job-not-found' || res.status === 404)) {
+          // 过期/不存在的任务：清掉映射，避免紫点常驻。
+          removeStoredJob(sid);
+          if (unread[sid] === true) {
+            delete unread[sid];
+            changed = true;
+          }
+        }
+      }
+      if (pruneUntracked(tracked)) changed = true;
+      return changed;
+    }
+
+    /** 一次轮询的收尾：释放 inFlight，状态变化则通知。 */
+    function finish(changed) {
+      inFlight = false;
+      if (stopped) return;
+      if (changed === true) notify();
+    }
+
+    /** 轮询一次：枚举映射 → 并发查询任务状态 → 更新未读。 */
+    function tick() {
+      if (stopped || inFlight) return;
+      if (typeof document !== 'undefined' && document !== null && document.hidden === true) return;
+      var storage = storageOf();
+      var tracked = trackedJobsOf(storage);
+      if (tracked.length === 0) {
+        if (pruneUntracked(tracked)) notify();
+        return;
+      }
+      inFlight = true;
+      var results = [];
+      var pending = [];
+      var requestFor = function (pair) {
+        return requestJson({ path: '/jobs/' + encodeURIComponent(pair.jobId), method: 'GET' }).then(function (res) {
+          results.push({ pair: pair, res: res });
+        });
+      };
+      for (var i = 0; i < tracked.length; i++) pending.push(requestFor(tracked[i]));
+      Promise.all(pending)
+        .then(function () {
+          var changed = false;
+          try {
+            changed = applyResults(storage, tracked, results);
+          } catch (error) {
+            console.warn(LOG_PREFIX + ' 未读状态更新失败（已忽略）：', error);
+          }
+          finish(changed);
+        })
+        .catch(function (error) {
+          console.warn(LOG_PREFIX + ' 未读状态查询失败（已忽略）：', error);
+          finish(false);
+        });
+    }
+
+    /**
+     * 启动轮询：立即查一次，之后每 UNREAD_POLL_MS 查一次；页面重新可见时补查。
+     *
+     * @returns 停止函数（清定时器、可见性监听与订阅）。
+     */
+    function start() {
+      if (started) return function () {};
+      started = true;
+      stopped = false;
+      try {
+        tick();
+      } catch (error) {
+        console.warn(LOG_PREFIX + ' 未读状态首次轮询失败（已忽略）：', error);
+      }
+      try {
+        if (typeof window !== 'undefined' && window !== null && typeof window.setInterval === 'function') {
+          timer = window.setInterval(function () {
+            try {
+              tick();
+            } catch (error) {
+              console.warn(LOG_PREFIX + ' 未读状态轮询失败（已忽略）：', error);
+            }
+          }, UNREAD_POLL_MS);
+        }
+      } catch (error) {
+        console.warn(LOG_PREFIX + ' 未读状态定时器启动失败（已忽略）：', error);
+      }
+      try {
+        if (typeof document !== 'undefined' && document !== null && typeof document.addEventListener === 'function') {
+          visibilityHandler = function () {
+            if (document.hidden === true) return;
+            try {
+              tick();
+            } catch (error) {
+              console.warn(LOG_PREFIX + ' 未读状态恢复轮询失败（已忽略）：', error);
+            }
+          };
+          document.addEventListener('visibilitychange', visibilityHandler);
+        }
+      } catch (error) {
+        console.warn(LOG_PREFIX + ' 未读状态可见性监听失败（已忽略）：', error);
+      }
+      return function () {
+        stopped = true;
+        started = false;
+        if (timer !== null) {
+          try {
+            window.clearInterval(timer);
+          } catch (error) {
+            /* 清理失败不影响页面 */
+          }
+          timer = null;
+        }
+        if (visibilityHandler !== null) {
+          try {
+            document.removeEventListener('visibilitychange', visibilityHandler);
+          } catch (error) {
+            /* 清理失败不影响页面 */
+          }
+          visibilityHandler = null;
+        }
+        subscribers.length = 0;
+        unread = {};
+        inFlight = false;
+      };
+    }
+
+    return { isUnread: isUnread, subscribe: subscribe, ack: ack, start: start };
   }
 
   //#endregion
@@ -3663,6 +3987,129 @@
 
   //#endregion
 
+  //#region 会话行紫点组件
+
+  /**
+   * 从组件自身 DOM 向上最多 6 层找会话行（A/BUTTON/LI 或 role=button/treeitem）。
+   *
+   * @param node - 紫点容器元素。
+   * @returns 会话行元素；找不到时 null。
+   */
+  function findSessionRowNode(node) {
+    var current = node;
+    for (var depth = 0; depth < 6; depth++) {
+      if (current === null || current === undefined || typeof current !== 'object') return null;
+      var tag = typeof current.tagName === 'string' ? current.tagName.toUpperCase() : '';
+      var role = typeof current.getAttribute === 'function' ? current.getAttribute('role') : null;
+      if (tag === 'A' || tag === 'BUTTON' || tag === 'LI' || role === 'button' || role === 'treeitem') return current;
+      current = current.parentElement !== undefined ? current.parentElement : null;
+    }
+    return null;
+  }
+
+  /**
+   * 造会话列表行 leading occupant：任务结束未读时画紫色实心点，否则画 idle 空心点。
+   *
+   * 宿主只在该行主状态 idle 时把 16px 状态圆点单元格让给 occupant，所以非未读时
+   * 必须补一个近似宿主的空心圆，避免所有会话行的状态点消失。
+   *
+   * @param runtime - { React, h, t, watcher }。
+   * @returns 可注册到 sidebar.session.row.leading 的组件。
+   */
+  function makeSessionLeadingDot(runtime) {
+    var React = runtime.React;
+    var h = runtime.h;
+    var t = runtime.t;
+    var watcher = runtime.watcher;
+
+    /**
+     * 会话行 leading occupant。
+     *
+     * @param props - 行 ownerProps（只含 sessionId）。
+     * @returns 16px 单元格内的状态点。
+     */
+    function SessionLeadingDot(props) {
+      var sessionId = readSessionId(props);
+      var mountedRef = React.useRef(true);
+      var dotRef = React.useRef(null);
+      var sessionIdRef = React.useRef(sessionId);
+      sessionIdRef.current = sessionId;
+
+      var [unread, setUnread] = React.useState(function () {
+        return sessionId !== '' && watcher.isUnread(sessionId);
+      });
+
+      React.useEffect(function () {
+        mountedRef.current = true;
+        return function () {
+          mountedRef.current = false;
+        };
+      }, []);
+
+      // 订阅 watcher：任何行状态变化时同步本行。
+      React.useEffect(
+        function () {
+          var sid = sessionId;
+          var sync = function () {
+            if (!mountedRef.current) return;
+            setUnread(sid !== '' && watcher.isUnread(sid));
+          };
+          var unsubscribe = watcher.subscribe(sync);
+          sync();
+          return function () {
+            unsubscribe();
+          };
+        },
+        [sessionId],
+      );
+
+      // 点击会话行（捕获阶段）时清除未读：祖先最多找 6 层，找不到退化为父元素。
+      React.useEffect(
+        function () {
+          var node = dotRef.current;
+          if (node === null || node === undefined) return undefined;
+          var row = findSessionRowNode(node);
+          var target =
+            row !== null ? row : node.parentElement !== null && node.parentElement !== undefined ? node.parentElement : node;
+          if (target === null || target === undefined || typeof target.addEventListener !== 'function') return undefined;
+          var onClick = function () {
+            var sid = sessionIdRef.current;
+            if (sid !== '' && watcher.isUnread(sid)) watcher.ack(sid);
+          };
+          target.addEventListener('click', onClick, true);
+          return function () {
+            target.removeEventListener('click', onClick, true);
+          };
+        },
+        [sessionId],
+      );
+
+      var unreadNow = unread === true;
+      var containerProps = {
+        ref: dotRef,
+        className: 'fi-session-leading',
+        'data-fi-unread': unreadNow ? '1' : '0',
+      };
+      if (unreadNow) {
+        containerProps.title = t('session.unreadHint');
+        containerProps['aria-label'] = t('session.unreadTitle');
+        containerProps.role = 'img';
+      }
+      return h(
+        'span',
+        containerProps,
+        h('span', {
+          className: 'fi-session-dot ' + (unreadNow ? 'fi-session-dot-unread' : 'fi-session-dot-idle'),
+          'aria-hidden': 'true',
+        }),
+      );
+    }
+
+    return SessionLeadingDot;
+  }
+
+  //#endregion
+
   //#region 模块装配
 
   /**
@@ -3685,9 +4132,11 @@
         return module.exports;
       }
       var h = React.createElement;
+      /** 会话行紫点 watcher：单例，供所有行共享（组件实例不各自轮询）。 */
+      var unreadWatcher = createUnreadWatcher();
 
       /**
-       * 激活：注册 locale、样式、右侧栏标签类型与正文插槽、设置页。
+       * 激活：注册 locale、样式、右侧栏标签类型与正文插槽、设置页、会话行紫点。
        *
        * 任何一步失败都只降级功能，绝不让插件抛错——否则整个 Web 端可能进不去。
        *
@@ -3727,6 +4176,15 @@
           }, 'dsh-low-integrity-check: panel styles');
         } catch (error) {
           console.error(LOG_PREFIX + ' 面板样式注入失败（不影响功能）：', error);
+        }
+
+        // 会话行紫点：轮询本插件任务状态；定时器与可见性监听都挂在 ctx.effect 上。
+        try {
+          ctx.effect(function () {
+            return unreadWatcher.start();
+          }, 'dsh-low-integrity-check: session row unread watcher');
+        } catch (error) {
+          console.warn(LOG_PREFIX + ' 未读状态 watcher 启动失败（已忽略）：', error);
         }
 
         var Panel = makePanel({ React: React, h: h, t: t });
@@ -3833,6 +4291,23 @@
           );
         } catch (error) {
           console.error(LOG_PREFIX + ' 右侧栏注册抛出异常（已忽略，不影响页面）：', error);
+        }
+
+        // 会话行 leading occupant：占用「状态圆点」单元格，显示任务结束紫点。
+        try {
+          var SessionLeadingDot = makeSessionLeadingDot({ React: React, h: h, t: t, watcher: unreadWatcher });
+          ctx.slots.inject('sidebar.session.row.leading', function () {
+            return ctx.slots.register(
+              {
+                name: 'sidebar.session.row.leading',
+                id: 'low-integrity-unread',
+                order: 20,
+              },
+              SessionLeadingDot,
+            );
+          });
+        } catch (error) {
+          console.warn(LOG_PREFIX + ' 会话行未读紫点注册失败（已忽略，其余功能不受影响）：', error);
         }
 
         // 设置页（可选能力）：注册到「设置 → 文件完整性检查」。
