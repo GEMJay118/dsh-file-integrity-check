@@ -8,17 +8,26 @@
  *   20 × 250ms 有界重试后 console.warn 退出，绝不抛错），正文通过
  *   ctx.slots.inject('sidebar.right.pane.tab') 挂到对应 key 上。
  * - 面板：解析工作区 → 扫描 → 命中清单分页 → 导出清单 → 一键清除（确认条）→
- *   运行中 800ms 轮询 → 成功/失败结果 → 生成日志；sessionId 取 slot props，切换会话
+ *   运行中 800ms 轮询 → 成功/失败结果；sessionId 取 slot props，切换会话
  *   重置并从 sessionStorage['dsh-fi:' + sessionId] 恢复任务。
+ * - 设置页：注册到「设置」的 settings.section，读取/保存产物目录与自动清理保留天数
+ *   （GET/POST /settings），并展示上次清理结果；面板底部同时展示当前产物目录（来自 /health）。
  *
  * Host API 契约（与本文件并行实现的宿主半侧）：
- *   GET  /health                                   → { ok, version, platform, engine, registry, warnings }
+ *   GET  /health                                   → { ok, version, platform, engine, registry, warnings,
+ *                                                      dataDir, defaultDataDir, dataDirError }
  *   GET  /diagnostics                              → 诊断对象（本面板不展示，供阶段 0 排查）
+ *   GET  /settings                                 → { ok, dataDir, defaultDataDir, isDefault, error,
+ *                                                      retentionDays, retentionPresets,
+ *                                                      lastCleanup: { at, cutoff, deletedCount, freedBytes, error } | null }
+ *   POST /settings { dataDir?, retentionDays? }    → { ok, dataDir, defaultDataDir, isDefault, retentionDays }；
+ *                                                     dataDir 传 '' 恢复默认；retentionDays 为 1..3650 的整数；
+ *                                                     两个字段都可选、至少一个；失败码见 KNOWN_ERROR_CODES
  *   POST /workspace { sessionId }                  → { ok, workspace, sessionCount, liveAgentCount, warnings }
  *   POST /jobs { action: 'scan'|'repair', sessionId } → { ok, jobId }
  *   GET  /jobs/:id                                 → { ok, job }
  *   GET  /jobs/:id/items?offset=&limit=            → { ok, jobId, offset, limit, total, items }
- *   POST /jobs/:id/cancel | /export | /log         → { ok } / { ok, path }
+ *   POST /jobs/:id/cancel | /export                → { ok } / { ok, path }
  * 所有请求都相对于「文档挂载前缀 + ROUTE_SEGMENT」；ROUTE_SEGMENT 必须与宿主
  * ctx.webServer.register 的 path 一致。
  *
@@ -54,6 +63,12 @@
   var SIDEBAR_RETRY_DELAY_MS = 250;
   /** 复制成功/失败提示的停留时间。 */
   var NOTICE_MS = 2600;
+  /** 自动清理保留天数的预设选项（Host 也会返回；缺失/非法时用这里兜底）。 */
+  var RETENTION_PRESETS = [3, 7, 15, 30];
+  /** 保留天数允许范围与默认值（与 Host 校验保持一致）。 */
+  var RETENTION_MIN_DAYS = 1;
+  var RETENTION_MAX_DAYS = 3650;
+  var RETENTION_DEFAULT_DAYS = 30;
   /** 样式标签归属标记。 */
   var STYLE_KEY = 'dsh-file-integrity-panel';
   /** 宿主 task/failure 列表最多展示条数（再多只给计数）。 */
@@ -73,11 +88,16 @@
     'engine-unavailable': true,
     'snapshot-not-found': true,
     'open-folder-failed': true,
+    'settings-invalid': true,
+    'settings-unwritable': true,
+    'settings-unavailable': true,
+    'data-dir-inside-workspace': true,
     forbidden: true,
     'internal-error': true,
     'network-error': true,
     'bad-response': true,
     'no-session': true,
+    'no-report': true,
   };
 
   //#endregion
@@ -111,8 +131,6 @@
     'action.confirm': '确认清除',
     'action.dismiss': '取消',
     'action.loadMore': '加载更多',
-    'action.log': '生成日志',
-    'action.logging': '正在生成日志…',
     'action.copy': '复制',
 
     'loading.workspace': '正在解析工作区…',
@@ -212,15 +230,50 @@
 
     'artifact.export': '清单文件',
     'artifact.report': '引擎报告',
-    'artifact.log': '日志文件',
     'artifact.copy': '复制路径',
     'export.ok': '清单已导出',
     'export.failed': '导出失败：{message}',
-    'log.ok': '日志已生成',
-    'log.failed': '生成日志失败：{message}',
 
     'notice.copied': '已复制',
     'notice.copyFailed': '复制失败，请手动选择文本复制',
+
+    'settings.sectionTitle': '文件完整性检查',
+    'settings.title': '文件完整性检查',
+    'settings.description': '设置清单、引擎报告、快照与恢复脚本等产物文件的存放目录。',
+    'settings.current': '当前产物目录',
+    'settings.currentEmpty': '尚未配置，当前使用默认目录',
+    'settings.inputLabel': '修改为',
+    'settings.placeholder': '留空使用默认目录',
+    'settings.defaultHint': '默认目录：{path}',
+    'settings.applyHint': '保存后从下一次检查/清除开始生效。',
+    'settings.loading': '正在读取设置…',
+    'settings.loadFailed': '无法读取设置：{message}',
+    'settings.saved': '已保存，下次检查/清除生效',
+    'settings.resetDone': '已恢复默认目录，下次检查/清除生效',
+    'settings.pickFailed': '选择文件夹失败：{message}',
+    'settings.pickUnavailable': '当前环境不支持选择文件夹，请手动输入路径',
+    'action.pickFolder': '选择文件夹…',
+    'action.save': '保存',
+    'action.saving': '保存中…',
+    'action.resetDefault': '恢复默认',
+
+    'settings.retention.title': '自动清理',
+    'settings.retention.current': '当前保留天数：{days} 天',
+    'settings.retention.label': '保留天数',
+    'settings.retention.option': '{days} 天',
+    'settings.retention.custom': '自定义',
+    'settings.retention.customLabel': '自定义天数（1–3650）',
+    'settings.retention.invalid': '请输入 1–3650 之间的整数天数',
+    'settings.retention.scopeHint': '自动清理只删除本插件生成的 reports/snapshots 文件（严格命名匹配），不会动其他文件。',
+    'settings.retention.lastTitle': '上次清理',
+    'settings.retention.never': '尚未清理',
+    'settings.retention.lastAt': '时间：{time}',
+    'settings.retention.lastCount': '删除 {count} 个文件，释放 {size}',
+    'settings.retention.lastError': '上次清理出错：{message}',
+
+    'dataDir.panelValue': '产物目录：{path}',
+    'dataDir.panelHint': '可在「设置 → 文件完整性检查」中修改',
+    'dataDir.error': '产物目录不可用：{message}',
 
     'error.workspace-not-found': '未找到当前会话的工作区，请先打开一个工作区',
     'error.path-rejected': '工作区路径被拒绝（可能超出允许范围）',
@@ -232,11 +285,16 @@
     'error.invalid-request': '请求参数无效',
     'error.snapshot-not-found': '没有可打开的快照文件',
     'error.open-folder-failed': '打开文件夹失败',
+    'error.settings-invalid': '产物目录无效（需要绝对路径，且不能是工作区内的目录）',
+    'error.settings-unwritable': '产物目录不可写，请换一个目录',
+    'error.settings-unavailable': '宿主不支持保存设置（设置服务不可用）',
+    'error.data-dir-inside-workspace': '产物目录不能放在工作区内',
     'error.forbidden': '没有权限执行该操作',
     'error.internal-error': '宿主内部错误',
     'error.network-error': '无法连接宿主服务',
     'error.bad-response': '宿主返回了无效响应',
     'error.no-session': '没有可用的会话信息，无法检查工作区',
+    'error.no-report': '没有可导出的引擎报告（未命中或报告写入失败）',
     'error.generic': '操作失败：{message}',
     'error.boundary': '面板渲染出错，已降级显示。',
   };
@@ -268,8 +326,6 @@
     'action.confirm': 'Confirm clear',
     'action.dismiss': 'Cancel',
     'action.loadMore': 'Load more',
-    'action.log': 'Generate log',
-    'action.logging': 'Generating log…',
     'action.copy': 'Copy',
 
     'loading.workspace': 'Resolving workspace…',
@@ -369,15 +425,50 @@
 
     'artifact.export': 'List file',
     'artifact.report': 'Engine report',
-    'artifact.log': 'Log file',
     'artifact.copy': 'Copy path',
     'export.ok': 'List exported',
     'export.failed': 'Export failed: {message}',
-    'log.ok': 'Log generated',
-    'log.failed': 'Cannot generate log: {message}',
 
     'notice.copied': 'Copied',
     'notice.copyFailed': 'Copy failed; select the text and copy manually',
+
+    'settings.sectionTitle': 'File integrity check',
+    'settings.title': 'File integrity check',
+    'settings.description': 'Choose where list files, engine reports, snapshots and restore scripts are written.',
+    'settings.current': 'Current artifact directory',
+    'settings.currentEmpty': 'Not configured yet; the default directory is in use',
+    'settings.inputLabel': 'Change to',
+    'settings.placeholder': 'Leave empty to use the default directory',
+    'settings.defaultHint': 'Default directory: {path}',
+    'settings.applyHint': 'Takes effect from the next check/clear.',
+    'settings.loading': 'Reading settings…',
+    'settings.loadFailed': 'Cannot read settings: {message}',
+    'settings.saved': 'Saved; applies to the next check/clear',
+    'settings.resetDone': 'Default directory restored; applies to the next check/clear',
+    'settings.pickFailed': 'Could not pick a folder: {message}',
+    'settings.pickUnavailable': 'Folder picking is unavailable here; enter the path manually',
+    'action.pickFolder': 'Choose folder…',
+    'action.save': 'Save',
+    'action.saving': 'Saving…',
+    'action.resetDefault': 'Restore default',
+
+    'settings.retention.title': 'Auto cleanup',
+    'settings.retention.current': 'Current retention: {days} days',
+    'settings.retention.label': 'Retention',
+    'settings.retention.option': '{days} d',
+    'settings.retention.custom': 'Custom',
+    'settings.retention.customLabel': 'Custom days (1–3650)',
+    'settings.retention.invalid': 'Enter an integer between 1 and 3650',
+    'settings.retention.scopeHint': 'Auto cleanup only removes files this plugin wrote under reports/snapshots (strict name match); other files are never touched.',
+    'settings.retention.lastTitle': 'Last cleanup',
+    'settings.retention.never': 'No cleanup yet',
+    'settings.retention.lastAt': 'Time: {time}',
+    'settings.retention.lastCount': 'Removed {count} files, freed {size}',
+    'settings.retention.lastError': 'Last cleanup failed: {message}',
+
+    'dataDir.panelValue': 'Artifact directory: {path}',
+    'dataDir.panelHint': 'Change it under Settings → File integrity check',
+    'dataDir.error': 'Artifact directory unavailable: {message}',
 
     'error.workspace-not-found': 'No workspace found for this session; open a workspace first',
     'error.path-rejected': 'Workspace path rejected (possibly out of the allowed range)',
@@ -389,11 +480,16 @@
     'error.invalid-request': 'Invalid request parameters',
     'error.snapshot-not-found': 'No snapshot file to open',
     'error.open-folder-failed': 'Could not open the folder',
+    'error.settings-invalid': 'Invalid artifact directory (needs an absolute path outside the workspace)',
+    'error.settings-unwritable': 'The artifact directory is not writable; choose another one',
+    'error.settings-unavailable': 'The host cannot save settings (settings service unavailable)',
+    'error.data-dir-inside-workspace': 'The artifact directory cannot be inside the workspace',
     'error.forbidden': 'Not allowed to perform this action',
     'error.internal-error': 'Host internal error',
     'error.network-error': 'Cannot reach the host service',
     'error.bad-response': 'The host returned an invalid response',
     'error.no-session': 'No session information; cannot inspect the workspace',
+    'error.no-report': 'No engine report to export (no hits, or the report write failed)',
     'error.generic': 'Operation failed: {message}',
     'error.boundary': 'The panel crashed and was degraded.',
   };
@@ -461,6 +557,13 @@
     '.fi-toggle input{accent-color:var(--dsw-alias-state-business-primary);cursor:inherit;}',
     '.fi-toggle.is-disabled{cursor:default;opacity:.6;}',
     '.fi-footer{display:flex;flex-direction:column;gap:2px;flex:0 0 auto;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2);}',
+    '.fi-settings{display:flex;flex-direction:column;gap:10px;min-width:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14);}',
+    '.fi-settings-input{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);padding:6px 8px;font:var(--dsw-font-xxs-12);font-family:var(--dsw-font-markdown-code-font-family,monospace);}',
+    '.fi-settings-input::placeholder{color:var(--dsw-alias-label-tertiary);}',
+    '.fi-settings-input:focus{outline:none;border-color:var(--dsw-alias-state-business-primary);}',
+    '.fi-settings-input:disabled{opacity:.6;}',
+    '.fi-settings-number{width:120px;}',
+    '.fi-seg{display:flex;align-items:center;gap:4px;flex-wrap:wrap;}',
   ].join('\n');
 
   /** 当前挂载数：多个面板可能同时挂载，靠引用计数决定何时移除 style 标签。 */
@@ -723,6 +826,41 @@
   }
 
   /**
+   * 字节数 → 人类可读体积。
+   *
+   * @param value - 字节数。
+   * @returns 形如 `0 B` / `512 B` / `1.4 MB`。
+   */
+  function formatBytes(value) {
+    var bytes = typeof value === 'number' && isFinite(value) && value > 0 ? value : 0;
+    if (bytes < 1024) return Math.round(bytes) + ' B';
+    var units = ['KB', 'MB', 'GB', 'TB'];
+    var size = bytes / 1024;
+    var index = 0;
+    while (size >= 1024 && index < units.length - 1) {
+      size /= 1024;
+      index += 1;
+    }
+    return (size >= 100 ? String(Math.round(size)) : size.toFixed(1).replace(/\.0$/, '')) + ' ' + units[index];
+  }
+
+  /**
+   * 毫秒时间戳（或 ISO 字符串）→ 本地时间文本。
+   *
+   * @param value - 毫秒数/ISO 字符串。
+   * @returns 本地时间文本；无法识别时 ''。
+   */
+  function formatDateTime(value) {
+    var ms = toTime(value);
+    if (ms <= 0) return '';
+    try {
+      return new Date(ms).toLocaleString();
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /**
    * 归一化一条命中项。
    *
    * @param raw - 宿主返回的 item。
@@ -805,6 +943,28 @@
   }
 
   /**
+   * 归一化失败项列表（repair 的 result.failed：path / message / output）。
+   *
+   * @param raw - 任意值。
+   * @returns { path, message, output } 数组。
+   */
+  function normalizeFailedItems(raw) {
+    if (!Array.isArray(raw)) return [];
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var entry = raw[i];
+      if (entry === null || entry === undefined) continue;
+      if (typeof entry !== 'object') continue;
+      out.push({
+        path: asString(entry.path),
+        message: asString(entry.message),
+        output: asString(entry.output),
+      });
+    }
+    return out;
+  }
+
+  /**
    * 归一化 health 响应。
    *
    * @param data - 响应 JSON。
@@ -817,6 +977,10 @@
     return {
       version: asString(raw.version),
       platform: asString(raw.platform),
+      // 产物目录（Host 可选能力；缺字段时一律空串，面板据此隐藏该行）。
+      dataDir: asString(raw.dataDir),
+      defaultDataDir: asString(raw.defaultDataDir),
+      dataDirError: asString(raw.dataDirError),
       engine:
         engine === null
           ? null
@@ -832,6 +996,80 @@
           ? null
           : { available: registry.available !== false, count: asNumber(registry.count) },
       warnings: asStringArray(raw.warnings),
+    };
+  }
+
+  /**
+   * 归一化保留天数：整数 1..3650；缺失/越界时用默认值。
+   *
+   * @param value - 任意值。
+   * @returns 合法保留天数。
+   */
+  function asRetentionDays(value) {
+    var days = typeof value === 'number' && isFinite(value) ? Math.round(value) : 0;
+    if (days < RETENTION_MIN_DAYS || days > RETENTION_MAX_DAYS) return RETENTION_DEFAULT_DAYS;
+    return days;
+  }
+
+  /**
+   * 归一化保留天数预设：只留 1..3650 的整数、去重；空列表用内置预设兜底。
+   *
+   * @param value - 宿主返回的 retentionPresets（任意值）。
+   * @returns 预设天数数组（非空）。
+   */
+  function normalizeRetentionPresets(value) {
+    if (!Array.isArray(value)) return RETENTION_PRESETS.slice();
+    var out = [];
+    for (var i = 0; i < value.length && out.length < 8; i++) {
+      var days = typeof value[i] === 'number' && isFinite(value[i]) ? Math.round(value[i]) : 0;
+      if (days < RETENTION_MIN_DAYS || days > RETENTION_MAX_DAYS) continue;
+      if (out.indexOf(days) !== -1) continue;
+      out.push(days);
+    }
+    return out.length > 0 ? out : RETENTION_PRESETS.slice();
+  }
+
+  /**
+   * 当前保留天数 → 分段按钮视图（命中预设选预设，否则自定义并回填数字）。
+   *
+   * @param days - 合法保留天数。
+   * @param presets - 预设天数数组。
+   * @returns { choice: number|'custom', input: string }。
+   */
+  function retentionViewOf(days, presets) {
+    var list = Array.isArray(presets) && presets.length > 0 ? presets : RETENTION_PRESETS;
+    if (list.indexOf(days) !== -1) return { choice: days, input: '' };
+    return { choice: 'custom', input: String(days) };
+  }
+
+  /**
+   * 自定义天数文本 → 整数天数。
+   *
+   * @param text - 输入框文本。
+   * @returns 1..3650 的整数；非法时 null。
+   */
+  function parseRetentionDays(text) {
+    var value = typeof text === 'string' ? text.trim() : '';
+    if (!/^\d+$/.test(value)) return null;
+    var days = Number(value);
+    if (!isFinite(days) || days < RETENTION_MIN_DAYS || days > RETENTION_MAX_DAYS) return null;
+    return days;
+  }
+
+  /**
+   * 归一化上次清理结果（GET /settings 的可选字段）。
+   *
+   * @param raw - 任意值。
+   * @returns { at, cutoff, deletedCount, freedBytes, error } 或 null（无记录）。
+   */
+  function normalizeLastCleanup(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    return {
+      at: toTime(raw.at),
+      cutoff: toTime(raw.cutoff),
+      deletedCount: asNumber(raw.deletedCount),
+      freedBytes: asNumber(raw.freedBytes),
+      error: asString(raw.error),
     };
   }
 
@@ -901,6 +1139,7 @@
       // 面板用 hits - fixed - failedCount 兜底估算（见 remainingHitsOf）。
       remainingCount: typeof raw.remainingCount === 'number' && isFinite(raw.remainingCount) ? raw.remainingCount : -1,
       errors: normalizeErrors(raw.errors),
+      failed: normalizeFailedItems(raw.failed),
       items: normalizeItems(raw.items),
       truncated: raw.truncated === true,
       snapshotPath: asString(raw.snapshotPath),
@@ -1009,6 +1248,7 @@
       errorCount: 0,
       remainingCount: -1,
       errors: [],
+      failed: [],
       items: [],
       truncated: false,
       snapshotPath: '',
@@ -1462,7 +1702,7 @@
   }
 
   /**
-   * 全局提示条集合：只读、引擎不可用、health/workspace/poll/action/export/log 错误、复制提示。
+   * 全局提示条集合：只读、引擎不可用、health/workspace/poll/action/export 错误、复制提示。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 提示条容器或 null。
@@ -1532,11 +1772,6 @@
     if (state.exportError !== null) {
       nodes.push(
         banner(h, { tone: 'error', text: t('export.failed', { message: describeError(t, state.exportError) }), key: 'export-error' }),
-      );
-    }
-    if (state.logError !== null) {
-      nodes.push(
-        banner(h, { tone: 'error', text: t('log.failed', { message: describeError(t, state.logError) }), key: 'log-error' }),
       );
     }
     if (state.notice !== '') {
@@ -1832,16 +2067,6 @@
       }
     } else if (scanJob.status === 'cancelled') {
       children.push(banner(h, { tone: 'info', title: t('job.cancelled'), key: 'title' }));
-      children.push(
-        actionButton(h, {
-          label: state.logging ? t('action.logging') : t('action.log'),
-          variant: 'ghost',
-          small: true,
-          disabled: state.logging,
-          onClick: actions.generateLog,
-          key: 'log',
-        }),
-      );
     } else {
       children.push(
         banner(h, {
@@ -1851,22 +2076,12 @@
           key: 'title',
         }),
       );
-      children.push(
-        actionButton(h, {
-          label: state.logging ? t('action.logging') : t('action.log'),
-          variant: 'ghost',
-          small: true,
-          disabled: state.logging,
-          onClick: actions.generateLog,
-          key: 'log',
-        }),
-      );
     }
     return h('div', { className: 'fi-card' }, children);
   }
 
   /**
-   * 清除结果：成功（N 项 + 复扫结果 + 快照/恢复路径）或失败（N 项失败 + 日志入口）。
+   * 清除结果：成功（N 项 + 复扫结果 + 快照/恢复路径）或失败（N 项失败）。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 结果卡片或 null。
@@ -1928,16 +2143,6 @@
       );
     } else if (job.status === 'cancelled') {
       children.push(banner(h, { tone: 'info', title: t('job.cancelled'), key: 'title' }));
-      children.push(
-        actionButton(h, {
-          label: state.logging ? t('action.logging') : t('action.log'),
-          variant: 'ghost',
-          small: true,
-          disabled: state.logging,
-          onClick: actions.generateLog,
-          key: 'log',
-        }),
-      );
     } else {
       children.push(banner(h, { tone: 'error', title: t('repair.failed', { count: job.failedCount }), key: 'title' }));
       if (job.message !== '') {
@@ -1946,16 +2151,6 @@
       if (job.fixed > 0) {
         children.push(h('div', { className: 'fi-muted', key: 'fixed' }, t('repair.partialFixed', { count: job.fixed })));
       }
-      children.push(
-        actionButton(h, {
-          label: state.logging ? t('action.logging') : t('action.log'),
-          variant: 'ghost',
-          small: true,
-          disabled: state.logging,
-          onClick: actions.generateLog,
-          key: 'log',
-        }),
-      );
     }
     return h('div', { className: 'fi-card' }, children);
   }
@@ -2034,26 +2229,45 @@
    * @param view - { h, t, state, actions, flags }。
    * @returns 失败列表卡片或 null。
    */
+  /**
+   * 把引擎诊断多行文本压成一行，供面板展示（日志文件已删除，诊断只在面板/接口里）。
+   *
+   * @param output - 引擎失败对象的 output 字段。
+   * @returns 一行诊断文本（最长 360 字）。
+   */
+  function diagnosticLine(output) {
+    var raw = asString(output);
+    if (raw === '') return '';
+    var text = raw.replace(/\s+/g, ' ').trim();
+    if (text.length > 360) text = text.slice(0, 360) + '…';
+    return text;
+  }
+
   function renderFailures(view) {
     var h = view.h;
     var t = view.t;
-    var state = view.state;
     var flags = view.flags;
     var job = flags.repairJob;
-    if (job === null || job.status !== 'failed' || job.errors.length === 0) return null;
-    var shown = job.errors.slice(0, MAX_FAILURE_ROWS);
+    if (job === null || job.status !== 'failed') return null;
+    // result.failed 带引擎可读诊断（Win32 码 / DACL before-after / guidance），优先展示；
+    // 旧任务或没有 result.failed 时退回错误列表（只有 path/message）。
+    var failures = job.failed.length > 0 ? job.failed : job.errors;
+    if (failures.length === 0) return null;
+    var shown = failures.slice(0, MAX_FAILURE_ROWS);
     var rows = shown.map(function (entry, index) {
       var text = entry.message !== '' ? entry.message : t('scan.failed');
+      var detail = diagnosticLine(entry.output);
       return h(
         'div',
         { className: 'fi-failure', key: (entry.path || '') + '#' + index },
         h('code', { className: 'fi-path', title: entry.path !== '' ? entry.path : text }, entry.path !== '' ? entry.path : text),
         entry.path !== '' ? h('div', { className: 'fi-muted' }, text) : null,
+        detail !== '' ? h('div', { className: 'fi-muted', title: detail }, detail) : null,
       );
     });
     var children = [h('div', { className: 'fi-row', key: 'head' }, h('span', { className: 'fi-label' }, t('repair.failures')))];
     children.push(h('div', { className: 'fi-list', key: 'list' }, rows));
-    var reportedFailures = job.errorCount > job.errors.length ? job.errorCount : job.errors.length;
+    var reportedFailures = Math.max(job.errorCount, job.failedCount, failures.length);
     if (reportedFailures > shown.length) {
       children.push(h('div', { className: 'fi-muted', key: 'more' }, t('repair.failuresMore', { count: reportedFailures - shown.length })));
     }
@@ -2061,7 +2275,7 @@
   }
 
   /**
-   * 产物路径（导出清单 / 日志）：生成后显示返回路径并可复制。
+   * 产物路径（导出清单 / 引擎报告）：生成后显示返回路径并可复制。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 产物卡片或 null。
@@ -2092,7 +2306,6 @@
         ),
       );
     }
-    if (state.logPath !== '') rows.push(artifactRow(h, t, actions, t('artifact.log'), state.logPath, 'log'));
     if (rows.length === 0) return null;
     return h('div', { className: 'fi-card' }, rows);
   }
@@ -2150,6 +2363,18 @@
       parts.push(t('footer.registry', { count: health.registry.count }));
     }
     var children = [h('div', { className: 'fi-muted', key: 'meta' }, parts.join(' · '))];
+    // 产物目录：Host 在 /health 里给出时展示一行，并提示到设置页修改。
+    if (health.dataDir !== '') {
+      children.push(
+        h('div', { className: 'fi-muted', key: 'dataDir' }, t('dataDir.panelValue', { path: health.dataDir })),
+        h('div', { className: 'fi-muted', key: 'dataDirHint' }, t('dataDir.panelHint')),
+      );
+    }
+    if (health.dataDirError !== '') {
+      children.push(
+        h('div', { className: 'fi-muted fi-warn-text', key: 'dataDirError' }, t('dataDir.error', { message: health.dataDirError })),
+      );
+    }
     if (health.warnings.length > 0) {
       children.push(
         h(
@@ -2361,7 +2586,6 @@
             pollError: null,
             notice: '',
             exportError: null,
-            logError: null,
           });
         });
         requestJson({ path: '/jobs', method: 'POST', body: requestBody }).then(function (res) {
@@ -2458,34 +2682,6 @@
               exportPath: path,
               exportError: null,
               notice: path !== '' ? t('export.ok') : '',
-            });
-          });
-        });
-      }
-
-      /** 生成当前（失败）任务的日志，展示宿主返回的路径。 */
-      function generateLog() {
-        var target = state.job;
-        if (target === null || target.status === 'running' || state.logging) return;
-        var mySession = sessionId;
-        setState(function (prev) {
-          return Object.assign({}, prev, { logging: true, logError: null });
-        });
-        requestJson({ path: '/jobs/' + encodeURIComponent(target.id) + '/log', method: 'POST', body: {} }).then(function (res) {
-          if (!isCurrent(mySession)) return;
-          if (!res.ok) {
-            setState(function (prev) {
-              return Object.assign({}, prev, { logging: false, logError: { code: res.code, message: res.message } });
-            });
-            return;
-          }
-          var path = res.data !== null && typeof res.data === 'object' ? asString(res.data.path) : '';
-          setState(function (prev) {
-            return Object.assign({}, prev, {
-              logging: false,
-              logPath: path,
-              logError: null,
-              notice: path !== '' ? t('log.ok') : '',
             });
           });
         });
@@ -2860,7 +3056,6 @@
         closeConfirm: closeConfirm,
         cancelJob: cancelJob,
         exportList: exportList,
-        generateLog: generateLog,
         openArtifactFolder: openArtifactFolder,
         loadMore: loadMore,
       };
@@ -2906,9 +3101,6 @@
       exporting: false,
       exportPath: '',
       exportError: null,
-      logging: false,
-      logPath: '',
-      logError: null,
       openingFolder: false,
       confirmOpen: false,
       starting: false,
@@ -2917,6 +3109,555 @@
       notice: '',
       deepScan: false,
       now: 0,
+    };
+  }
+
+  //#endregion
+
+  //#region 设置页组件
+
+  /**
+   * 设置页初始状态。
+   *
+   * @returns { loading, loadError, dataDir, defaultDataDir, isDefault, input, saving, saveError,
+   *   pickError, notice, retentionDays, retentionPresets, retentionChoice, retentionInput, lastCleanup }。
+   */
+  function initialSettingsState() {
+    return {
+      loading: true,
+      loadError: null,
+      dataDir: '',
+      defaultDataDir: '',
+      isDefault: true,
+      input: '',
+      saving: false,
+      saveError: null,
+      pickError: '',
+      notice: '',
+      retentionDays: RETENTION_DEFAULT_DAYS,
+      retentionPresets: RETENTION_PRESETS.slice(),
+      retentionChoice: RETENTION_DEFAULT_DAYS,
+      retentionInput: '',
+      lastCleanup: null,
+    };
+  }
+
+  /**
+   * 造设置页组件（注册到 settings.section）：读取/保存产物目录与自动清理保留天数，
+   * 可选择文件夹并展示上次清理结果。
+   *
+   * @param runtime - { React, h, t, pickDirectory }（pickDirectory 为 null 表示平台不支持选择）。
+   * @returns 可直接注册到 settings.section 的组件。
+   */
+  function makeSettingsPage(runtime) {
+    var React = runtime.React;
+    var h = runtime.h;
+    var t = runtime.t;
+    var pickDirectory = typeof runtime.pickDirectory === 'function' ? runtime.pickDirectory : null;
+
+    /** 设置页崩溃会让整块设置区域空白：兜住渲染异常并提供重试。 */
+    class SettingsBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { failed: false, attempt: 0 };
+        this.handleRetry = this.handleRetry.bind(this);
+      }
+
+      static getDerivedStateFromError() {
+        return { failed: true };
+      }
+
+      componentDidCatch(error) {
+        console.error(LOG_PREFIX + ' 设置页渲染失败（已兜底，不影响页面）：', error);
+      }
+
+      handleRetry() {
+        this.setState(function (prev) {
+          return { failed: false, attempt: prev.attempt + 1 };
+        });
+      }
+
+      render() {
+        if (this.state.failed) {
+          return h(
+            'div',
+            { className: 'fi-settings fi-fatal' },
+            h('div', { className: 'fi-fatal-title' }, t('error.boundary')),
+            h('button', { type: 'button', className: 'fi-btn', onClick: this.handleRetry }, t('action.retry')),
+          );
+        }
+        // attempt 变化 → key 变化 → 重新挂载一次（设置页自愈的最后一招）。
+        return h('div', { className: 'fi-fatal-holder', key: 'attempt-' + this.state.attempt }, this.props.children);
+      }
+    }
+
+    /**
+     * 设置页主体。
+     *
+     * @param props - 设置插槽标准 props（close 等；本页按需忽略）。
+     * @returns 设置页根元素。
+     */
+    function SettingsPage(props) {
+      var [state, setState] = React.useState(function () {
+        return initialSettingsState();
+      });
+      var [loadNonce, setLoadNonce] = React.useState(0);
+      var mountedRef = React.useRef(true);
+
+      React.useEffect(function () {
+        mountedRef.current = true;
+        return function () {
+          mountedRef.current = false;
+        };
+      }, []);
+
+      // 挂载与「重试」时各读取一次当前设置；成功后把当前值填进输入框。
+      React.useEffect(
+        function () {
+          var alive = true;
+          setState(function (prev) {
+            return Object.assign({}, prev, { loading: true, loadError: null, saveError: null, pickError: '' });
+          });
+          requestJson({ path: '/settings', method: 'GET' }).then(function (res) {
+            if (!alive) return;
+            if (!res.ok) {
+              setState(function (prev) {
+                return Object.assign({}, prev, { loading: false, loadError: { code: res.code, message: res.message } });
+              });
+              return;
+            }
+            var data = res.data !== null && typeof res.data === 'object' ? res.data : {};
+            var dataDir = asString(data.dataDir);
+            var retentionDays = asRetentionDays(data.retentionDays);
+            var presets = normalizeRetentionPresets(data.retentionPresets);
+            setState(function (prev) {
+              var retentionView = retentionViewOf(retentionDays, presets);
+              return Object.assign({}, prev, {
+                loading: false,
+                loadError: null,
+                dataDir: dataDir,
+                defaultDataDir: asString(data.defaultDataDir),
+                isDefault: data.isDefault === true,
+                input: dataDir,
+                notice: '',
+                retentionDays: retentionDays,
+                retentionPresets: presets,
+                retentionChoice: retentionView.choice,
+                retentionInput: retentionView.input,
+                lastCleanup: normalizeLastCleanup(data.lastCleanup),
+              });
+            });
+          });
+          return function () {
+            alive = false;
+          };
+        },
+        [loadNonce],
+      );
+
+      // 保存成功提示自动消失。
+      React.useEffect(
+        function () {
+          if (state.notice === '') return undefined;
+          var timer = window.setTimeout(function () {
+            if (!mountedRef.current) return;
+            setState(function (prev) {
+              return Object.assign({}, prev, { notice: '' });
+            });
+          }, NOTICE_MS);
+          return function () {
+            window.clearTimeout(timer);
+          };
+        },
+        [state.notice],
+      );
+
+      /** 当前选择对应的保留天数；自定义非法时 null。 */
+      function effectiveRetentionDays() {
+        if (state.retentionChoice === 'custom') return parseRetentionDays(state.retentionInput);
+        return typeof state.retentionChoice === 'number' ? state.retentionChoice : null;
+      }
+
+      /**
+       * 提交设置：产物目录 + 保留天数一起保存。
+       *
+       * @param options - { resetDirectory?: boolean }；true 时只把产物目录恢复默认，保留天数保持当前值。
+       */
+      function saveSettings(options) {
+        if (state.saving === true) return;
+        var opts = options !== null && typeof options === 'object' ? options : {};
+        var isReset = opts.resetDirectory === true;
+        var body = { dataDir: isReset ? '' : state.input.trim() };
+        if (!isReset) {
+          var retentionDays = effectiveRetentionDays();
+          if (retentionDays === null) return; // 自定义天数非法：保存按钮已禁用，这里兜底
+          body.retentionDays = retentionDays;
+        }
+        setState(function (prev) {
+          return Object.assign({}, prev, { saving: true, saveError: null, pickError: '', notice: '' });
+        });
+        requestJson({ path: '/settings', method: 'POST', body: body }).then(function (res) {
+          if (!mountedRef.current) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              return Object.assign({}, prev, { saving: false, saveError: { code: res.code, message: res.message } });
+            });
+            return;
+          }
+          var data = res.data !== null && typeof res.data === 'object' ? res.data : {};
+          var nextDir = asString(data.dataDir);
+          var nextDefault = asString(data.defaultDataDir);
+          var nextRetention = asRetentionDays(data.retentionDays);
+          setState(function (prev) {
+            var patch = {
+              saving: false,
+              saveError: null,
+              dataDir: nextDir,
+              defaultDataDir: nextDefault !== '' ? nextDefault : prev.defaultDataDir,
+              isDefault: data.isDefault === true,
+              input: nextDir,
+              notice: isReset ? t('settings.resetDone') : t('settings.saved'),
+            };
+            // 恢复默认只重置目录：保留天数的选择与当前值都保持不动。
+            if (!isReset) {
+              var retentionView = retentionViewOf(nextRetention, prev.retentionPresets);
+              patch.retentionDays = nextRetention;
+              patch.retentionChoice = retentionView.choice;
+              patch.retentionInput = retentionView.input;
+            }
+            return Object.assign({}, prev, patch);
+          });
+        });
+      }
+
+      /**
+       * 选中一个预设保留天数。
+       *
+       * @param days - 预设天数。
+       */
+      function selectRetentionPreset(days) {
+        setState(function (prev) {
+          return Object.assign({}, prev, { retentionChoice: days, saveError: null });
+        });
+      }
+
+      /** 切到「自定义」：保留已有输入，为空时回填当前保留天数。 */
+      function selectCustomRetention() {
+        setState(function (prev) {
+          var input = prev.retentionInput !== '' ? prev.retentionInput : String(prev.retentionDays);
+          return Object.assign({}, prev, { retentionChoice: 'custom', retentionInput: input, saveError: null });
+        });
+      }
+
+      /**
+       * 自定义天数输入变化。
+       *
+       * @param event - React change 事件。
+       */
+      function changeRetentionInput(event) {
+        var value = '';
+        if (event !== null && typeof event === 'object' && event.target !== null && typeof event.target === 'object') {
+          value = asString(event.target.value);
+        }
+        setState(function (prev) {
+          return Object.assign({}, prev, { retentionInput: value, saveError: null });
+        });
+      }
+
+      /**
+       * 造一个预设保留天数按钮。
+       *
+       * @param days - 预设天数。
+       * @returns 分段按钮。
+       */
+      function retentionPresetButton(days) {
+        return actionButton(h, {
+          label: t('settings.retention.option', { days: days }),
+          variant: state.retentionChoice === days ? 'primary' : 'ghost',
+          small: true,
+          disabled: state.saving === true,
+          onClick: function () {
+            selectRetentionPreset(days);
+          },
+          key: 'preset-' + days,
+        });
+      }
+
+      /** 选择文件夹并填入输入框（服务缺失时按钮已禁用）。 */
+      function pickFolder() {
+        if (pickDirectory === null || state.saving === true) return;
+        var pending;
+        try {
+          pending = pickDirectory();
+        } catch (error) {
+          setState(function (prev) {
+            return Object.assign({}, prev, { pickError: errorMessageOf(error) });
+          });
+          return;
+        }
+        Promise.resolve(pending).then(
+          function (dir) {
+            if (!mountedRef.current) return;
+            if (typeof dir === 'string' && dir !== '') {
+              setState(function (prev) {
+                return Object.assign({}, prev, { input: dir, pickError: '', saveError: null });
+              });
+            }
+          },
+          function (error) {
+            if (!mountedRef.current) return;
+            setState(function (prev) {
+              return Object.assign({}, prev, { pickError: errorMessageOf(error) });
+            });
+          },
+        );
+      }
+
+      /**
+       * 输入框变化。
+       *
+       * @param event - React change 事件。
+       */
+      function changeInput(event) {
+        var value = '';
+        if (event !== null && typeof event === 'object' && event.target !== null && typeof event.target === 'object') {
+          value = asString(event.target.value);
+        }
+        setState(function (prev) {
+          return Object.assign({}, prev, { input: value, saveError: null });
+        });
+      }
+
+      /**
+       * 输入框回车 = 保存。
+       *
+       * @param event - React keydown 事件。
+       */
+      function submitOnEnter(event) {
+        if (event !== null && typeof event === 'object' && event.key === 'Enter') {
+          event.preventDefault();
+          saveSettings({});
+        }
+      }
+
+      var children = [
+        h(
+          'div',
+          { className: 'fi-head', key: 'head' },
+          h(
+            'div',
+            { className: 'fi-head-main' },
+            h('div', { className: 'fi-title' }, t('settings.title')),
+            h('div', { className: 'fi-sub' }, t('settings.description')),
+          ),
+        ),
+      ];
+
+      if (state.loading === true) {
+        children.push(h('div', { className: 'fi-muted', key: 'loading' }, t('settings.loading')));
+        return h('div', { className: 'fi-settings' }, children);
+      }
+      if (state.loadError !== null) {
+        children.push(
+          banner(h, {
+            tone: 'error',
+            title: t('settings.loadFailed', { message: describeError(t, state.loadError) }),
+            key: 'load-error',
+          }),
+        );
+        children.push(
+          h(
+            'div',
+            { className: 'fi-row', key: 'retry' },
+            actionButton(h, {
+              label: t('action.retry'),
+              variant: 'ghost',
+              onClick: function () {
+                setLoadNonce(function (prev) {
+                  return prev + 1;
+                });
+              },
+            }),
+          ),
+        );
+        return h('div', { className: 'fi-settings' }, children);
+      }
+
+      var disabled = state.saving === true;
+      var placeholder = state.defaultDataDir !== '' ? state.defaultDataDir : t('settings.placeholder');
+      var retentionInvalid = state.retentionChoice === 'custom' && parseRetentionDays(state.retentionInput) === null;
+      var saveDisabled = disabled || retentionInvalid;
+      var buttons = [];
+      buttons.push(
+        actionButton(h, {
+          label: t('action.pickFolder'),
+          variant: 'ghost',
+          disabled: disabled || pickDirectory === null,
+          title: pickDirectory === null ? t('settings.pickUnavailable') : '',
+          onClick: pickFolder,
+          key: 'pick',
+        }),
+      );
+      buttons.push(
+        actionButton(h, {
+          label: disabled ? t('action.saving') : t('action.save'),
+          variant: 'primary',
+          disabled: saveDisabled,
+          onClick: function () {
+            saveSettings({});
+          },
+          key: 'save',
+        }),
+      );
+      buttons.push(
+        actionButton(h, {
+          label: t('action.resetDefault'),
+          variant: 'ghost',
+          disabled: disabled || state.isDefault === true,
+          onClick: function () {
+            saveSettings({ resetDirectory: true });
+          },
+          key: 'reset',
+        }),
+      );
+
+      var cardChildren = [];
+      cardChildren.push(h('span', { className: 'fi-label', key: 'current-label' }, t('settings.current')));
+      if (state.dataDir !== '') {
+        cardChildren.push(h('code', { className: 'fi-path', key: 'current-value', title: state.dataDir }, state.dataDir));
+      } else {
+        cardChildren.push(h('div', { className: 'fi-muted', key: 'current-value' }, t('settings.currentEmpty')));
+      }
+      cardChildren.push(
+        h(
+          'label',
+          { className: 'fi-col', key: 'input' },
+          h('span', { className: 'fi-label' }, t('settings.inputLabel')),
+          h('input', {
+            className: 'fi-settings-input',
+            type: 'text',
+            value: state.input,
+            placeholder: placeholder,
+            spellCheck: false,
+            disabled: disabled,
+            'aria-label': t('settings.inputLabel'),
+            onChange: changeInput,
+            onKeyDown: submitOnEnter,
+          }),
+        ),
+      );
+      if (state.defaultDataDir !== '') {
+        cardChildren.push(h('div', { className: 'fi-muted', key: 'default' }, t('settings.defaultHint', { path: state.defaultDataDir })));
+      }
+      children.push(h('div', { className: 'fi-card', key: 'data-dir-card' }, cardChildren));
+
+      // 自动清理卡片：保留天数（预设 + 自定义）、清理范围提示、上次清理结果。
+      var retentionChildren = [];
+      retentionChildren.push(h('span', { className: 'fi-label', key: 'title' }, t('settings.retention.title')));
+      retentionChildren.push(
+        h('div', { className: 'fi-muted', key: 'current' }, t('settings.retention.current', { days: state.retentionDays })),
+      );
+      retentionChildren.push(h('span', { className: 'fi-label', key: 'label' }, t('settings.retention.label')));
+      var segmentNodes = [];
+      for (var presetIndex = 0; presetIndex < state.retentionPresets.length; presetIndex++) {
+        segmentNodes.push(retentionPresetButton(state.retentionPresets[presetIndex]));
+      }
+      segmentNodes.push(
+        actionButton(h, {
+          label: t('settings.retention.custom'),
+          variant: state.retentionChoice === 'custom' ? 'primary' : 'ghost',
+          small: true,
+          disabled: disabled,
+          onClick: selectCustomRetention,
+          key: 'custom',
+        }),
+      );
+      retentionChildren.push(h('div', { className: 'fi-seg', key: 'segments' }, segmentNodes));
+      if (state.retentionChoice === 'custom') {
+        retentionChildren.push(
+          h(
+            'label',
+            { className: 'fi-col', key: 'custom-input' },
+            h('span', { className: 'fi-label' }, t('settings.retention.customLabel')),
+            h('input', {
+              className: 'fi-settings-input fi-settings-number',
+              type: 'number',
+              min: RETENTION_MIN_DAYS,
+              max: RETENTION_MAX_DAYS,
+              step: 1,
+              value: state.retentionInput,
+              placeholder: String(state.retentionDays),
+              disabled: disabled,
+              'aria-label': t('settings.retention.customLabel'),
+              onChange: changeRetentionInput,
+              onKeyDown: submitOnEnter,
+            }),
+          ),
+        );
+        if (retentionInvalid) {
+          retentionChildren.push(h('div', { className: 'fi-error-text', key: 'custom-error' }, t('settings.retention.invalid')));
+        }
+      }
+      retentionChildren.push(h('div', { className: 'fi-muted', key: 'scope-hint' }, t('settings.retention.scopeHint')));
+      retentionChildren.push(h('span', { className: 'fi-label', key: 'last-title' }, t('settings.retention.lastTitle')));
+      if (state.lastCleanup === null) {
+        retentionChildren.push(h('div', { className: 'fi-muted', key: 'last-never' }, t('settings.retention.never')));
+      } else {
+        var lastCleanup = state.lastCleanup;
+        var lastAtText = formatDateTime(lastCleanup.at);
+        retentionChildren.push(
+          h(
+            'div',
+            { className: 'fi-muted', key: 'last-at' },
+            t('settings.retention.lastAt', { time: lastAtText !== '' ? lastAtText : '—' }),
+          ),
+        );
+        retentionChildren.push(
+          h(
+            'div',
+            { className: 'fi-muted', key: 'last-count' },
+            t('settings.retention.lastCount', {
+              count: lastCleanup.deletedCount,
+              size: formatBytes(lastCleanup.freedBytes),
+            }),
+          ),
+        );
+        if (lastCleanup.error !== '') {
+          retentionChildren.push(
+            h('div', { className: 'fi-warn-text', key: 'last-error' }, t('settings.retention.lastError', { message: lastCleanup.error })),
+          );
+        }
+      }
+      children.push(h('div', { className: 'fi-card', key: 'retention-card' }, retentionChildren));
+      children.push(h('div', { className: 'fi-muted', key: 'apply-hint' }, t('settings.applyHint')));
+      children.push(h('div', { className: 'fi-row', key: 'actions' }, buttons));
+
+      if (state.saveError !== null) {
+        children.push(banner(h, { tone: 'error', text: describeError(t, state.saveError), key: 'save-error' }));
+      }
+      if (state.pickError !== '') {
+        children.push(
+          banner(h, {
+            tone: 'error',
+            text: t('settings.pickFailed', { message: state.pickError !== '' ? state.pickError : '—' }),
+            key: 'pick-error',
+          }),
+        );
+      }
+      if (state.notice !== '') {
+        children.push(banner(h, { tone: 'success', text: state.notice, key: 'notice' }));
+      }
+      return h('div', { className: 'fi-settings' }, children);
+    }
+
+    /**
+     * 注册到插槽的组件：外层先挂错误边界。
+     *
+     * @param props - 设置插槽标准 props。
+     * @returns 设置页元素。
+     */
+    return function LowIntegritySettingsPage(props) {
+      return h(SettingsBoundary, null, h(SettingsPage, props));
     };
   }
 
@@ -2946,7 +3687,7 @@
       var h = React.createElement;
 
       /**
-       * 激活：注册 locale、样式、右侧栏标签类型与正文插槽。
+       * 激活：注册 locale、样式、右侧栏标签类型与正文插槽、设置页。
        *
        * 任何一步失败都只降级功能，绝不让插件抛错——否则整个 Web 端可能进不去。
        *
@@ -3092,6 +3833,34 @@
           );
         } catch (error) {
           console.error(LOG_PREFIX + ' 右侧栏注册抛出异常（已忽略，不影响页面）：', error);
+        }
+
+        // 设置页（可选能力）：注册到「设置 → 文件完整性检查」。
+        // uiWorkspace 软取：服务缺失时「选择文件夹…」按钮禁用，其余功能照常。
+        try {
+          var workspaceUi = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined;
+          var pickDirectory = null;
+          if (workspaceUi !== undefined && workspaceUi !== null && typeof workspaceUi.pickDirectory === 'function') {
+            pickDirectory = function () {
+              return workspaceUi.pickDirectory();
+            };
+          }
+          var SettingsPage = makeSettingsPage({ React: React, h: h, t: t, pickDirectory: pickDirectory });
+          ctx.slots.inject('settings.section', function () {
+            return ctx.slots.register(
+              {
+                name: 'settings.section',
+                id: 'low-integrity',
+                order: 50,
+                label: function () {
+                  return t('settings.sectionTitle');
+                },
+              },
+              SettingsPage,
+            );
+          });
+        } catch (error) {
+          console.warn(LOG_PREFIX + ' 设置页注册失败（已忽略，其余功能不受影响）：', error);
         }
       }
 

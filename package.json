@@ -34,7 +34,7 @@
     }
   },
   "scripts": {
-    "test": "node test/paths.test.mjs && node test/jobs.test.mjs && node test/engine.test.mjs && node test/routes.test.mjs",
-    "check": "node --check index.js && node --check client.js && node --check lib/paths.js && node --check lib/engine.js && node --check lib/jobs.js && node --check lib/routes.js && node --check lib/runtime.js"
+    "test": "node test/paths.test.mjs && node test/datadir.test.mjs && node test/cleanup.test.mjs && node test/jobs.test.mjs && node test/engine.test.mjs && node test/routes.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check lib/paths.js && node --check lib/datadir.js && node --check lib/cleanup.js && node --check lib/engine.js && node --check lib/jobs.js && node --check lib/routes.js && node --check lib/runtime.js"
   }
 }

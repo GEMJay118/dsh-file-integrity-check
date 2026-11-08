@@ -29,8 +29,9 @@
   Low objects (explicit + inherited); quick/deep counts and explicit hit sets are
   asserted equal; a 2000 file fixture records the quick vs deep timing as INFO
   plus a soft "quick is faster" assertion (no flaky hard threshold).
-  Every scan now writes a report file (<DataDir>\reports\scan-*.json) and its
-  result.reportPath is asserted (existence, counts, items scope, item fields).
+  Every scan with hits writes a report file (<DataDir>\reports\scan-*.json) and its
+  result.reportPath is asserted (existence, counts, items scope, item fields); a
+  zero-hit scan must leave result.reportPath null and write no report file/dir.
   Repair runs assert the current C# repair contract: zero hit events, progress
   phases restricted to enumerate/repair/verify carrying scanned/total/hits/fixed
   (enumerate total=null), result.repairEngine="csharp" and numeric result.timings
@@ -382,6 +383,13 @@ function Clear-ScanReports {
     if (Test-Path -LiteralPath $script:ScanDataDir) {
         Remove-Tree -Path $script:ScanDataDir
     }
+}
+
+function Get-ScanReportFileCount {
+    param([string]$DataDir)
+    $reportsDir = Join-Path $DataDir 'reports'
+    if (-not [System.IO.Directory]::Exists($reportsDir)) { return 0 }
+    return @([System.IO.Directory]::GetFiles($reportsDir, 'scan-*.json')).Count
 }
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1072,7 @@ function Test-EnvMode {
 
 function Test-ScanSuite {
     param($Fixtures, $ExpectedHits, [string]$Prefix)
+    $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
     $arguments = @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules', '-Json')
     $run = Invoke-Engine -EngineArguments $arguments
     Test-EventContract -Run $run -NamePrefix $Prefix
@@ -1078,7 +1087,7 @@ function Test-ScanSuite {
     }
     $hitEvents = @(Get-EventsOfType $run 'hit')
     Test-HitSet -NamePrefix $Prefix -HitEvents $hitEvents -ExpectedHits $ExpectedHits
-    Test-ScanReport -Result $result -Prefix $Prefix -ExpectedDepth 'deep'
+    Test-ScanReport -Result $result -Prefix $Prefix -ExpectedDepth 'deep' -DataDir $script:ScanDataDir -ReportCountBefore $reportCountBefore
 
     $progressEvents = @(Get-EventsOfType $run 'progress')
     Test-Assert -Name ($Prefix + '-progress-present') -Condition ($progressEvents.Count -gt 0) -Detail ('count=' + $progressEvents.Count)
@@ -1173,6 +1182,7 @@ function Test-ReadOnlyCleanScan {
         Add-Skip -Name 'clean-scan-readonly' -Detail 'no readable non-Low reference directory available in this sandbox'
         return
     }
+    $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $candidate, '-SkipDirs', 'node_modules')
     Test-EventContract -Run $run -NamePrefix 'clean-readonly'
     $result = Get-ResultEvent $run
@@ -1180,6 +1190,7 @@ function Test-ReadOnlyCleanScan {
     $condition = ($run.exitCode -eq 0) -and ($hits.Count -eq 0)
     if ($null -ne $result) { $condition = $condition -and ([string]$result.rootLabel -ne 'Low') }
     Test-Assert -Name 'clean-scan-readonly' -Condition $condition -Detail ('dir=' + $candidate + ' exit=' + $run.exitCode + ' hits=' + $hits.Count + ' errors=' + (@(Get-EventsOfType $run 'error')).Count)
+    Test-ScanReport -Result $result -Prefix 'clean-readonly' -ExpectedDepth 'deep' -DataDir $script:ScanDataDir -ReportCountBefore $reportCountBefore
 }
 
 function Test-RepairFailure {
@@ -1467,12 +1478,18 @@ function Test-ZeroHitRepair {
         Add-Skip -Name 'repair-zero-hit' -Detail 'no read-only system directory available'
         return
     }
-    $probeRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $candidate, '-SkipDirs', 'node_modules')
+    $probeDataDir = Join-Path $script:BaseDir 'data-zero-hit-probe'
+    $probeReportCountBefore = Get-ScanReportFileCount -DataDir $probeDataDir
+    $probeRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $probeDataDir, '-Root', $candidate, '-SkipDirs', 'node_modules')
     $probeResult = Get-ResultEvent $probeRun
     if ($null -eq $probeResult -or [int]$probeResult.hits -ne 0) {
         Add-Skip -Name 'repair-zero-hit' -Detail ('candidate has Low hits; probe exit=' + $probeRun.exitCode)
         return
     }
+    # A zero-hit scan must leave result.reportPath null and must not create the
+    # reports directory nor write a report file.
+    Test-ScanReport -Result $probeResult -Prefix 'repair-zero-hit-probe' -ExpectedDepth 'quick' -DataDir $probeDataDir -ReportCountBefore $probeReportCountBefore
+    Test-Assert -Name 'repair-zero-hit-probe-no-report-dir' -Condition (-not [System.IO.Directory]::Exists((Join-Path $probeDataDir 'reports'))) -Detail ('reports dir=' + (Join-Path $probeDataDir 'reports'))
     $dataDir = Join-Path $script:BaseDir 'data-zero-hit'
     New-FixtureDirectory $dataDir
     $snapshotDir = Join-Path $dataDir 'snapshots'
@@ -1494,6 +1511,8 @@ function Test-ZeroHitRepair {
             $after = @([System.IO.Directory]::GetFiles($snapshotDir, 'snapshot-*.json')).Count
         }
         Test-Assert -Name 'repair-zero-hit-no-snapshot-file' -Condition ($after -eq $before) -Detail ('snapshot files before=' + $before + ' after=' + $after)
+        $snapshotDirAfter = [System.IO.Directory]::Exists($snapshotDir)
+        Test-Assert -Name 'repair-zero-hit-no-snapshot-dir' -Condition (-not $snapshotDirAfter) -Detail ('snapshots dir exists=' + $snapshotDirAfter + ' path=' + $snapshotDir)
     }
 }
 
@@ -1586,6 +1605,7 @@ function Test-DataDirExclusion {
 
 function Test-QuickScan {
     param($Fixtures, $DeepOutcome)
+    $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
     $run = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'quick', '-DataDir', $script:ScanDataDir, '-Root', $Fixtures.root, '-SkipDirs', 'node_modules')
     Test-EventContract -Run $run -NamePrefix 'scan-quick'
     Test-ResultContract -Run $run -NamePrefix 'scan-quick'
@@ -1595,7 +1615,7 @@ function Test-QuickScan {
     Test-Assert -Name 'scan-quick-result-engine' -Condition ([string]$result.engine -eq 'csharp') -Detail ('engine=' + [string]$result.engine)
     $scanMsProperty = $result.PSObject.Properties['scanMs']
     Test-Assert -Name 'scan-quick-result-scanms' -Condition ($null -ne $scanMsProperty -and [long]$result.scanMs -ge 0) -Detail ('scanMs=' + [string]$result.scanMs)
-    Test-ScanReport -Result $result -Prefix 'scan-quick' -ExpectedDepth 'quick'
+    Test-ScanReport -Result $result -Prefix 'scan-quick' -ExpectedDepth 'quick' -DataDir $script:ScanDataDir -ReportCountBefore $reportCountBefore
 
     $quickHits = @(Get-EventsOfType $run 'hit')
     $nonExplicit = @($quickHits | Where-Object { -not [bool]$_.explicit })
@@ -1716,12 +1736,23 @@ function Test-QuickBench {
 }
 
 function Test-ScanReport {
-    param($Result, [string]$Prefix, [string]$ExpectedDepth)
+    param($Result, [string]$Prefix, [string]$ExpectedDepth, [string]$DataDir = '', [int]$ReportCountBefore = -1)
     if ($null -eq $Result) { return }
     $reportPathProperty = $Result.PSObject.Properties['reportPath']
     Test-Assert -Name ($Prefix + '-report-path-field') -Condition ($null -ne $reportPathProperty) -Detail ''
     if ($null -eq $reportPathProperty) { return }
     $reportPath = [string]$Result.reportPath
+    $hits = [int]$Result.hits
+    if ($hits -le 0) {
+        # A zero-hit scan must not write a report (result.reportPath stays null, so
+        # the Host export contract reports "no-report" instead of an empty file).
+        Test-Assert -Name ($Prefix + '-report-none') -Condition ([string]::IsNullOrEmpty($reportPath)) -Detail ('reportPath=' + $reportPath + ' hits=' + $hits)
+        if (-not [string]::IsNullOrEmpty($DataDir) -and $ReportCountBefore -ge 0) {
+            $reportCountAfter = Get-ScanReportFileCount -DataDir $DataDir
+            Test-Assert -Name ($Prefix + '-report-no-new-file') -Condition ($reportCountAfter -eq $ReportCountBefore) -Detail ('reports before=' + $ReportCountBefore + ' after=' + $reportCountAfter + ' reportPath=' + $reportPath)
+        }
+        return
+    }
     Test-Assert -Name ($Prefix + '-report-exists') -Condition ([System.IO.File]::Exists($reportPath)) -Detail ('reportPath=' + $reportPath)
     if (-not [System.IO.File]::Exists($reportPath)) { return }
     try {
@@ -2082,6 +2113,7 @@ try {
 
     # ---- clean fixture (full mode only) -----------------------------------
     if ($script:FullMode) {
+        $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
         $cleanRun = Invoke-Engine -EngineArguments @('-Mode', 'Scan', '-ScanDepth', 'deep', '-DataDir', $script:ScanDataDir, '-Root', $fixtures.cleanDir, '-SkipDirs', 'node_modules')
         Test-EventContract -Run $cleanRun -NamePrefix 'clean'
         $cleanHits = @(Get-EventsOfType $cleanRun 'hit')
@@ -2089,6 +2121,7 @@ try {
         $cleanOk = ($cleanRun.exitCode -eq 0) -and ($cleanHits.Count -eq 0)
         if ($null -ne $cleanResult) { $cleanOk = $cleanOk -and ([string]$cleanResult.rootLabel -ne 'Low') }
         Test-Assert -Name 'clean-zero-hits' -Condition $cleanOk -Detail ('exit=' + $cleanRun.exitCode + ' hits=' + $cleanHits.Count)
+        Test-ScanReport -Result $cleanResult -Prefix 'clean' -ExpectedDepth 'deep' -DataDir $script:ScanDataDir -ReportCountBefore $reportCountBefore
     } else {
         Add-Skip -Name 'clean-zero-hits' -Detail 'cannot create a Medium (clean) fixture inside the sandbox; covered by test/run-fixtures.ps1 full mode'
         Test-ReadOnlyCleanScan

@@ -10,9 +10,10 @@
              stream a "hit" line for every object whose label is Low. Reparse points
              (junctions / symlinks) are never followed. -SkipDirs entries are skipped
              entirely (neither reported nor traversed). Unreadable objects produce an
-             "error" line and do not abort the scan. When the scan finishes, the full
-             hit report is written to <DataDir>\reports\scan-<timestamp>.json and
-             result.reportPath points at it (the Host can export that file directly).
+             "error" line and do not abort the scan. When the scan finds Low objects,
+             the full hit report is written to <DataDir>\reports\scan-<timestamp>.json
+             and result.reportPath points at it (the Host can export that file
+             directly); a zero-hit scan writes no report and result.reportPath is null.
              -ScanDepth quick (default) uses the embedded C# scanner; deep keeps the
              legacy PowerShell traversal.
     Repair - runs in-process in the embedded C# RepairSession (no per-hit output and
@@ -92,7 +93,8 @@
 .PARAMETER DataDir
   Engine data directory. Repair writes snapshots and restore scripts to
   <DataDir>\snapshots\; Scan writes its complete hit report to <DataDir>\reports\
-  as scan-<timestamp>.json (result.reportPath). Default:
+  as scan-<timestamp>.json (result.reportPath) only when it found Low objects
+  (zero-hit scans write no report and result.reportPath is null). Default:
   <temp>\dsh-file-integrity-check.
 
 .PARAMETER Json
@@ -3315,6 +3317,11 @@ function Write-ScanReport {
         $ErrorList,
         [long]$ScanMs
     )
+    # Zero-hit scans keep no artifact: the Host export contract only needs a report
+    # when there are hits, and result.reportPath must stay null so export reports
+    # "no-report" instead of pointing at an empty report file. Return before the
+    # reports directory is created.
+    if ($Hits -eq 0) { return $null }
     $reportPath = $null
     try {
         $dataDirectory = Resolve-DataDirectory
@@ -3689,14 +3696,11 @@ function Invoke-RepairMode {
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
     $snapshotPath = Join-Path $snapshotDirectory ('snapshot-' + $stamp + '.json')
     $restorePath = Join-Path $snapshotDirectory ('restore-' + $stamp + '.ps1')
-    try {
-        if (-not [System.IO.Directory]::Exists($snapshotDirectory)) {
-            [void][System.IO.Directory]::CreateDirectory($snapshotDirectory)
-        }
-    } catch {
-        Write-Fatal -Code 'snapshot-failed' -Message ('Could not create the snapshot directory: ' + $_.Exception.Message)
-        return 3
-    }
+    # The snapshot directory is created on demand by C# RepairSession.WriteSnapshot
+    # right before the snapshot write (hits > 0 only), so a zero-hit Repair leaves
+    # no empty snapshots directory behind. The restore script is written after that
+    # successful snapshot write, so its directory already exists. A snapshot write
+    # failure still surfaces as snapshot-failed through SnapshotError below.
 
     # The C# pipeline reports progress through this delegate. total stays $null
     # while the scan is still walking the tree (the final count is unknown).

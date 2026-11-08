@@ -3,7 +3,8 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { JobManager, fileStamp, safeSegment, uniquePath } from '../lib/jobs.js'
+import { JobManager } from '../lib/jobs.js'
+import { pathKey } from '../lib/paths.js'
 
 const WORKSPACE = { id: 'ws-1', path: 'C:\\fake\\workspace', title: 'workspace' }
 
@@ -59,6 +60,23 @@ function makeManager(runEngine, dataDir = 'C:\\fake\\data') {
   return new JobManager({ enginePath: 'C:\\fake\\engine.ps1', dataDir, runEngine })
 }
 
+/** Manager whose product directory is re-read through a live callback. */
+function makeLiveManager(getDataDir, runEngine) {
+  return new JobManager({ enginePath: 'C:\\fake\\engine.ps1', getDataDir, runEngine })
+}
+
+/** Fake engine that records the input it was started with. */
+function recordingEngine(recorded, events) {
+  return (input) => {
+    recorded.push(input)
+    const handle = { done: Promise.resolve({ code: 0, stderr: '' }), kill: () => {}, getStderr: () => '' }
+    queueMicrotask(() => {
+      for (const event of events) input.onEvent(event)
+    })
+    return handle
+  }
+}
+
 test('scan job accumulates hits, counts and errors', async () => {
   const dataDir = await tempDir()
   try {
@@ -109,67 +127,78 @@ test('scan job accumulates hits, counts and errors', async () => {
   }
 })
 
-test('completed scan exports a JSON report', async () => {
-  const dataDir = await tempDir()
-  try {
-    const manager = makeManager(
-      fakeEngine([
-        { type: 'hit', path: 'C:\\fake\\workspace\\a.txt', kind: 'file', explicit: true },
-        { type: 'result', mode: 'scan', scanned: 3, hits: 1, explicitCount: 1, inheritedCount: 0, rootLabel: 'Low' },
-      ]),
-      dataDir,
-    )
-    const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
-    const job = await waitTerminal(manager, started.jobId)
-    const result = await manager.exportScan(job)
-    assert.equal(result.ok, true)
-    const payload = JSON.parse(await fs.readFile(result.path, 'utf8'))
-    assert.equal(payload.workspacePath, WORKSPACE.path)
-    assert.equal(payload.rootLabel, 'Low')
-    assert.equal(payload.hits, 1)
-    assert.equal(payload.items.length, 1)
-    assert.equal(payload.exportedAt.length > 10, true)
-    manager.dispose()
-  } finally {
-    await fs.rm(dataDir, { recursive: true, force: true })
-  }
+test('completed scan export hands off the engine report path', async () => {
+  const reportPath = 'C:\\fake\\data\\reports\\scan-1.json'
+  const manager = makeManager(
+    fakeEngine([
+      { type: 'hit', path: 'C:\\fake\\workspace\\a.txt', kind: 'file', explicit: true },
+      {
+        type: 'result',
+        mode: 'scan',
+        scanned: 3,
+        hits: 1,
+        explicitCount: 1,
+        inheritedCount: 0,
+        rootLabel: 'Low',
+        reportPath,
+      },
+    ]),
+  )
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  const result = await manager.exportScan(job)
+  assert.deepEqual(result, { ok: true, path: reportPath, fromEngine: true })
+  manager.dispose()
 })
 
-test('partial repair fails and writes a failure log with details', async () => {
-  const dataDir = await tempDir()
-  try {
-    const manager = makeManager(
-      fakeEngine([
-        { type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true },
-        { type: 'hit', path: 'C:\\fake\\workspace\\a.txt', kind: 'file', explicit: true },
-        {
-          type: 'result',
-          mode: 'repair',
-          fixed: 1,
-          snapshotPath: 'C:\\fake\\data\\snapshots\\repair-1.json',
-          restorePath: 'C:\\fake\\data\\snapshots\\restore-1.ps1',
-          failed: [{ path: 'C:\\fake\\workspace\\a.txt', message: 'Access is denied.', output: 'C:\\fake\\workspace\\a.txt: Access is denied.' }],
-        },
-      ]),
-      dataDir,
-    )
-    const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
-    const job = await waitTerminal(manager, started.jobId)
-    assert.equal(job.status, 'failed')
-    assert.equal(job.failedCount, 1)
-    assert.equal(job.fixed, 1)
-    assert.match(job.message, /清除失败（1 项）/)
+test('scan without an engine report returns no-report', async () => {
+  const manager = makeManager(
+    fakeEngine([
+      {
+        type: 'result',
+        mode: 'scan',
+        scanned: 3,
+        hits: 0,
+        explicitCount: 0,
+        inheritedCount: 0,
+        rootLabel: 'Medium',
+      },
+    ]),
+  )
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  const result = await manager.exportScan(job)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'no-report')
+  assert.equal(result.message, '本次扫描没有可导出的报告（未生成或写入失败）')
+  manager.dispose()
+})
 
-    const logged = await manager.writeLog(job)
-    const text = await fs.readFile(logged.path, 'utf8')
-    assert.match(text, /failure log/)
-    assert.match(text, /Access is denied/)
-    assert.match(text, /snapshotPath/)
-    assert.match(text, /integrity/)
-    manager.dispose()
-  } finally {
-    await fs.rm(dataDir, { recursive: true, force: true })
-  }
+test('partial repair fails and reports the failed objects', async () => {
+  const manager = makeManager(
+    fakeEngine([
+      { type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true },
+      { type: 'hit', path: 'C:\\fake\\workspace\\a.txt', kind: 'file', explicit: true },
+      {
+        type: 'result',
+        mode: 'repair',
+        fixed: 1,
+        snapshotPath: 'C:\\fake\\data\\snapshots\\repair-1.json',
+        restorePath: 'C:\\fake\\data\\snapshots\\restore-1.ps1',
+        failed: [{ path: 'C:\\fake\\workspace\\a.txt', message: 'Access is denied.', output: 'C:\\fake\\workspace\\a.txt: Access is denied.' }],
+      },
+    ]),
+  )
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedCount, 1)
+  assert.equal(job.fixed, 1)
+  assert.equal(job.failed.length, 1)
+  assert.equal(job.failed[0].path, 'C:\\fake\\workspace\\a.txt')
+  assert.match(job.failed[0].message, /Access is denied/)
+  assert.match(job.message, /清除失败（1 项）/)
+  manager.dispose()
 })
 
 test('repair aborts before touching labels when the engine is sandboxed', async () => {
@@ -475,20 +504,143 @@ test('result.errors are merged into host errors without streamed raw events', as
   manager.dispose()
 })
 
-test('file stamp, safe segment and unique path helpers', async () => {
-  assert.match(fileStamp(Date.UTC(2026, 10, 6, 7, 8, 9)), /^2026\d{4}-\d{6}$/)
-  assert.equal(safeSegment('my work: v1?'), 'my work_ v1_')
-  assert.equal(safeSegment('   '), 'workspace')
-  assert.equal(safeSegment('..'), 'workspace')
+test('each job pins the product directory read when it starts', async () => {
+  const recorded = []
+  const state = { current: 'C:\\fake\\data-a' }
+  const resultEvent = { type: 'result', mode: 'scan', scanned: 1, hits: 0, explicitCount: 0, inheritedCount: 0, rootLabel: 'Medium' }
+  const manager = makeLiveManager(
+    () => ({ dataDir: state.current, defaultDataDir: 'C:\\fake\\default', isDefault: false, error: null }),
+    recordingEngine(recorded, [resultEvent]),
+  )
+  const first = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(first.ok, true)
+  assert.equal(manager.get(first.jobId).dataDir, 'C:\\fake\\data-a')
+  await waitTerminal(manager, first.jobId)
+  assert.equal(manager.snapshot(manager.get(first.jobId)).dataDir, 'C:\\fake\\data-a')
 
-  const dir = await tempDir()
-  try {
-    const first = path.join(dir, 'a.json')
-    await fs.writeFile(first, '{}', 'utf8')
-    const second = await uniquePath(first)
-    assert.notEqual(second, first)
-    assert.match(second, /a-2\.json$/)
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true })
+  // The live reader is consulted again for the next job (volatile config).
+  state.current = 'C:\\fake\\data-b'
+  const second = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(second.ok, true)
+  assert.equal(manager.get(second.jobId).dataDir, 'C:\\fake\\data-b')
+  await waitTerminal(manager, second.jobId)
+
+  assert.equal(recorded.length, 2)
+  assert.equal(recorded[0].dataDir, 'C:\\fake\\data-a')
+  assert.equal(recorded[1].dataDir, 'C:\\fake\\data-b')
+  manager.dispose()
+})
+
+test('a product directory inside the workspace blocks the job before it starts', () => {
+  const inner = path.join(WORKSPACE.path, 'artifacts')
+  for (const candidate of [inner, WORKSPACE.path, WORKSPACE.path.toUpperCase()]) {
+    const manager = makeLiveManager(
+      () => ({ dataDir: candidate, defaultDataDir: 'C:\\fake\\data', isDefault: false, error: null }),
+      fakeEngine([]),
+    )
+    const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+    assert.equal(started.ok, false, candidate)
+    assert.equal(started.code, 'data-dir-inside-workspace')
+    assert.match(started.message, /工作区内/)
+    assert.equal(manager.jobs.size, 0)
+    assert.equal(manager.running.size, 0)
+    manager.dispose()
   }
+})
+
+test('a failing product-directory reader falls back to the static directory', async () => {
+  const recorded = []
+  const manager = new JobManager({
+    enginePath: 'C:\\fake\\engine.ps1',
+    dataDir: 'C:\\fake\\fallback',
+    getDataDir: () => {
+      throw new Error('config unavailable')
+    },
+    runEngine: recordingEngine(recorded, [
+      { type: 'result', mode: 'scan', scanned: 1, hits: 0, explicitCount: 0, inheritedCount: 0, rootLabel: 'Medium' },
+    ]),
+  })
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(started.ok, true)
+  assert.equal(manager.get(started.jobId).dataDir, 'C:\\fake\\fallback')
+  await waitTerminal(manager, started.jobId)
+  assert.equal(recorded[0].dataDir, 'C:\\fake\\fallback')
+  manager.dispose()
+})
+
+test('onFinished fires exactly once when a job reaches a terminal state', async () => {
+  const calls = []
+  const manager = new JobManager({
+    enginePath: 'C:\\fake\\engine.ps1',
+    runEngine: fakeEngine([
+      { type: 'result', mode: 'scan', scanned: 1, hits: 0, explicitCount: 0, inheritedCount: 0, rootLabel: 'Medium' },
+    ]),
+    onFinished: (job) => calls.push({ id: job.id, status: job.status }),
+  })
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(calls.length, 0)
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'succeeded')
+  assert.deepEqual(calls, [{ id: job.id, status: 'succeeded' }])
+  // A second settlement is a no-op and must not notify again.
+  manager.finish(job, 'failed')
+  assert.equal(calls.length, 1)
+  assert.equal(job.status, 'succeeded')
+  manager.dispose()
+})
+
+test('onFinished also fires for cancelled jobs', async () => {
+  const calls = []
+  const engine = controllableEngine()
+  const manager = new JobManager({
+    enginePath: 'C:\\fake\\engine.ps1',
+    runEngine: engine.run,
+    onFinished: (job) => calls.push(job.status),
+  })
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  manager.requestCancel(started.jobId, 'user')
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'cancelled')
+  assert.deepEqual(calls, ['cancelled'])
+  manager.dispose()
+})
+
+test('a throwing onFinished never changes the job result', async () => {
+  const manager = new JobManager({
+    enginePath: 'C:\\fake\\engine.ps1',
+    runEngine: fakeEngine([
+      { type: 'result', mode: 'scan', scanned: 1, hits: 0, explicitCount: 0, inheritedCount: 0, rootLabel: 'Medium' },
+    ]),
+    onFinished: () => {
+      throw new Error('cleanup boom')
+    },
+  })
+  const started = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'succeeded')
+  assert.equal(job.message, null)
+  assert.equal(manager.snapshot(job).status, 'succeeded')
+  manager.dispose()
+})
+
+test('protectedArtifactPaths collects every in-memory job artifact path', async () => {
+  const engine = controllableEngine()
+  const manager = new JobManager({ enginePath: 'C:\\fake\\engine.ps1', runEngine: engine.run })
+  const started = manager.start({ action: 'repair', workspace: WORKSPACE, sessionId: 's1' })
+  const job = manager.get(started.jobId)
+  job.reportPath = 'C:\\fake\\data\\reports\\scan-1.json'
+  job.snapshotPath = 'C:\\fake\\data\\snapshots\\snapshot-1.json'
+  job.restorePath = 'C:\\fake\\data\\snapshots\\restore-1.ps1'
+  const keys = manager.protectedArtifactPaths()
+  assert.equal(keys.size, 3)
+  assert.equal(keys.has(pathKey('c:\\FAKE\\data\\reports\\scan-1.json')), true)
+  assert.equal(keys.has(pathKey('C:\\fake\\data\\snapshots\\snapshot-1.json')), true)
+  assert.equal(keys.has(pathKey('C:\\fake\\data\\snapshots\\restore-1.ps1')), true)
+
+  job.reportPath = null
+  job.snapshotPath = 42
+  assert.equal(manager.protectedArtifactPaths().size, 1)
+
+  manager.dispose()
+  assert.equal(manager.protectedArtifactPaths().size, 0)
 })
