@@ -1,14 +1,14 @@
 /**
  * Host half of the DSH low-integrity-check plugin.
  *
- * Registers a same-origin HTTP route under `/dsh-low-integrity-check`.
+ * Registers a same-origin HTTP route under `/dsh-file-integrity-check`.
  * The browser half (client.js) drives the right-sidebar panel.
- * @module dsh-low-integrity-check
+ * @module dsh-file-integrity-check
  */
 import { createRuntime } from './lib/runtime.js'
 
 /** Cordis plugin name. */
-export const name = 'dsh-low-integrity-check'
+export const name = 'dsh-file-integrity-check'
 
 /** Hard dependencies: the route carrier only. */
 export const inject = ['webServer']

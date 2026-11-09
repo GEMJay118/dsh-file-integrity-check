@@ -20,7 +20,7 @@ function fakeRuntimeCtx(existing = {}) {
     ...existing,
     registered,
     logger: {},
-    fiber: 'fiber' in existing ? existing.fiber : { entry: { id: 'dsh-low-integrity-check' } },
+    fiber: 'fiber' in existing ? existing.fiber : { entry: { id: 'dsh-file-integrity-check' } },
     get(name) {
       return typeof existing.get === 'function' ? existing.get(name) : undefined
     },
@@ -346,7 +346,7 @@ test('ensureWritable rejects an empty path', async () => {
 
 test('index.js loads without a resolvable schemastery and exposes a safe Config', async () => {
   const module = await import('../index.js')
-  assert.equal(module.name, 'dsh-low-integrity-check')
+  assert.equal(module.name, 'dsh-file-integrity-check')
   assert.ok(module.inject.includes('webServer'))
   assert.equal(typeof module.apply, 'function')
   // The schema factory is not guaranteed to resolve from the repository, but

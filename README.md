@@ -1,8 +1,10 @@
-# dsh-low-integrity-check
+# dsh-file-integrity-check
 
 > 一个 Windows 专用的 DSH（DeepSeek Harness）插件：在右侧栏检查当前工作区残留的 **Low 完整性标签**，确认后一键恢复为 **Medium**，并支持导出清单、复扫验证与面板内失败诊断。
 >
-> 仓库名 `dsh-file-integrity-check` 是项目目录名；插件包名与 DSH 插件 id 为 **`dsh-low-integrity-check`**。
+> 仓库、插件包名与 DSH 插件 id 统一为 **`dsh-file-integrity-check`**（2026-11-09 由 `dsh-low-integrity-check` 改名；插件行 id、HTTP 路由与客户端模块 id 一并更新）。
+>
+> 数据目录仍沿用 `%DSH_HOME%\low-integrity-check\`（默认值，避免已有快照/报告失联），可在设置页改到其他目录。
 
 ## 背景：为什么需要它
 
@@ -67,13 +69,13 @@ git clone https://github.com/GEMJay118/dsh-file-integrity-check.git
 plugin_manager install_bundle  D:\path\to\dsh-file-integrity-check
 ```
 
-安装成功后插件管理器会显示 `dsh-low-integrity-check`，右侧栏出现「完整性检查」入口。更新代码后需要重启 DSH 以加载新的 Host JS 与 client.js；引擎脚本（`engine/integrity.ps1`）每次任务都会重新读取，改完无需重启。
+安装成功后插件管理器会显示 `dsh-file-integrity-check`，右侧栏出现「完整性检查」入口。更新代码后需要重启 DSH 以加载新的 Host JS 与 client.js；引擎脚本（`engine/integrity.ps1`）每次任务都会重新读取，改完无需重启。
 
 ## 工作原理
 
 ```
 右侧栏面板 (client.js, React.createElement)
-   │ 同源 fetch  /dsh-low-integrity-check/*（quick / deep / repair / settings）
+   │ 同源 fetch  /dsh-file-integrity-check/*（quick / deep / repair / settings）
    ▼
 Host 插件 (index.js, Cordis)
    │ 1. workspaceRegistry 解析会话所属工作区（客户端不传路径）

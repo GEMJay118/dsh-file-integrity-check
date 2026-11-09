@@ -1,5 +1,5 @@
 /**
- * dsh-low-integrity-check 的浏览器半侧：把「文件完整性检查」注册成 DSH 右侧栏的一种标签页。
+ * dsh-file-integrity-check 的浏览器半侧：把「文件完整性检查」注册成 DSH 右侧栏的一种标签页。
  *
  * 结构：
  * - 模块包装：window.__ModuleLoader__.load({ id, factory })；factory 内只 require('react')，
@@ -41,7 +41,7 @@
   //#region 常量
 
   /** 标签实现身份；同时也是标签类型 id 与正文/标题插槽的 key。 */
-  var TAB_ID = 'dsh-low-integrity-check';
+  var TAB_ID = 'dsh-file-integrity-check';
   /** 标签类型；openTab 按它打开。 */
   var TAB_KIND = 'low-integrity';
   /** locale 字典命名空间。 */
@@ -50,10 +50,10 @@
    * 宿主 HTTP 路由段。
    *
    * 必须与宿主半侧 ctx.webServer.register({ kind: 'prefix', path }) 的 path 完全一致
-   * （Host 已实现为 '/dsh-low-integrity-check'）；浏览器实际请求地址 =
+   * （Host 已实现为 '/dsh-file-integrity-check'）；浏览器实际请求地址 =
    * mountPrefixOf(document.baseURI) + 本值（见 routeBaseOf）。
    */
-  var ROUTE_SEGMENT = '/dsh-low-integrity-check';
+  var ROUTE_SEGMENT = '/dsh-file-integrity-check';
   /** 会话级任务恢复的 sessionStorage 键前缀。 */
   var STORAGE_PREFIX = 'dsh-fi:';
   /** 会话行紫点的「已读」标记键前缀（值为已读到的 jobId）。 */
@@ -80,7 +80,7 @@
   /** 宿主 task/failure 列表最多展示条数（再多只给计数）。 */
   var MAX_FAILURE_ROWS = 100;
   /** 日志前缀；所有 console 输出统一带它，便于在页面控制台里筛。 */
-  var LOG_PREFIX = '[dsh-low-integrity-check]';
+  var LOG_PREFIX = '[dsh-file-integrity-check]';
 
   /** 宿主错误码 → 本地化文案键的映射（未列出的码走 error.generic）。 */
   var KNOWN_ERROR_CODES = {
@@ -4163,7 +4163,7 @@
         try {
           ctx.effect(function () {
             return ctx.locale.register(NS, DICTS);
-          }, 'dsh-low-integrity-check: dictionaries');
+          }, 'dsh-file-integrity-check: dictionaries');
           t = ctx.locale.bind(NS);
         } catch (error) {
           console.error(LOG_PREFIX + ' locale 注册失败（文案退化为键名）：', error);
@@ -4173,7 +4173,7 @@
         try {
           ctx.effect(function () {
             return injectPanelCss();
-          }, 'dsh-low-integrity-check: panel styles');
+          }, 'dsh-file-integrity-check: panel styles');
         } catch (error) {
           console.error(LOG_PREFIX + ' 面板样式注入失败（不影响功能）：', error);
         }
@@ -4182,7 +4182,7 @@
         try {
           ctx.effect(function () {
             return unreadWatcher.start();
-          }, 'dsh-low-integrity-check: session row unread watcher');
+          }, 'dsh-file-integrity-check: session row unread watcher');
         } catch (error) {
           console.warn(LOG_PREFIX + ' 未读状态 watcher 启动失败（已忽略）：', error);
         }
@@ -4287,7 +4287,7 @@
                 }
               };
             },
-            'dsh-low-integrity-check: sidebar panel tab',
+            'dsh-file-integrity-check: sidebar panel tab',
           );
         } catch (error) {
           console.error(LOG_PREFIX + ' 右侧栏注册抛出异常（已忽略，不影响页面）：', error);
