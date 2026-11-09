@@ -1,5 +1,5 @@
 /**
- * Host half of the DSH low-integrity-check plugin.
+ * Host half of the DSH file-integrity-check plugin.
  *
  * Registers a same-origin HTTP route under `/dsh-file-integrity-check`.
  * The browser half (client.js) drives the right-sidebar panel.

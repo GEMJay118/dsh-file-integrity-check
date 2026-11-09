@@ -1,4 +1,4 @@
-# Insert the low-integrity-check plugin into the profile tree.
+# Insert the file-integrity-check plugin into the profile tree.
 # The client half is discovered through package.json `dsh.client`,
 # so no separate row is needed for the browser artifact.
 - insert:

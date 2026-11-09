@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   Creates a self-contained fixture tree under
-      %TEMP%\dsh-low-integrity-tests\<runId>\
+      %TEMP%\dsh-file-integrity-tests\<runId>\
   and exercises the engine end to end (Env / Scan / Repair), then removes the
   fixture tree again (unless -Keep is used).
 
@@ -66,7 +66,7 @@
   Length of each deep path segment. Default 40.
 
 .NOTES
-  This script only touches %TEMP%\dsh-low-integrity-tests\<runId>.
+  This script only touches %TEMP%\dsh-file-integrity-tests\<runId>.
   It never modifies user files outside that directory.
 #>
 [CmdletBinding()]
@@ -94,7 +94,7 @@ try {
 
 $script:RunId = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
 $tempRoot = [System.IO.Path]::GetTempPath()
-$script:TestTempRoot = Join-Path $tempRoot 'dsh-low-integrity-tests'
+$script:TestTempRoot = Join-Path $tempRoot 'dsh-file-integrity-tests'
 $script:BaseDir = Join-Path $script:TestTempRoot $script:RunId
 $script:ScanDataDir = Join-Path $script:BaseDir 'data-scan'
 
