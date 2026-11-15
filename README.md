@@ -140,16 +140,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 
 `test/run-fixtures.ps1` 会自动探测标签写权限：可写则跑 FULL（含修复成功、恢复回滚、继承传播实验、native/grant 修复快路径、Repair 事件/进度/结果契约、并行基准、报告文件与 0 命中产物断言（命中时写报告；0 命中 `reportPath` 为空且不新增报告文件、不建 `snapshots` 目录）、DataDir 排除等）；不可写则跑沙箱内可测子集并标注 SKIP。产物目录配置与自动清理（Config / 设置页 / `/settings` 路由 / `lib/datadir.js` / `lib/cleanup.js`）属 Host 侧逻辑，由 Node 单测覆盖，不在引擎夹具里。
 
-开发验收结果（DSH 0.2.2-rc.1 / Windows 11；本轮核对 2026-11-08）：
+开发验收结果（DSH 0.2.2-rc.1 / Windows 11；2026-11-13 复跑核对）：
 
-- 引擎夹具：SANDBOX **PASS=230 / FAIL=0 / SKIP=8 / INFO=4**（2026-11-08，DSH 工具沙箱内，PS 5.1 + pwsh 7 双宿主）；FULL 历史口径为 **PASS=324 / FAIL=0 / SKIP=1 / INFO=9**（2026-11-07，沙箱外），**本轮未在沙箱外复跑，待复跑**。
-- Node / Host 测试：**105 项**（2026-11-08；**104 pass + 1 skip**；paths 15 / datadir 25 / cleanup 23 / jobs 23 / engine 6 / routes 13；skip 为 file symlink 需开发者模式，本机 EPERM），`npm run check` 通过（9 个 JS 文件）。
+- 引擎夹具（2026-11-13 复跑）：SANDBOX **PASS=230 / FAIL=0 / SKIP=8 / INFO=4**（DSH 工具沙箱内，PS 5.1 + pwsh 7 双宿主）；FULL **PASS=332 / FAIL=0 / SKIP=1 / INFO=9**（沙箱外；唯一 SKIP 为需拒绝写标签的失败路径，由同日 SANDBOX 覆盖）。
+- Node / Host 测试：**105 项**（2026-11-13；**104 pass + 1 skip**；paths 15 / datadir 25 / cleanup 23 / jobs 23 / engine 6 / routes 13；skip 为 file symlink 需开发者模式，本机 EPERM），`npm run check` 通过（9 个 JS 文件）。
 - 性能（阶段口径与完整数据见维护文档 HANDOFF）：
   - **扫描**：真实 122,575 项 quick **≈7s**（C# 扫描器）；2000 文件夹具 quick ≈1.7s vs deep ≈25s。
   - **修复（阶段 4，顺序版基线，真实 114k）**：110,133 命中 **≈25min**（≈13.6ms/对象），其中扫描 7.1s、快照 0.43s、restore 10.5s；瓶颈是逐对象临时 WRITE_OWNER 授权。
   - **阶段 5**：临时授权把「还原 DACL + 写标签」合并为一次 `SetNamedSecurityInfo`（每对象 SD 写 3→2），FULL 断言合并写生效（`grantFallbacks=0`）。
-  - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）。真实 114k 复测预计 **≈14min** 量级（待回填）。
+  - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）；2026-11-13 复跑 `perGrantFileMs=2.26`、`repairWallMs=6,777`。真实 114k 复测预计 **≈14min** 量级（待回填）。
 - 真实工作区（历史，阶段 1 前）：修复前 24 命中，清除后复扫 **0 命中**、根与文件均为 Medium，非命中 DACL 抽样逐字符一致。
+- 真实修复复核（2026-11-13）：2026-11-12 由面板修复的工作区只读复扫 **0 命中**、根标签 Medium，与快照/restore 产物一致。
 
 > 文档维护：新内容并入对应章节，避免追加式续写与重复表述；被取代的旧表述随更新删除。
 
