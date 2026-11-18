@@ -743,3 +743,140 @@ test('a job whose product directory sits inside the workspace is rejected with 4
     await fs.rm(workspace, { recursive: true, force: true })
   }
 })
+
+test('preview job lifecycle over HTTP: start, snapshot.preview, export and open-folder rejected', async () => {
+  const dataDir = await tempDir()
+  const workspace = await tempDir()
+  const itemPath = path.join(workspace, 'sub')
+  const deps = await makeDeps({
+    workspacePath: workspace,
+    dataDir,
+    events: [
+      { type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true },
+      { type: 'progress', phase: 'scan', scanned: 12, hits: 2 },
+      {
+        type: 'result',
+        mode: 'preview',
+        root: workspace,
+        rootLabel: 'Low',
+        scanned: 12,
+        hits: 2,
+        explicitCount: 1,
+        inheritedCount: 1,
+        scanMs: 9,
+        propagation: {
+          candidates: 1,
+          descendants: 4,
+          skippedDirs: 2,
+          dataDir: 0,
+          other: 1,
+          uncertain: 3,
+          truncated: false,
+          items: [{ path: itemPath, kind: 'dir', reason: 'explicit-low' }],
+          errors: [],
+        },
+        engineVersion: '0.1.0',
+        durationMs: 20,
+      },
+    ],
+  })
+  const harness = await startTestServer(deps)
+  const headers = { 'content-type': 'application/json', origin: harness.base }
+  try {
+    const start = await request(harness.base, PREFIX + '/jobs', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'preview', sessionId: 'session-1' }),
+    })
+    assert.equal(start.status, 200)
+    assert.equal(start.json.ok, true)
+    assert.equal(start.json.depth, null)
+    assert.deepEqual(start.json.warnings, [])
+    const jobId = start.json.jobId
+    assert.equal(typeof jobId, 'string')
+
+    let job = null
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const poll = await request(harness.base, PREFIX + '/jobs/' + jobId)
+      assert.equal(poll.status, 200)
+      job = poll.json.job
+      if (job.status !== 'running') break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(job.status, 'succeeded')
+    assert.equal(job.action, 'preview')
+    assert.equal(job.depth, null)
+    assert.deepEqual(job.items, [])
+    assert.deepEqual(job.preview, {
+      hits: 2,
+      explicitCount: 1,
+      inheritedCount: 1,
+      scanMs: 9,
+      candidates: 1,
+      descendants: 4,
+      skippedDirs: 2,
+      dataDir: 0,
+      other: 1,
+      uncertain: 3,
+      truncated: false,
+      items: [{ path: itemPath, kind: 'dir', reason: 'explicit-low' }],
+      errors: [],
+    })
+
+    // Preview streams no hit items of its own.
+    const items = await request(harness.base, PREFIX + '/jobs/' + jobId + '/items')
+    assert.equal(items.json.total, 0)
+    assert.deepEqual(items.json.items, [])
+
+    // Preview writes no report: exporting is a client-correctable 400.
+    const exported = await request(harness.base, PREFIX + '/jobs/' + jobId + '/export', { method: 'POST', headers, body: '{}' })
+    assert.equal(exported.status, 400)
+    assert.equal(exported.json.ok, false)
+    assert.equal(exported.json.code, 'invalid-request')
+
+    // Preview has no artifacts at all, so open-folder is rejected as well.
+    for (const body of [{ jobId }, { jobId, target: 'report' }, { jobId, target: 'restore' }]) {
+      const opened = await request(harness.base, PREFIX + '/open-folder', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      })
+      assert.equal(opened.status, 400, JSON.stringify(body))
+      assert.equal(opened.json.ok, false)
+      assert.equal(opened.json.code, 'invalid-request')
+      assert.match(opened.json.message, /预览任务/)
+    }
+  } finally {
+    deps.jobs.dispose()
+    await harness.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('unknown job actions are still rejected', async () => {
+  const dataDir = await tempDir()
+  const workspace = await tempDir()
+  const deps = await makeDeps({ workspacePath: workspace, dataDir })
+  const harness = await startTestServer(deps)
+  const headers = { 'content-type': 'application/json', origin: harness.base }
+  try {
+    for (const action of ['purge', 'Preview', '', undefined]) {
+      const rejected = await request(harness.base, PREFIX + '/jobs', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action, sessionId: 'session-1' }),
+      })
+      assert.equal(rejected.status, 400, String(action))
+      assert.equal(rejected.json.ok, false)
+      assert.equal(rejected.json.code, 'invalid-request')
+      assert.equal(rejected.json.message, 'action 必须是 scan、repair 或 preview')
+    }
+    assert.equal(deps.jobs.jobs.size, 0)
+  } finally {
+    deps.jobs.dispose()
+    await harness.close()
+    await fs.rm(dataDir, { recursive: true, force: true })
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})

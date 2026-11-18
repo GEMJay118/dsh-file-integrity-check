@@ -4,7 +4,7 @@
   dsh-file-integrity-check engine: detect and repair Low integrity labels on files.
 
 .DESCRIPTION
-  Three modes:
+  Four modes:
     Env    - report current user / integrity level / icacls availability / label-write capability.
     Scan   - walk -Root, read the mandatory-integrity label of every file and directory,
              stream a "hit" line for every object whose label is Low. Reparse points
@@ -44,20 +44,37 @@
              restore-*.ps1 script restores EVERY snapshot hit explicitly as Low
              (inherited entries become explicit Low) and uses the same temporary-grant
              fallback when the DACL denies the label write.
+    Preview - read-only repair-impact estimate: runs the same C# scan as Repair
+             (no snapshot; -SkipDirs and a -DataDir inside -Root are excluded from
+             the hit set), then walks the descendants of every hit directory
+             (including SkipDirs / DataDir-in-Root regions, never following reparse
+             points) and counts the Low objects that are NOT in the hit set. Those
+             "candidates" could be switched to Medium by Windows inheritance
+             propagation when Repair sets an inheritable (OI)(CI)Medium label on a
+             hit directory; the number is an ESTIMATE. Candidates are classified by
+             region (data-dir first, then skipped-dir, then other); label read
+             failures are reported as "uncertain" with details in propagation.errors.
+             Preview writes nothing: no label change, no report, no snapshot, no
+             restore script, no directory, no log. It never streams "hit" events.
+             progress phases are enumerate (hit scan) and analyze (descendant check);
+             total is always null and hits stays the hit count. The result exits 0
+             even when hits/candidates are non-zero (2 is never used by Preview).
 
   Output is UTF-8 (no BOM) JSON Lines written to stdout; diagnostics must never be
   written to stdout (they go to stderr or are dropped). Line types:
     {"type":"env",...}
     {"type":"progress","phase":"enumerate|repair|verify","scanned":n,"total":n|null,"hits":n,"fixed":n}
+    {"type":"progress","phase":"enumerate|analyze","scanned":n,"total":null,"hits":n}   Preview
     {"type":"hit","path","kind":"file"|"dir","explicit":bool,"label":"Low",...}
     {"type":"error","path","message"}                       scan / read problems
     {"type":"error","path","message","phase":"repair","output"}  repair attempt failures
-    {"type":"result","mode":"scan"|"repair",...}
+    {"type":"result","mode":"scan"|"repair"|"preview",...}
     {"type":"fatal","code","message"}
 
   Exit codes:
-    0 - success (Scan: no Low hits found; Repair: nothing remaining/failed; Env: ok)
-    2 - Scan found Low objects / Repair left Low objects or failures
+    0 - success (Scan: no Low hits found; Repair: nothing remaining/failed; Env: ok;
+        Preview: always 0 when the scan/analysis completed)
+    2 - Scan found Low objects / Repair left Low objects or failures (never Preview)
     3 - fatal error (bad arguments, root missing, snapshot write failure, unexpected exception)
 
   Suppressed / non-ASCII / space / >260 char paths are supported; internal Win32 calls use
@@ -66,10 +83,10 @@
   to SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION) and reports the method in the result.
 
 .PARAMETER Mode
-  Env, Scan or Repair. Default: Scan.
+  Env, Scan, Repair or Preview. Default: Scan.
 
 .PARAMETER Root
-  Directory (or single file) to scan / repair. Required for Scan and Repair.
+  Directory (or single file) to scan / repair / preview. Required for Scan, Repair and Preview.
 
 .PARAMETER SkipDirs
   Directory names skipped entirely during traversal. Default: node_modules, .git.
@@ -84,8 +101,9 @@
     deep  - legacy PowerShell traversal; streams every Low hit and behaves exactly
             like previous engine versions. result carries depth:"deep",
             engine:"powershell".
-  -Mode Env and -Mode Repair are unaffected by this switch (Repair uses the
-  embedded C# RepairSession and does not stream hit lines).
+  -Mode Env, -Mode Repair and -Mode Preview are unaffected by this switch
+  (Repair uses the embedded C# RepairSession and does not stream hit lines;
+  Preview reuses the same C# scan without a snapshot).
 
 .PARAMETER IcaclsPath
   icacls executable (test seam). Default: icacls.exe resolved from PATH/System32.
@@ -94,8 +112,9 @@
   Engine data directory. Repair writes snapshots and restore scripts to
   <DataDir>\snapshots\; Scan writes its complete hit report to <DataDir>\reports\
   as scan-<timestamp>.json (result.reportPath) only when it found Low objects
-  (zero-hit scans write no report and result.reportPath is null). Default:
-  <temp>\dsh-file-integrity-check.
+  (zero-hit scans write no report and result.reportPath is null). Preview only
+  reads the value to exclude/classify a -DataDir that lives inside -Root; it
+  never creates or writes anything there. Default: <temp>\dsh-file-integrity-check.
 
 .PARAMETER Json
   Accepted for Host compatibility; output is always JSON Lines.
@@ -106,7 +125,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Env', 'Scan', 'Repair')]
+    [ValidateSet('Env', 'Scan', 'Repair', 'Preview')]
     [string]$Mode = 'Scan',
 
     [string]$Root,
@@ -1718,7 +1737,9 @@ namespace DshIntegrity
             result.ScanMs = watch.ElapsedMilliseconds;
             result.Truncated = result.Truncated || truncated;
 
-            if (result.Hits > 0)
+            // Preview reuses this scan with snapshotPath == null and must stay
+            // read-only; Repair always passes a path, so its behaviour is unchanged.
+            if (result.Hits > 0 && snapshotPath != null)
             {
                 Stopwatch snapshotWatch = Stopwatch.StartNew();
                 try
@@ -2216,6 +2237,348 @@ namespace DshIntegrity
             if (win32Path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + win32Path.Substring(8); }
             if (win32Path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return win32Path.Substring(4); }
             return win32Path;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Preview-mode analysis (read-only). PreviewSession does NOT enumerate a
+    // second time from the scan root: the hit scan is the existing
+    // RepairSession.Scan pass (called with a null snapshot path), and this class
+    // only walks the descendants of the hit directories to estimate which Low
+    // objects are absent from the hit set and could therefore be switched to
+    // Medium by inheritance propagation during a real repair.
+    // ----------------------------------------------------------------------
+    public sealed class PreviewSample
+    {
+        public string Path;
+        public string Kind;
+        public string Reason;
+    }
+
+    public sealed class PreviewError
+    {
+        public string Path;
+        public string Message;
+    }
+
+    public sealed class PreviewPropagation
+    {
+        public int Candidates;
+        public int Descendants;
+        public int SkippedDirs;
+        public int DataDir;
+        public int Other;
+        public int Uncertain;
+        public bool Truncated;
+        public List<PreviewSample> Items = new List<PreviewSample>();
+        public List<PreviewError> Errors = new List<PreviewError>();
+    }
+
+    public static class PreviewSession
+    {
+        private const int MaxDescendantChecks = 200000;
+        private const int MaxItems = 50;
+        private const int MaxUncertainErrors = 20;
+        private const int ProgressItemStep = 2000;
+        private const int ProgressMillisecondStep = 250;
+        private const uint InvalidFileAttributes = 0xFFFFFFFF;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WIN32_FIND_DATA
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationTimeLow;
+            public uint ftCreationTimeHigh;
+            public uint ftLastAccessTimeLow;
+            public uint ftLastAccessTimeHigh;
+            public uint ftLastWriteTimeLow;
+            public uint ftLastWriteTimeHigh;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint dwReserved0;
+            public uint dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+            public string cAlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstFileExW(
+            string lpFileName,
+            int fInfoLevelId,
+            out WIN32_FIND_DATA lpFindFileData,
+            int fSearchOp,
+            IntPtr lpSearchFilter,
+            int dwAdditionalFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATA lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FindClose(IntPtr hFindFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileAttributesW(string lpFileName);
+
+        private sealed class WalkEntry
+        {
+            public string Win32Path;
+            public bool InDataDir;
+            public bool InSkippedDir;
+        }
+
+        public static PreviewPropagation Analyze(
+            RepairScanResult scan,
+            string[] skipDirNames,
+            string[] dataDirPrefixes,
+            RepairProgressDelegate progress)
+        {
+            PreviewPropagation result = new PreviewPropagation();
+            if (scan == null || scan.HitList == null) { return result; }
+
+            HashSet<string> hitPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> hitDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int index = 0; index < scan.HitList.Count; index++)
+            {
+                RepairHit hit = scan.HitList[index];
+                if (hit == null || hit.Path == null) { continue; }
+                string hitLower = hit.Path.ToLowerInvariant();
+                if (hitPaths.Add(hitLower) && hit.Kind == "dir")
+                {
+                    hitDirs.Add(hitLower);
+                }
+            }
+            if (hitDirs.Count == 0) { return result; }
+
+            HashSet<string> skipLookup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (skipDirNames != null)
+            {
+                for (int index = 0; index < skipDirNames.Length; index++)
+                {
+                    string skipName = skipDirNames[index];
+                    if (skipName == null) { continue; }
+                    skipName = skipName.Trim();
+                    if (skipName.Length > 0) { skipLookup.Add(skipName); }
+                }
+            }
+
+            List<string> dataPrefixes = new List<string>();
+            if (dataDirPrefixes != null)
+            {
+                for (int index = 0; index < dataDirPrefixes.Length; index++)
+                {
+                    string prefix = dataDirPrefixes[index];
+                    if (prefix == null) { continue; }
+                    prefix = prefix.Trim().TrimEnd('\\');
+                    if (prefix.Length > 0) { dataPrefixes.Add(prefix.ToLowerInvariant()); }
+                }
+            }
+
+            // Only the top-most hit directories are walked: a hit directory nested
+            // inside another hit directory is already covered by the ancestor walk,
+            // which keeps descendants/candidates unique.
+            List<RepairHit> starts = new List<RepairHit>();
+            for (int index = 0; index < scan.HitList.Count; index++)
+            {
+                RepairHit hit = scan.HitList[index];
+                if (hit == null || hit.Win32Path == null || hit.Kind != "dir") { continue; }
+                string normal = NormalizePath(hit.Win32Path);
+                string lower = normal.ToLowerInvariant();
+                bool covered = false;
+                string parent = ParentPath(lower);
+                while (parent != null)
+                {
+                    if (hitDirs.Contains(parent)) { covered = true; break; }
+                    parent = ParentPath(parent);
+                }
+                if (!covered) { starts.Add(hit); }
+            }
+
+            Stack<WalkEntry> stack = new Stack<WalkEntry>();
+            for (int index = starts.Count - 1; index >= 0; index--)
+            {
+                RepairHit start = starts[index];
+                uint attributes = GetFileAttributesW(start.Win32Path);
+                if (attributes != InvalidFileAttributes && (attributes & FileAttributeReparsePoint) != 0) { continue; }
+                WalkEntry entry = new WalkEntry();
+                entry.Win32Path = start.Win32Path;
+                entry.InDataDir = false;
+                entry.InSkippedDir = false;
+                stack.Push(entry);
+            }
+
+            int hitCount = scan.Hits;
+            int lastProgressDescendants = 0;
+            long lastProgressMilliseconds = 0;
+            bool truncated = false;
+            Stopwatch watch = Stopwatch.StartNew();
+
+            while (stack.Count > 0)
+            {
+                WalkEntry current = stack.Pop();
+                bool hasTrailingBackslash = current.Win32Path.EndsWith("\\", StringComparison.Ordinal);
+                string pattern = hasTrailingBackslash ? current.Win32Path + "*" : current.Win32Path + "\\*";
+                WIN32_FIND_DATA findData;
+                // fInfoLevelId 1 = FindExInfoBasic (skips short-name lookup);
+                // dwAdditionalFlags 2 = FIND_FIRST_EX_LARGE_FETCH (same as the quick
+                // scanner; this walk can cover the whole hit subtree).
+                IntPtr findHandle = FindFirstFileExW(pattern, 1, out findData, 0, IntPtr.Zero, 2);
+                if (findHandle == new IntPtr(-1))
+                {
+                    // An unreadable directory has no readable descendants; the hit
+                    // scan already reported the read failure. Skip it silently here.
+                    continue;
+                }
+                try
+                {
+                    bool hasMore = true;
+                    while (hasMore)
+                    {
+                        string fileName = findData.cFileName;
+                        if (fileName != null && fileName.Length > 0 && fileName != "." && fileName != "..")
+                        {
+                            bool isDirectory = ((findData.dwFileAttributes & FileAttributeDirectory) != 0);
+                            bool isReparse = ((findData.dwFileAttributes & FileAttributeReparsePoint) != 0);
+                            string childWin32 = hasTrailingBackslash ? current.Win32Path + fileName : current.Win32Path + "\\" + fileName;
+                            string childNormal = NormalizePath(childWin32);
+                            string childLower = childNormal.ToLowerInvariant();
+
+                            bool childInDataDir = current.InDataDir;
+                            if (!childInDataDir)
+                            {
+                                for (int prefixIndex = 0; prefixIndex < dataPrefixes.Count; prefixIndex++)
+                                {
+                                    if (string.Equals(childLower, dataPrefixes[prefixIndex], StringComparison.Ordinal))
+                                    {
+                                        childInDataDir = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            bool childInSkippedDir = current.InSkippedDir;
+                            if (!childInSkippedDir && isDirectory && skipLookup.Contains(fileName))
+                            {
+                                childInSkippedDir = true;
+                            }
+
+                            result.Descendants++;
+                            if (!hitPaths.Contains(childLower))
+                            {
+                                LabelReadResult label = Native.GetLabelInfoFast(childWin32, false);
+                                if (!label.Ok)
+                                {
+                                    result.Uncertain++;
+                                    if (result.Errors.Count < MaxUncertainErrors)
+                                    {
+                                        PreviewError error = new PreviewError();
+                                        error.Path = childNormal;
+                                        error.Message = DescribeWin32(label.ErrorCode);
+                                        result.Errors.Add(error);
+                                    }
+                                }
+                                else if (label.Level == "Low")
+                                {
+                                    result.Candidates++;
+                                    string reason;
+                                    if (childInDataDir)
+                                    {
+                                        result.DataDir++;
+                                        reason = "data-dir";
+                                    }
+                                    else if (childInSkippedDir)
+                                    {
+                                        result.SkippedDirs++;
+                                        reason = "skipped-dir";
+                                    }
+                                    else
+                                    {
+                                        result.Other++;
+                                        reason = "other";
+                                    }
+                                    if (result.Items.Count < MaxItems)
+                                    {
+                                        PreviewSample sample = new PreviewSample();
+                                        sample.Path = childNormal;
+                                        sample.Kind = isDirectory ? "dir" : "file";
+                                        sample.Reason = reason;
+                                        result.Items.Add(sample);
+                                    }
+                                }
+                            }
+
+                            if (isDirectory && !isReparse)
+                            {
+                                WalkEntry child = new WalkEntry();
+                                child.Win32Path = childWin32;
+                                child.InDataDir = childInDataDir;
+                                child.InSkippedDir = childInSkippedDir;
+                                stack.Push(child);
+                            }
+                        }
+                        hasMore = FindNextFileW(findHandle, out findData);
+                    }
+                }
+                finally
+                {
+                    FindClose(findHandle);
+                }
+
+                if (result.Descendants >= MaxDescendantChecks)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                long elapsed = watch.ElapsedMilliseconds;
+                if (progress != null && ((result.Descendants - lastProgressDescendants) >= ProgressItemStep || (elapsed - lastProgressMilliseconds) >= ProgressMillisecondStep))
+                {
+                    progress("analyze", result.Descendants, -1, hitCount, 0);
+                    lastProgressDescendants = result.Descendants;
+                    lastProgressMilliseconds = elapsed;
+                }
+            }
+
+            result.Truncated = truncated;
+            if (progress != null)
+            {
+                progress("analyze", result.Descendants, -1, hitCount, 0);
+            }
+            return result;
+        }
+
+        private static string ParentPath(string lowerPath)
+        {
+            if (lowerPath == null) { return null; }
+            if (lowerPath.Length <= 3) { return null; }
+            int index = lowerPath.LastIndexOf('\\');
+            if (index <= 0) { return null; }
+            string parent = lowerPath.Substring(0, index);
+            if (parent.Length == 2 && parent[1] == ':') { parent = parent + "\\"; }
+            return parent;
+        }
+
+        private static string NormalizePath(string win32Path)
+        {
+            if (win32Path == null) { return null; }
+            if (win32Path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + win32Path.Substring(8); }
+            if (win32Path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return win32Path.Substring(4); }
+            return win32Path;
+        }
+
+        private static string DescribeWin32(int errorCode)
+        {
+            try
+            {
+                string text = new System.ComponentModel.Win32Exception(errorCode).Message;
+                return text + " (Win32 " + errorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+            }
+            catch
+            {
+                return "Win32 " + errorCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
         }
     }
 }
@@ -3416,7 +3779,7 @@ function Invoke-EnvMode {
 
 function Test-RootArgument {
     if ([string]::IsNullOrEmpty($Root)) {
-        Write-Fatal -Code 'invalid-arguments' -Message '-Root is required for Scan/Repair.'
+        Write-Fatal -Code 'invalid-arguments' -Message '-Root is required for Scan/Repair/Preview.'
         return @{ ok = $false }
     }
     $rootNormal = Resolve-RootPath -Path $Root
@@ -3850,6 +4213,141 @@ function Invoke-RepairMode {
 }
 
 # ---------------------------------------------------------------------------
+# Preview mode (read-only repair-impact estimate).
+#
+# 1) "enumerate": the exact Repair hit scan (C# RepairSession.Scan) with a null
+#    snapshot path, so no snapshot/report/directory is ever written. -SkipDirs
+#    and a -DataDir inside -Root are excluded from the hit set exactly like
+#    Repair, which keeps hits/explicitCount/inheritedCount comparable.
+# 2) "analyze": walk the descendants of every hit directory (including SkipDirs
+#    and DataDir-in-Root regions, never following reparse points) and count Low
+#    objects that are not in the hit set. Those objects may become Medium through
+#    inheritance propagation when Repair sets an inheritable (OI)(CI)Medium label,
+#    so the count is an estimate, not a promise.
+#
+# Preview never streams "hit" events and always exits 0 unless something fatal
+# happens (3); exit code 2 is never used by this mode.
+# ---------------------------------------------------------------------------
+function Invoke-PreviewMode {
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $rootCheck = Test-RootArgument
+    if (-not $rootCheck.ok) { return 3 }
+
+    # Resolve the data directory ONLY to exclude/classify a DataDir that lives
+    # inside -Root; Preview must not create or write anything there.
+    $dataDirectory = Resolve-DataDirectory
+    $previewDataPrefixes = @()
+    try {
+        $rootLower = $rootCheck.rootNormal.ToLowerInvariant().TrimEnd('\')
+        $dataLower = $dataDirectory.ToLowerInvariant().TrimEnd('\')
+        if ($dataLower.Length -gt $rootLower.Length -and $dataLower.StartsWith($rootLower + '\')) {
+            $previewDataPrefixes = @($dataDirectory)
+        }
+    } catch { }
+
+    $enumerateCallback = [DshIntegrity.RepairProgressDelegate] {
+        param([string]$phase, [int]$scanned, [int]$total, [int]$hits, [int]$fixedCount)
+        Write-ProgressEvent -Phase 'enumerate' -Scanned $scanned -Total $null -Hits $hits
+    }
+
+    try {
+        $scanResult = [DshIntegrity.RepairSession]::Scan(
+            [string]$rootCheck.rootNormal,
+            [string[]]$script:SkipDirList,
+            [string[]]$previewDataPrefixes,
+            $null,
+            [string]$script:EngineVersion,
+            (Get-Date).ToString('o'),
+            $enumerateCallback)
+    } catch {
+        Write-Fatal -Code 'preview-scan-failed' -Message ('C# preview scan failed: ' + $_.Exception.Message)
+        return 3
+    }
+    if ($null -eq $scanResult) {
+        Write-Fatal -Code 'preview-scan-failed' -Message 'C# preview scan returned no result.'
+        return 3
+    }
+
+    # Preview has no result.errors field (the Host contract keeps scan problems
+    # out of the propagation summary); stream them as bounded "error" events.
+    foreach ($scanError in $scanResult.Errors) {
+        Write-Event -Fields ([ordered]@{
+                type    = 'error'
+                path    = [string]$scanError.Path
+                message = [string]$scanError.Message
+            })
+    }
+
+    $analyzeCallback = [DshIntegrity.RepairProgressDelegate] {
+        param([string]$phase, [int]$scanned, [int]$total, [int]$hits, [int]$fixedCount)
+        Write-ProgressEvent -Phase 'analyze' -Scanned $scanned -Total $null -Hits $hits
+    }
+
+    try {
+        $propagation = [DshIntegrity.PreviewSession]::Analyze(
+            $scanResult,
+            [string[]]$script:SkipDirList,
+            [string[]]$previewDataPrefixes,
+            $analyzeCallback)
+    } catch {
+        Write-Fatal -Code 'preview-analyze-failed' -Message ('C# preview analysis failed: ' + $_.Exception.Message)
+        return 3
+    }
+    if ($null -eq $propagation) {
+        Write-Fatal -Code 'preview-analyze-failed' -Message 'C# preview analysis returned no result.'
+        return 3
+    }
+
+    # The contract has no top-level truncated flag: report a truncated hit scan
+    # through propagation.truncated as well (a truncated scan also bounds the
+    # candidate list, so the consumer must not read it as a complete estimate).
+    $truncated = ([bool]$propagation.Truncated) -or ([bool]$scanResult.Truncated)
+
+    $itemList = New-Object System.Collections.ArrayList
+    foreach ($item in $propagation.Items) {
+        [void]$itemList.Add([ordered]@{
+                path   = [string]$item.Path
+                kind   = [string]$item.Kind
+                reason = [string]$item.Reason
+            })
+    }
+    $propagationErrors = New-Object System.Collections.ArrayList
+    foreach ($entry in $propagation.Errors) {
+        [void]$propagationErrors.Add([ordered]@{
+                path    = [string]$entry.Path
+                message = [string]$entry.Message
+            })
+    }
+
+    Write-Event -Fields ([ordered]@{
+            type           = 'result'
+            mode           = 'preview'
+            root           = $rootCheck.rootNormal
+            rootLabel      = [string]$scanResult.RootLabel
+            scanned        = [int]$scanResult.Scanned
+            hits           = [int]$scanResult.Hits
+            explicitCount  = [int]$scanResult.ExplicitCount
+            inheritedCount = [int]$scanResult.InheritedCount
+            scanMs         = [int]$scanResult.ScanMs
+            propagation    = ([ordered]@{
+                    candidates  = [int]$propagation.Candidates
+                    descendants = [int]$propagation.Descendants
+                    skippedDirs = [int]$propagation.SkippedDirs
+                    dataDir     = [int]$propagation.DataDir
+                    other       = [int]$propagation.Other
+                    uncertain   = [int]$propagation.Uncertain
+                    truncated   = [bool]$truncated
+                    items       = $itemList
+                    errors      = $propagationErrors
+                })
+            engineVersion  = $script:EngineVersion
+            durationMs     = [int]$stopwatch.ElapsedMilliseconds
+        })
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Argument normalization / entry point.
 # ---------------------------------------------------------------------------
 $script:SkipDirList = New-Object System.Collections.ArrayList
@@ -3870,6 +4368,7 @@ try {
         'Env' { $exitCode = Invoke-EnvMode }
         'Scan' { $exitCode = Invoke-ScanMode }
         'Repair' { $exitCode = Invoke-RepairMode }
+        'Preview' { $exitCode = Invoke-PreviewMode }
         default {
             Write-Fatal -Code 'invalid-arguments' -Message ('Unknown mode: ' + $Mode)
             $exitCode = 3

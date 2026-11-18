@@ -42,6 +42,15 @@
   through P/Invoke, DACL-less objects through the in-process temporary grant, and
   a 3000 grant-file fixture records the repair throughput (INFO).
 
+  Both modes also cover the read-only Preview mode (-Mode Preview) because it must
+  never write labels or artifacts: preview-clean asserts zero hits/candidates, exit
+  code 0, no hit events and no report/snapshot/data directory; preview-impact builds
+  an explicit-Low root with a hit directory, a node_modules Low file, an in-Root
+  DataDir Low file and a Medium file, then asserts hits/explicit/inherited,
+  propagation candidates/descendants/classifications, items/errors caps, legal
+  enumerate/analyze progress, unchanged label SDDLs and an untouched DataDir.
+  A missing -Root must exit 3 (Preview never uses exit code 2).
+
   Engine invocations use Windows PowerShell 5.1 when available (the engine must be
   5.1 compatible); -EngineHost overrides the executable. An additional Env parity
   run with pwsh 7 is performed when pwsh is available.
@@ -832,6 +841,172 @@ function Test-RepairProgressContract {
     foreach ($value in $totalValues) { if ($value -eq $expectedTotal) { $hasExpectedTotal = $true } }
     Test-Assert -Name ($NamePrefix + '-progress-repair-total') -Condition $hasExpectedTotal -Detail ('repair total values=' + (($totalValues | Sort-Object -Unique) -join ',') + ' result.hits=' + $expectedTotal)
     Test-Assert -Name ($NamePrefix + '-progress-repair-fixed') -Condition ($sawFixed -and ($maxFixed -eq $expectedFixed)) -Detail ('progress fixed max=' + $maxFixed + ' result.fixed=' + $expectedFixed)
+}
+
+# ---------------------------------------------------------------------------
+# Preview contract helpers:
+#   * read-only repair-impact estimate (no hit events, no artifacts, exit 0);
+#   * progress phases are enumerate/analyze, total is always null, hits stays the
+#     hit count;
+#   * result carries propagation{candidates,descendants,skippedDirs,dataDir,
+#     other,uncertain,truncated,items,errors} and its classifications must sum to
+#     candidates.
+# ---------------------------------------------------------------------------
+function Test-PreviewEventContract {
+    param($Run, [string]$NamePrefix)
+    Test-EventContract -Run $Run -NamePrefix $NamePrefix
+    $hitEvents = @(Get-EventsOfType $Run 'hit')
+    Test-Assert -Name ($NamePrefix + '-no-hit-events') -Condition ($hitEvents.Count -eq 0) -Detail ('hit events=' + $hitEvents.Count + ' (Preview must not stream hits)')
+    $allowed = @('progress', 'error', 'result', 'fatal')
+    $badTypes = New-Object System.Collections.ArrayList
+    foreach ($event in $Run.events) {
+        if ($allowed -notcontains [string]$event.type) { [void]$badTypes.Add([string]$event.type) }
+    }
+    Test-Assert -Name ($NamePrefix + '-preview-only-event-types') -Condition ($badTypes.Count -eq 0) -Detail ('unexpected event types: ' + (($badTypes | Sort-Object -Unique) -join ','))
+
+    $progressEvents = @(Get-EventsOfType $Run 'progress')
+    $allowedPhases = @('enumerate', 'analyze')
+    $badPhases = New-Object System.Collections.ArrayList
+    $fieldProblems = New-Object System.Collections.ArrayList
+    foreach ($progress in $progressEvents) {
+        $phase = [string]$progress.phase
+        if ($allowedPhases -notcontains $phase) { [void]$badPhases.Add($phase) }
+        foreach ($field in @('scanned', 'hits')) {
+            $state = Get-PropertyState -Object $progress -Property $field
+            if (-not $state.exists) { [void]$fieldProblems.Add($phase + '.' + $field + '=missing') }
+            elseif (-not (Test-IsNumericValue -Value $state.value)) { [void]$fieldProblems.Add($phase + '.' + $field + '=not-numeric') }
+        }
+        $totalState = Get-PropertyState -Object $progress -Property 'total'
+        if (-not $totalState.exists) {
+            [void]$fieldProblems.Add($phase + '.total=missing')
+        } elseif ($null -ne $totalState.value) {
+            [void]$fieldProblems.Add($phase + '.total must be null, got ' + [string]$totalState.value)
+        }
+    }
+    Test-Assert -Name ($NamePrefix + '-progress-phases') -Condition ($badPhases.Count -eq 0) -Detail ('unexpected phases: ' + (($badPhases | Sort-Object -Unique) -join ','))
+    Test-Assert -Name ($NamePrefix + '-progress-fields') -Condition ($fieldProblems.Count -eq 0) -Detail (($fieldProblems | Select-Object -First 5) -join '; ')
+    return $progressEvents
+}
+
+function Test-PreviewPropagationContract {
+    param($Result, [string]$NamePrefix)
+    $propState = Get-PropertyState -Object $Result -Property 'propagation'
+    Test-Assert -Name ($NamePrefix + '-propagation-present') -Condition $propState.exists -Detail ''
+    if (-not $propState.exists) { return $null }
+    $propagation = $propState.value
+    $required = @('candidates', 'descendants', 'skippedDirs', 'dataDir', 'other', 'uncertain', 'truncated', 'items', 'errors')
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($property in $required) {
+        if ($null -eq $propagation.PSObject.Properties[$property]) { [void]$missing.Add($property) }
+    }
+    Test-Assert -Name ($NamePrefix + '-propagation-fields') -Condition ($missing.Count -eq 0) -Detail ('missing: ' + ($missing -join ','))
+
+    $numericProblems = New-Object System.Collections.ArrayList
+    foreach ($field in @('candidates', 'descendants', 'skippedDirs', 'dataDir', 'other', 'uncertain')) {
+        $state = Get-PropertyState -Object $propagation -Property $field
+        if (-not $state.exists) { [void]$numericProblems.Add($field + '=missing') }
+        elseif (-not (Test-IsNumericValue -Value $state.value)) { [void]$numericProblems.Add($field + '=not-numeric') }
+        elseif ([long]$state.value -lt 0) { [void]$numericProblems.Add($field + '=negative') }
+    }
+    Test-Assert -Name ($NamePrefix + '-propagation-numbers') -Condition ($numericProblems.Count -eq 0) -Detail (($numericProblems | Select-Object -First 6) -join '; ')
+
+    $truncatedState = Get-PropertyState -Object $propagation -Property 'truncated'
+    $truncatedOk = $truncatedState.exists -and ($truncatedState.value -is [bool])
+    Test-Assert -Name ($NamePrefix + '-propagation-truncated-bool') -Condition $truncatedOk -Detail ('truncated=' + [string]$truncatedState.value)
+
+    $classified = [long]$propagation.skippedDirs + [long]$propagation.dataDir + [long]$propagation.other
+    Test-Assert -Name ($NamePrefix + '-propagation-classification-sum') -Condition ($classified -eq [long]$propagation.candidates) -Detail ('skippedDirs=' + [long]$propagation.skippedDirs + ' dataDir=' + [long]$propagation.dataDir + ' other=' + [long]$propagation.other + ' sum=' + $classified + ' candidates=' + [long]$propagation.candidates)
+
+    $items = @($propagation.items)
+    $errors = @($propagation.errors)
+    Test-Assert -Name ($NamePrefix + '-propagation-items-cap') -Condition ($items.Count -le 50) -Detail ('items=' + $items.Count + ' (max 50)')
+    Test-Assert -Name ($NamePrefix + '-propagation-errors-cap') -Condition ($errors.Count -le 20) -Detail ('errors=' + $errors.Count + ' (max 20)')
+    $itemProblems = New-Object System.Collections.ArrayList
+    $allowedReasons = @('skipped-dir', 'data-dir', 'other')
+    $allowedKinds = @('file', 'dir')
+    foreach ($item in $items) {
+        $pathState = Get-PropertyState -Object $item -Property 'path'
+        $kindState = Get-PropertyState -Object $item -Property 'kind'
+        $reasonState = Get-PropertyState -Object $item -Property 'reason'
+        if (-not $pathState.exists -or [string]::IsNullOrEmpty([string]$pathState.value)) { [void]$itemProblems.Add('path=missing') }
+        if (-not $kindState.exists -or $allowedKinds -notcontains [string]$kindState.value) { [void]$itemProblems.Add('kind=' + [string]$kindState.value) }
+        if (-not $reasonState.exists -or $allowedReasons -notcontains [string]$reasonState.value) { [void]$itemProblems.Add('reason=' + [string]$reasonState.value) }
+    }
+    Test-Assert -Name ($NamePrefix + '-propagation-item-fields') -Condition ($itemProblems.Count -eq 0) -Detail (($itemProblems | Select-Object -First 5) -join '; ')
+    return $propagation
+}
+
+function Test-PreviewResultContract {
+    param($Run, [string]$NamePrefix)
+    $result = Get-ResultEvent $Run
+    Test-Assert -Name ($NamePrefix + '-has-result') -Condition ($null -ne $result) -Detail ''
+    if ($null -eq $result) { return $null }
+    $required = @('type', 'mode', 'root', 'rootLabel', 'scanned', 'hits', 'explicitCount', 'inheritedCount', 'scanMs', 'propagation', 'engineVersion', 'durationMs')
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($property in $required) {
+        if ($null -eq $result.PSObject.Properties[$property]) { [void]$missing.Add($property) }
+    }
+    Test-Assert -Name ($NamePrefix + '-result-fields') -Condition ($missing.Count -eq 0) -Detail ('missing: ' + ($missing -join ','))
+    Test-Assert -Name ($NamePrefix + '-result-mode') -Condition ([string]$result.mode -eq 'preview') -Detail ('mode=' + [string]$result.mode)
+    Test-Assert -Name ($NamePrefix + '-result-version') -Condition ([string]$result.engineVersion -eq '0.1.0') -Detail ('engineVersion=' + [string]$result.engineVersion)
+    $numericProblems = New-Object System.Collections.ArrayList
+    foreach ($field in @('scanned', 'hits', 'explicitCount', 'inheritedCount', 'scanMs', 'durationMs')) {
+        $state = Get-PropertyState -Object $result -Property $field
+        if (-not $state.exists) { [void]$numericProblems.Add($field + '=missing') }
+        elseif (-not (Test-IsNumericValue -Value $state.value)) { [void]$numericProblems.Add($field + '=not-numeric') }
+        elseif ([double]$state.value -lt 0) { [void]$numericProblems.Add($field + '=negative') }
+    }
+    Test-Assert -Name ($NamePrefix + '-result-numbers') -Condition ($numericProblems.Count -eq 0) -Detail (($numericProblems | Select-Object -First 6) -join '; ')
+    Test-Assert -Name ($NamePrefix + '-result-counts') -Condition (([int]$result.explicitCount + [int]$result.inheritedCount) -eq [int]$result.hits) -Detail ('explicit=' + [int]$result.explicitCount + ' inherited=' + [int]$result.inheritedCount + ' hits=' + [int]$result.hits)
+    Test-PreviewPropagationContract -Result $result -NamePrefix $NamePrefix | Out-Null
+    return $result
+}
+
+function Find-ReadOnlyCleanDirectory {
+    $candidates = @(
+        (Join-Path $env:SystemRoot 'System32\drivers\etc'),
+        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\en-US'),
+        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Management')
+    )
+    foreach ($path in $candidates) {
+        if (-not [System.IO.Directory]::Exists($path)) { continue }
+        $info = Get-LabelInfo $path
+        if (-not $info.ok) { continue }
+        if ($info.level -eq 'Low') { continue }
+        return $path
+    }
+    return $null
+}
+
+function Get-SddlSnapshot {
+    param([string[]]$Paths)
+    $snapshot = @{}
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrEmpty($path)) { continue }
+        $info = Get-LabelInfo $path
+        $snapshot[([string]$path).ToLowerInvariant()] = @{ path = $path; sddl = [string]$info.sddl; level = [string]$info.level }
+    }
+    return $snapshot
+}
+
+function Test-SddlSnapshotUnchanged {
+    param($Before, [string]$NamePrefix)
+    $mismatches = New-Object System.Collections.ArrayList
+    foreach ($key in $Before.Keys) {
+        $info = Get-LabelInfo $Before[$key].path
+        if ([string]$info.sddl -ne [string]$Before[$key].sddl) {
+            [void]$mismatches.Add($Before[$key].path + ' before=' + [string]$Before[$key].sddl + ' after=' + [string]$info.sddl)
+        }
+    }
+    Test-Assert -Name ($NamePrefix + '-labels-unchanged') -Condition ($mismatches.Count -eq 0) -Detail (($mismatches | Select-Object -First 3) -join '; ')
+}
+
+function Get-DirectoryFileList {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or -not [System.IO.Directory]::Exists($Path)) { return @() }
+    $files = @([System.IO.Directory]::GetFiles($Path, '*', [System.IO.SearchOption]::AllDirectories))
+    [Array]::Sort($files, [System.StringComparer]::OrdinalIgnoreCase)
+    return $files
 }
 
 # ---------------------------------------------------------------------------
@@ -2022,6 +2197,175 @@ function Test-EngineParityPwsh7 {
 }
 
 # ---------------------------------------------------------------------------
+# Preview (read-only repair-impact estimate) - executed in FULL and SANDBOX
+# because Preview must never write labels or artifacts.
+# ---------------------------------------------------------------------------
+function Test-PreviewClean {
+    param($Fixtures)
+    $cleanRoot = $null
+    if ($script:FullMode) {
+        if ($null -ne $Fixtures -and -not [string]::IsNullOrEmpty([string]$Fixtures.cleanDir)) {
+            $cleanRoot = [string]$Fixtures.cleanDir
+        }
+    } else {
+        $cleanRoot = Find-ReadOnlyCleanDirectory
+    }
+    if ([string]::IsNullOrEmpty($cleanRoot)) {
+        Add-Skip -Name 'preview-clean' -Detail 'no readable non-Low reference directory available in this sandbox'
+        return
+    }
+
+    # A non-existent DataDir proves Preview creates nothing (no report/snapshot dir).
+    $dataDir = Join-Path $script:BaseDir 'data-preview-clean'
+    if ([System.IO.Directory]::Exists($dataDir)) { Remove-Tree -Path $dataDir }
+    $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Preview', '-Root', $cleanRoot, '-SkipDirs', 'node_modules', '-DataDir', $dataDir, '-Json')
+    $null = Test-PreviewEventContract -Run $run -NamePrefix 'preview-clean'
+    Test-Assert -Name 'preview-clean-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode + ' (Preview never uses 2)')
+    $result = Test-PreviewResultContract -Run $run -NamePrefix 'preview-clean'
+    if ($null -ne $result) {
+        Test-Assert -Name 'preview-clean-hits' -Condition ([int]$result.hits -eq 0) -Detail ('hits=' + [int]$result.hits + ' root=' + $cleanRoot)
+        Test-Assert -Name 'preview-clean-explicit' -Condition ([int]$result.explicitCount -eq 0) -Detail ('explicitCount=' + [int]$result.explicitCount)
+        Test-Assert -Name 'preview-clean-inherited' -Condition ([int]$result.inheritedCount -eq 0) -Detail ('inheritedCount=' + [int]$result.inheritedCount)
+        $propagation = $result.propagation
+        Test-Assert -Name 'preview-clean-candidates' -Condition ([int]$propagation.candidates -eq 0) -Detail ('candidates=' + [int]$propagation.candidates)
+        Test-Assert -Name 'preview-clean-descendants' -Condition ([int]$propagation.descendants -eq 0) -Detail ('descendants=' + [int]$propagation.descendants)
+        Test-Assert -Name 'preview-clean-items-empty' -Condition (@($propagation.items).Count -eq 0) -Detail ('items=' + @($propagation.items).Count)
+        Test-Assert -Name 'preview-clean-propagation-errors-empty' -Condition (@($propagation.errors).Count -eq 0) -Detail ('errors=' + @($propagation.errors).Count)
+        Test-Assert -Name 'preview-clean-uncertain' -Condition ([int]$propagation.uncertain -eq 0) -Detail ('uncertain=' + [int]$propagation.uncertain)
+        Test-Assert -Name 'preview-clean-truncated' -Condition ([bool]$propagation.truncated -eq $false) -Detail ('truncated=' + [bool]$propagation.truncated)
+    }
+    $reportCountAfter = Get-ScanReportFileCount -DataDir $script:ScanDataDir
+    Test-Assert -Name 'preview-clean-no-report' -Condition ($reportCountAfter -eq $reportCountBefore) -Detail ('reports before=' + $reportCountBefore + ' after=' + $reportCountAfter)
+    Test-Assert -Name 'preview-clean-no-datadir' -Condition (-not [System.IO.Directory]::Exists($dataDir)) -Detail ('dataDir exists=' + [System.IO.Directory]::Exists($dataDir) + ' path=' + $dataDir)
+    Test-Assert -Name 'preview-clean-no-reports-dir' -Condition (-not [System.IO.Directory]::Exists((Join-Path $dataDir 'reports'))) -Detail (Join-Path $dataDir 'reports')
+    Test-Assert -Name 'preview-clean-no-snapshots-dir' -Condition (-not [System.IO.Directory]::Exists((Join-Path $dataDir 'snapshots'))) -Detail (Join-Path $dataDir 'snapshots')
+}
+
+function Test-PreviewImpact {
+    $root = Join-Path $script:BaseDir 'preview-impact'
+    if ([System.IO.Directory]::Exists($root)) { Remove-Tree -Path $root }
+    New-FixtureDirectory $root
+    if ($script:FullMode) {
+        $setLow = Set-FixtureLabel -Path $root -LevelSpecification '(OI)(CI)Low'
+        Test-Assert -Name 'preview-impact-setup-low' -Condition ($setLow.exitCode -eq 0) -Detail $setLow.output
+        if ($setLow.exitCode -ne 0) { return }
+    }
+
+    # Children are created AFTER the root label so they inherit Low (FULL); in
+    # SANDBOX every object created here already inherits Low.
+    $hitDir = Join-Path $root 'hit-dir'
+    New-FixtureDirectory $hitDir
+    $hitFile = Join-Path $hitDir 'low-file.txt'
+    New-FixtureFile $hitFile 'low'
+    $skipDir = Join-Path $root 'node_modules'
+    New-FixtureDirectory $skipDir
+    $skipFile = Join-Path $skipDir 'skip-low.txt'
+    New-FixtureFile $skipFile 'low'
+    $dataDir = Join-Path $root 'data'
+    New-FixtureDirectory $dataDir
+    $dataFile = Join-Path $dataDir 'data-low.txt'
+    New-FixtureFile $dataFile 'low'
+    $mediumFile = Join-Path $root 'medium.txt'
+    New-FixtureFile $mediumFile 'medium'
+    if ($script:FullMode) {
+        $setMedium = Set-FixtureLabel -Path $mediumFile -LevelSpecification 'Medium'
+        Test-Assert -Name 'preview-impact-setup-medium' -Condition ($setMedium.exitCode -eq 0) -Detail $setMedium.output
+        if ($setMedium.exitCode -ne 0) { return }
+        Test-AssertLabel -Name 'preview-impact-setup-medium-label' -Path $mediumFile -ExpectedLevel 'Medium' -ExpectedExplicit $true
+    }
+    if ($script:FullMode) {
+        Test-AssertLabel -Name 'preview-impact-setup-hitdir-inherited' -Path $hitDir -ExpectedLevel 'Low' -ExpectedExplicit $false
+    }
+
+    # Expected values: scan sees root + hit-dir + low-file.txt + medium.txt =
+    # 4 objects (node_modules and the in-Root DataDir are excluded). The analysis
+    # walks the 7 descendants of root and classifies the 4 Low objects outside the
+    # hit set as 2 skipped-dir (node_modules + its file) and 2 data-dir (data + file).
+    $expectedHits = 4
+    $expectedExplicit = 0
+    if ($script:FullMode) {
+        $expectedHits = 3
+        $expectedExplicit = 1
+    }
+    $expectedDescendants = 7
+    $expectedCandidates = 4
+
+    $watched = @($root, $hitDir, $hitFile, $skipDir, $skipFile, $dataDir, $dataFile, $mediumFile)
+    $sddlBefore = Get-SddlSnapshot -Paths $watched
+    $dataFilesBefore = @(Get-DirectoryFileList -Path $dataDir)
+    $reportCountBefore = Get-ScanReportFileCount -DataDir $script:ScanDataDir
+
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Preview', '-Root', $root, '-SkipDirs', 'node_modules', '-DataDir', $dataDir, '-Json')
+    $progressEvents = @(Test-PreviewEventContract -Run $run -NamePrefix 'preview-impact')
+    Test-Assert -Name 'preview-impact-exit' -Condition ($run.exitCode -eq 0) -Detail ('exit=' + $run.exitCode + ' (Preview never uses 2, even with hits)')
+    $result = Test-PreviewResultContract -Run $run -NamePrefix 'preview-impact'
+    if ($null -ne $result) {
+        Test-Assert -Name 'preview-impact-root' -Condition (([string]$result.root).ToLowerInvariant().TrimEnd('\') -eq $root.ToLowerInvariant().TrimEnd('\')) -Detail ('root=' + [string]$result.root)
+        Test-Assert -Name 'preview-impact-scanned' -Condition ([int]$result.scanned -eq 4) -Detail ('scanned=' + [int]$result.scanned + ' expected=4')
+        Test-Assert -Name 'preview-impact-hits' -Condition ([int]$result.hits -eq $expectedHits) -Detail ('hits=' + [int]$result.hits + ' expected=' + $expectedHits)
+        Test-Assert -Name 'preview-impact-explicit' -Condition ([int]$result.explicitCount -eq $expectedExplicit) -Detail ('explicitCount=' + [int]$result.explicitCount + ' expected=' + $expectedExplicit)
+        Test-Assert -Name 'preview-impact-inherited' -Condition ([int]$result.inheritedCount -eq ($expectedHits - $expectedExplicit)) -Detail ('inheritedCount=' + [int]$result.inheritedCount + ' expected=' + ($expectedHits - $expectedExplicit))
+
+        $propagation = $result.propagation
+        Test-Assert -Name 'preview-impact-candidates' -Condition ([int]$propagation.candidates -eq $expectedCandidates) -Detail ('candidates=' + [int]$propagation.candidates + ' expected=' + $expectedCandidates)
+        Test-Assert -Name 'preview-impact-candidates-at-least-two' -Condition ([int]$propagation.candidates -ge 2) -Detail ('candidates=' + [int]$propagation.candidates)
+        Test-Assert -Name 'preview-impact-descendants' -Condition ([int]$propagation.descendants -eq $expectedDescendants) -Detail ('descendants=' + [int]$propagation.descendants + ' expected=' + $expectedDescendants)
+        Test-Assert -Name 'preview-impact-skipped-dirs' -Condition ([int]$propagation.skippedDirs -ge 1) -Detail ('skippedDirs=' + [int]$propagation.skippedDirs)
+        Test-Assert -Name 'preview-impact-data-dir' -Condition ([int]$propagation.dataDir -ge 1) -Detail ('dataDir=' + [int]$propagation.dataDir)
+        Test-Assert -Name 'preview-impact-other' -Condition ([int]$propagation.other -eq 0) -Detail ('other=' + [int]$propagation.other)
+        Test-Assert -Name 'preview-impact-uncertain' -Condition ([int]$propagation.uncertain -eq 0) -Detail ('uncertain=' + [int]$propagation.uncertain)
+        Test-Assert -Name 'preview-impact-truncated' -Condition ([bool]$propagation.truncated -eq $false) -Detail ('truncated=' + [bool]$propagation.truncated)
+        $items = @($propagation.items)
+        Test-Assert -Name 'preview-impact-items' -Condition ($items.Count -eq $expectedCandidates) -Detail ('items=' + $items.Count + ' expected=' + $expectedCandidates)
+        $itemReasons = @($items | ForEach-Object { [string]$_.reason })
+        Test-Assert -Name 'preview-impact-items-have-skipped' -Condition ($itemReasons -contains 'skipped-dir') -Detail ('reasons=' + ($itemReasons -join ','))
+        Test-Assert -Name 'preview-impact-items-have-data' -Condition ($itemReasons -contains 'data-dir') -Detail ('reasons=' + ($itemReasons -join ','))
+        Test-Assert -Name 'preview-impact-propagation-errors' -Condition (@($propagation.errors).Count -eq 0) -Detail ('errors=' + @($propagation.errors).Count)
+
+        $enumerateEvents = @($progressEvents | Where-Object { [string]$_.phase -eq 'enumerate' })
+        $analyzeEvents = @($progressEvents | Where-Object { [string]$_.phase -eq 'analyze' })
+        Test-Assert -Name 'preview-impact-progress-enumerate' -Condition ($enumerateEvents.Count -gt 0) -Detail ('enumerate events=' + $enumerateEvents.Count)
+        Test-Assert -Name 'preview-impact-progress-analyze' -Condition ($analyzeEvents.Count -gt 0) -Detail ('analyze events=' + $analyzeEvents.Count)
+        $hitsMismatch = New-Object System.Collections.ArrayList
+        foreach ($progress in $progressEvents) {
+            if ([int]$progress.hits -ne [int]$result.hits) { [void]$hitsMismatch.Add([string]$progress.phase + '=' + [int]$progress.hits) }
+        }
+        Test-Assert -Name 'preview-impact-progress-hits' -Condition ($hitsMismatch.Count -eq 0) -Detail ('expected hits=' + [int]$result.hits + ' got ' + (($hitsMismatch | Select-Object -First 5) -join ','))
+        if ($enumerateEvents.Count -gt 0) {
+            $lastEnumerate = $enumerateEvents[$enumerateEvents.Count - 1]
+            Test-Assert -Name 'preview-impact-progress-enumerate-final' -Condition ([int]$lastEnumerate.scanned -eq [int]$result.scanned) -Detail ('last enumerate scanned=' + [int]$lastEnumerate.scanned + ' result.scanned=' + [int]$result.scanned)
+        }
+        if ($analyzeEvents.Count -gt 0) {
+            $lastAnalyze = $analyzeEvents[$analyzeEvents.Count - 1]
+            Test-Assert -Name 'preview-impact-progress-analyze-final' -Condition ([int]$lastAnalyze.scanned -eq [int]$propagation.descendants) -Detail ('last analyze scanned=' + [int]$lastAnalyze.scanned + ' descendants=' + [int]$propagation.descendants)
+        }
+    }
+
+    # Read-only assertions: labels, DataDir contents and report artifacts must be
+    # byte-for-byte unchanged after the preview run.
+    Test-SddlSnapshotUnchanged -Before $sddlBefore -NamePrefix 'preview-impact'
+    $dataFilesAfter = @(Get-DirectoryFileList -Path $dataDir)
+    Test-Assert -Name 'preview-impact-datadir-files-unchanged' -Condition (($dataFilesBefore -join '|') -eq ($dataFilesAfter -join '|')) -Detail ('before=' + ($dataFilesBefore -join ';') + ' after=' + ($dataFilesAfter -join ';'))
+    Test-Assert -Name 'preview-impact-no-reports-dir' -Condition (-not [System.IO.Directory]::Exists((Join-Path $dataDir 'reports'))) -Detail (Join-Path $dataDir 'reports')
+    Test-Assert -Name 'preview-impact-no-snapshots-dir' -Condition (-not [System.IO.Directory]::Exists((Join-Path $dataDir 'snapshots'))) -Detail (Join-Path $dataDir 'snapshots')
+    $reportCountAfter = Get-ScanReportFileCount -DataDir $script:ScanDataDir
+    Test-Assert -Name 'preview-impact-no-report' -Condition ($reportCountAfter -eq $reportCountBefore) -Detail ('reports before=' + $reportCountBefore + ' after=' + $reportCountAfter)
+}
+
+function Test-PreviewFatalMissingRoot {
+    $missing = Join-Path $script:BaseDir ('preview-missing-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $run = Invoke-Engine -EngineArguments @('-Mode', 'Preview', '-Root', $missing, '-Json')
+    Test-Assert -Name 'preview-fatal-exit' -Condition ($run.exitCode -eq 3) -Detail ('exit=' + $run.exitCode + ' (Preview must use 3, never 2)')
+    $fatalEvents = @(Get-EventsOfType $run 'fatal')
+    Test-Assert -Name 'preview-fatal-event' -Condition ($fatalEvents.Count -eq 1) -Detail ('fatal events=' + $fatalEvents.Count)
+    if ($fatalEvents.Count -gt 0) {
+        Test-Assert -Name 'preview-fatal-code' -Condition ([string]$fatalEvents[0].code -eq 'root-not-found') -Detail ('code=' + [string]$fatalEvents[0].code)
+    }
+    Test-Assert -Name 'preview-fatal-no-result' -Condition (@(Get-EventsOfType $run 'result').Count -eq 0) -Detail ''
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 Write-Host '============================================================'
@@ -2160,6 +2504,11 @@ try {
 
     # ---- DataDir inside -Root must be excluded from traversal -------------
     Test-DataDirExclusion
+
+    # ---- Preview: read-only repair-impact estimate (FULL and SANDBOX) -----
+    Test-PreviewClean -Fixtures $fixtures
+    Test-PreviewImpact
+    Test-PreviewFatalMissingRoot
 
     # ---- FULL-only: directory label propagation observation ---------------
     if ($script:FullMode) {

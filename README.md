@@ -26,6 +26,7 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
   - **深度模式**：面板里的「深度扫描（逐文件清单）」开关，输出全部命中（含继承项），适合排查或需要逐文件清单时使用。
 - **命中口径**：区分「显式设置」与「继承自父级」，并在面板中说明继承项可能随父级恢复（Windows 不保证自动传播）。
 - **清单查看与导出**：面板内分页查看命中清单（路径 / 类型 / 显式或继承 / 复制完整路径）；扫描命中时引擎直接写出完整 JSON 报告，导出即返回该文件路径；0 命中不生成报告，导出会提示 `no-report`。
+- **清除前影响预览（dry-run）**：点「一键清除」时先跑一次只读预览——复用修复的命中扫描，再遍历每个命中目录的后代，统计「有效标签为 Low、但不在修复命中集里」的对象；面板先显示「正在评估影响…」，确认条给出「直接修复 N 项」以及可能因目录继承被一并改为 Medium 的数量（按跳过目录 / 产物目录 / 其他分类）。预览不写标签、不写报告/快照、不建目录；数量是**估算**，且这些对象不在快照内、无法用恢复脚本回滚。预览失败会自动退回原来的确认条，不阻塞清除。
 - **一键清除**：修复在引擎内一次完成——扫描命中并写出快照 → 单遍逐对象把标签设为 Medium（目录 `(OI)(CI)Medium`、文件 `Medium`）→ 每个对象改完立即复读验证 → 只对失败候选再复验一次。修复阶段不再逐条输出命中，也不再整遍复扫。
 - **权限降级路径**：遇到对象缺少 `WRITE_OWNER`（DSH 沙箱创建的常见情况）且当前用户是对象 owner 时，在进程内临时授予 `WRITE_OWNER` → 改标签 → 还原原 DACL，并复读 SDDL **逐字符比较**确认还原一致；失败时记录可读诊断（Repair 不再逐对象回退 `icacls`；`icacls` 只在环境能力探测与恢复脚本里使用）。
 - **快照与恢复**：清除前保存命中对象的标签快照与 `restore-*.ps1`；可随时把对象恢复为 Low。清除结果里的「快照文件」行有 **打开文件夹** 按钮，可直接打开快照所在目录（Host 只允许打开该任务产物目录下的 `snapshots`）。
@@ -33,7 +34,7 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
 - **产物目录可配置**：默认产物写在 `%DSH_HOME%\low-integrity-check\`；可在 DSH **设置 → 文件完整性检查** 里输入或选择其他本地目录，保存后从下一次检查/清除开始生效，面板底部显示当前目录。
 - **自动清理过期产物**：设置页可选保留 **3 / 7 / 15 / 30 天或自定义 1–3650 天**（默认 30）；只清理**当前产物目录**下 `reports\`（`scan-*.json`）与 `snapshots\`（`snapshot-*.json`、`restore-*.ps1`）中严格命名的引擎产物，不递归、不删目录、不碰其他文件；最近 15 分钟的新文件与仍被任务引用的文件受保护。插件激活后、每个任务结束、每 6 小时与保存设置后自动执行，设置页显示上次清理时间/删除数/释放空间。
 - **会话行紫点提醒**：由本会话发起的检查/清除任务结束（成功 / 失败 / 取消）且尚未查看时，左侧会话列表该行的状态圆圈位置显示一个紫色实心圆点（悬停提示「点击会话行标记为已读」）；点击该会话行后恢复原样。已读状态只记录在浏览器 `sessionStorage`，不写入工作区或 Host 配置。2026-11-08 经用户真机验证：任务结束显示紫点、点击会话行恢复原样。
-- **进度体验**：运行中显示阶段（扫描 / 修复 / 验证）、已扫描或已修复数量、扫描速率与预计剩余时间（total 已知时），随时可取消；修复进度按批合并，不再每个对象一行。
+- **进度体验**：运行中显示阶段（扫描 / 修复 / 验证；清除前预览显示「正在评估影响…」）、已扫描或已修复数量、扫描速率与预计剩余时间（total 已知时），随时可取消；修复进度按批合并，不再每个对象一行。
 - **安全约束**：只接受 DSH 已注册工作区的规范化路径；拒绝盘根、用户主目录及其宽泛子目录、DSH 安装目录、相对路径；HTTP 只接受同源请求；产物目录同样由 Host 校验（带盘符绝对路径、工作区外、非盘根/用户主目录/DSH 数据与安装目录）。
 
 ## 使用
@@ -44,7 +45,7 @@ DSH 以 `workspace-write` 模式打开工作区时，会在磁盘安全描述符
    - 未命中：显示「未发现 Low 标签」；
    - 命中：显示「发现 N 个 Low 对象（X 显式 / Y 继承自父级）」，可展开清单、导出 JSON。
      快速模式下清单只列显式项，继承项显示为聚合说明；需要逐文件清单时切到深度模式再扫描。
-4. 点击 **一键清除** → 确认条（含预计修复对象数、快照/恢复提示、活跃会话风险提示）→ 执行。清除过程显示「扫描 / 修复标签 / 复扫验证」阶段与已修复数量。
+4. 点击 **一键清除** → 先跑只读影响预览（面板显示「正在评估影响…」）→ 确认条（「直接修复 N 项」、可能因继承被改的数量与分类、快照/恢复提示、活跃会话风险提示）→ 执行。清除过程显示「扫描 / 修复标签 / 复扫验证」阶段与已修复数量。
 5. 结果显示「清除成功（N 项）」或「清除失败（N 项失败）」；失败项在面板内给出原因与可读诊断（不再生成日志文件）。面板的「复扫」提示来自引擎对失败候选的终验（修复后不再整遍复扫），需要完整确认时可点「重新扫描」。
 
 > 提醒：只要还有 `workspace-write` 会话在写入，DSH 可能再次给工作区写入 Low 标签。插件不改变沙箱行为，也不承诺标签不再复发。
@@ -75,7 +76,7 @@ plugin_manager install_bundle  D:\path\to\dsh-file-integrity-check
 
 ```
 右侧栏面板 (client.js, React.createElement)
-   │ 同源 fetch  /dsh-file-integrity-check/*（quick / deep / repair / settings）
+   │ 同源 fetch  /dsh-file-integrity-check/*（quick / deep / repair / preview / settings）
    ▼
 Host 插件 (index.js, Cordis)
    │ 1. workspaceRegistry 解析会话所属工作区（客户端不传路径）
@@ -85,11 +86,12 @@ Host 插件 (index.js, Cordis)
    │ 5. spawn 隐藏 powershell.exe（windowsHide，非 DSH 会话；传 -DataDir）
    │ 6. 自动清理：激活约 10s / 每个任务终态 / 每 6h / 保存设置后，只删白名单产物
    ▼
-引擎 (engine/integrity.ps1)  -Mode Env|Scan|Repair  -ScanDepth quick|deep  -DataDir <产物目录>
+引擎 (engine/integrity.ps1)  -Mode Env|Scan|Repair|Preview  -ScanDepth quick|deep  -DataDir <产物目录>
    │ Scan quick：内嵌 C# 扫描器（FindFirstFileExW + 标签读取 + 判定）
    │ Scan deep ：原 PowerShell 全量遍历
    │ Repair    ：内嵌 C# RepairSession（单遍扫描+快照 → 单遍修复 → 失败候选复验）
-   │ JSON Lines：env / progress / hit / error / result / fatal（Repair 不发 hit）
+   │ Preview   ：只读：复用 Repair 命中扫描（不写快照）→ 遍历命中目录后代估算继承传播范围
+   │ JSON Lines：env / progress / hit / error / result / fatal（Repair 与 Preview 不发 hit）
    │ Scan 命中时直写 <DataDir>\reports\scan-*.json（result.reportPath；0 命中不写；DataDir 可配置）
    ▼
 Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
@@ -104,6 +106,7 @@ Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
 - **修复顺序**：按「对象类型 + 路径深度」分波推进（目录波→文件波，波内并行、波间串行，同波内无祖先/后代）；每个命中对象只修一次，改完立即复读验证；不使用 `/T` 全树，避免改动非命中对象。
 - **修复快路径**：C# 进程内 `SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)` 直接设标签（`methods.native`）；Access denied 且当前用户是 owner 时走进程内临时授权：一次读取 owner+DACL → 授权 → 设标签 → 还原 → 一次复读逐字符比较（`methods.grant`）。阶段 5 起「还原 DACL」与「写标签」合并为一次 `SetNamedSecurityInfo`；阶段 6 起默认 8 线程并行（按 kind+depth 分波）。失败只记录可读诊断，不再 spawn `icacls`。
 - **终验只覆盖失败候选**：修复结束后只复读失败候选；若候选已因父级恢复传播变为 Medium，则不计入失败。
+- **清除前影响预览（只读）**：引擎 `-Mode Preview` 复用 Repair 的命中扫描（快照路径传 null，不写快照），再遍历每个命中目录的后代，把「有效 Low、但不在修复命中集」的对象计为候选；分类优先级 `data-dir` > `skipped-dir` > `other`，列表上限 50 条、读取失败上限 20 条、后代检查上限 200000（超限置 `truncated`）；不发 `hit`，`progress` 只有 `enumerate`/`analyze`，退出码只用 `0`/`3`。预览不写标签、报告、快照或目录。
 - **长路径/中文**：枚举与 P/Invoke 使用 `\\?\` 前缀；stdout 为 UTF-8 无 BOM 的 JSON Lines；支持中文、空格与 >260 字符路径。
 - **跳过**：默认跳过 `.git`、`node_modules`、`.pnpm-store`；不跟随 junction / 符号链接。
 - **产物目录配置**：Host 从插件 Config 读取 `dataDir`（空串 = 默认；`volatile`，保存后无需重载插件），每次任务开始时重新解析并固定到 `job.dataDir`，再传给引擎 `-DataDir`；`/open-folder` 用同一固定值做根校验。配置值在 Host 侧经 `lib/datadir.js` 校验（带盘符绝对路径、工作区外、非盘根/用户主目录/DSH 数据或安装目录，保存时探测可写）。
@@ -128,7 +131,7 @@ Host 累积摘要 + 首屏 200 条 → 面板 800ms 轮询
 ## 开发与测试
 
 ```powershell
-# 语法与单测（105 项：路径安全 / 产物目录 / 自动清理 / 任务管理 / 引擎协议 / HTTP 路由）
+# 语法与单测（117 项：路径安全 / 产物目录 / 自动清理 / 任务管理 / 引擎协议 / HTTP 路由）
 npm test
 
 # 语法检查（9 个 JS 文件，含 lib/datadir.js、lib/cleanup.js）
@@ -138,17 +141,17 @@ npm run check
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 ```
 
-`test/run-fixtures.ps1` 会自动探测标签写权限：可写则跑 FULL（含修复成功、恢复回滚、继承传播实验、native/grant 修复快路径、Repair 事件/进度/结果契约、并行基准、报告文件与 0 命中产物断言（命中时写报告；0 命中 `reportPath` 为空且不新增报告文件、不建 `snapshots` 目录）、DataDir 排除等）；不可写则跑沙箱内可测子集并标注 SKIP。产物目录配置与自动清理（Config / 设置页 / `/settings` 路由 / `lib/datadir.js` / `lib/cleanup.js`）属 Host 侧逻辑，由 Node 单测覆盖，不在引擎夹具里。
+`test/run-fixtures.ps1` 会自动探测标签写权限：可写则跑 FULL（含修复成功、恢复回滚、继承传播实验、native/grant 修复快路径、Repair 事件/进度/结果契约、并行基准、报告文件与 0 命中产物断言（命中时写报告；0 命中 `reportPath` 为空且不新增报告文件、不建 `snapshots` 目录）、DataDir 排除等）；不可写则跑沙箱内可测子集并标注 SKIP。**两种模式都会跑只读的 Preview 夹具**（`preview-clean` / `preview-impact` / `preview-fatal`），断言预览前后标签 SDDL 不变、不新增 `reports`/`snapshots` 产物、不创建 DataDir。产物目录配置与自动清理（Config / 设置页 / `/settings` 路由 / `lib/datadir.js` / `lib/cleanup.js`）属 Host 侧逻辑，由 Node 单测覆盖，不在引擎夹具里。
 
-开发验收结果（DSH 0.2.2-rc.1 / Windows 11；2026-11-13 复跑核对）：
+开发验收结果（DSH 0.2.2-rc.1 / Windows 11；2026-11-15 复跑核对）：
 
-- 引擎夹具（2026-11-13 复跑）：SANDBOX **PASS=230 / FAIL=0 / SKIP=8 / INFO=4**（DSH 工具沙箱内，PS 5.1 + pwsh 7 双宿主）；FULL **PASS=332 / FAIL=0 / SKIP=1 / INFO=9**（沙箱外；唯一 SKIP 为需拒绝写标签的失败路径，由同日 SANDBOX 覆盖）。
-- Node / Host 测试：**105 项**（2026-11-13；**104 pass + 1 skip**；paths 15 / datadir 25 / cleanup 23 / jobs 23 / engine 6 / routes 13；skip 为 file symlink 需开发者模式，本机 EPERM），`npm run check` 通过（9 个 JS 文件）。
+- 引擎夹具（2026-11-15 复跑）：SANDBOX **PASS=318 / FAIL=0 / SKIP=8 / INFO=4**（DSH 工具沙箱内，PS 5.1 + pwsh 7 双宿主）；FULL **PASS=424 / FAIL=0 / SKIP=1 / INFO=9**（沙箱外；唯一 SKIP 为需拒绝写标签的失败路径，由同日 SANDBOX 覆盖）。
+- Node / Host 测试：**117 项**（2026-11-15；**116 pass + 1 skip**；paths 15 / datadir 25 / cleanup 23 / jobs 30 / engine 9 / routes 15；skip 为 file symlink 需开发者模式，本机 EPERM），`npm run check` 通过（9 个 JS 文件）。
 - 性能（阶段口径与完整数据见维护文档 HANDOFF）：
-  - **扫描**：真实 122,575 项 quick **≈7s**（C# 扫描器）；2000 文件夹具 quick ≈1.7s vs deep ≈25s。
+  - **扫描**：真实 122,575 项 quick **≈7s**（C# 扫描器）；2000 文件夹具 quick ≈1.5s vs deep ≈10.2s（2026-11-15：`quickWallMs=1,473` / `deepWallMs=10,165`）。
   - **修复（阶段 4，顺序版基线，真实 114k）**：110,133 命中 **≈25min**（≈13.6ms/对象），其中扫描 7.1s、快照 0.43s、restore 10.5s；瓶颈是逐对象临时 WRITE_OWNER 授权。
   - **阶段 5**：临时授权把「还原 DACL + 写标签」合并为一次 `SetNamedSecurityInfo`（每对象 SD 写 3→2），FULL 断言合并写生效（`grantFallbacks=0`）。
-  - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）；2026-11-13 复跑 `perGrantFileMs=2.26`、`repairWallMs=6,777`。真实 114k 复测预计 **≈14min** 量级（待回填）。
+  - **阶段 6**：按「对象类型 + 路径深度」分波、波内 8 线程并行修复；FULL 3000-grant 基准 `perGrantFileMs 4.06→2.22`，修复 **1.83×**（16 线程仅 1.87×，争用饱和，默认 8）；2026-11-15 复跑 `perGrantFileMs=2.14`、`repairWallMs=6,418`、`grantFallbacks=0`、`hits=3022`。真实 114k 复测预计 **≈14min** 量级（待回填）。
 - 真实工作区（历史，阶段 1 前）：修复前 24 命中，清除后复扫 **0 命中**、根与文件均为 Medium，非命中 DACL 抽样逐字符一致。
 - 真实修复复核（2026-11-13）：2026-11-12 由面板修复的工作区只读复扫 **0 命中**、根标签 Medium，与快照/restore 产物一致。
 
@@ -165,7 +168,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\run-fixtures.ps1
 - Repair 为 C# 流水线 + 并行修复（阶段 6，默认 8 线程）：顺序版真实 114k 实测 ≈25min（≈13.6ms/对象），并行版 FULL 基准 **1.83×**（真实 114k 待复测，预计 ≈14min）；在真实复测回填前不要承诺更短时长。
 - 修复的终验只覆盖失败候选，不再整遍复扫；需要完整确认时可点「重新扫描」。继承项可能随父级恢复，但 Windows 不保证自动传播。
 - 修复扫描已用 `GetAce` 直读标签；quick 扫描仍走 SDDL 解析，换用 `GetAce` 的收益在 5,021 项夹具上未观察到（928 vs 922ms），是否切换待 benchmark。
-- 修复 Low 目录时会写入可继承的 `(OI)(CI)Medium` 标签；Windows 可能把该继承标签传播到其下已存在的子对象（包括本次跳过的 `node_modules`、数据目录内的子项和非命中子项）。FULL 验收会记录实际影响；在确认前不要把「非命中对象完全不变」当成承诺。
+- 修复 Low 目录时会写入可继承的 `(OI)(CI)Medium` 标签；Windows 可能把该继承标签传播到其下已存在的子对象（包括本次跳过的 `node_modules`、数据目录内的子项和非命中子项）。FULL 验收会记录实际影响，面板的清除前影响预览会给出估算范围；在确认前不要把「非命中对象完全不变」当成承诺。
+- **清除前影响预览是估算，不是承诺**：候选（`candidates`）只表示「命中目录后代里有效 Low 但不在修复命中集」的对象数量，用于判断继承传播的量级；这些对象不在快照/恢复脚本内，**无法用恢复脚本回滚**。预览的 122k 规模性能**未验证**（只在 10,101 对象的临时基准上跑过，且那是全命中树，未覆盖「大量非命中后代逐个读标签」的最坏路径）；`items`（50）/`errors`（20）/`uncertain`/`truncated` 的上限与异常路径未被夹具强制触发；面板上的预览 → 确认条 → 清除 / 失败降级 / 取消流程**尚未真机验证**（需重启 DSH 后人工点）。
 - 零命中不产生产物：扫描 0 命中不写报告（`reportPath` 为空、不建 `reports` 目录），修复 0 命中不写快照/恢复脚本（`snapshotPath`/`restorePath` 为空、不建 `snapshots` 目录）。
 - 产物目录/保留天数设置：**2026-11-08 真机已验证** `configEditor` 写 profile patch + volatile 持久化（profile 中为 `dataDir=D:\low-integrity-check`、`retentionDays=3`）、`GET /settings` 与 `/diagnostics` 返回、Config schema 投影（inspector `status=schema`）、设置页注册（`settings.section` id `low-integrity` order 50）并被实际使用；**页面视觉/文案、「选择文件夹」真机行为、真实任务 → 新 `-DataDir` 联调仍待人工确认**；不做 `realpath`，junction/符号链接指向受保护目录的绕过属已知口径。
 - 自动清理真机验证（2026-11-08）：① 激活后触发已产生 `lastCleanup`；② 保存设置后触发——在 `D:\low-integrity-check\reports` 放 2020 年假报告 `scan-20200101-000000-abcdef.json` 与用户文件 `notes.txt`，`POST /settings {retentionDays:3}` 后 4 秒内假报告被删（`lastCleanup.deletedCount=1`、`freedBytes=15`），`notes.txt` 原样保留（测试文件随后已清理）。**仍未验证**：每 6 小时与任务终态触发在真机上的时间行为；file symlink 防护（本机无开发者模式，测试 1 skip）；真实大目录、并发写报告、网络盘；设置页视觉/文案待人工确认。非法 `retentionDays` 会回退默认 30 天并在 `/diagnostics` 报 `retentionError`。
@@ -183,10 +187,10 @@ lib/
   paths.js                工作区解析与路径安全
   datadir.js              产物目录默认值/安全校验/可写性探测
   cleanup.js              过期产物自动清理（白名单/realpath 防护/保护窗口）
-  jobs.js                 任务管理（互斥/超时/取消/导出；job.dataDir 固定；终态回调）
-  engine.js               spawn 隐藏 PowerShell + JSONL 解析（engineInvocation 拼 argv）
-client.js                 右侧栏面板 + DSH 设置页「文件完整性检查」（产物目录 + 自动清理）+ 会话行未读紫点（纯 JS，无 JSX / 无平台包依赖）
-engine/integrity.ps1      Env / Scan / Repair 引擎（PS 5.1 兼容；quick 与 Repair 用内嵌 C#）
+  jobs.js                 任务管理（scan / repair / preview；互斥/超时/取消/导出；job.dataDir 固定；终态回调）
+  engine.js               spawn 隐藏 PowerShell + JSONL 解析（engineInvocation 拼 argv；Preview 不转发 -ScanDepth）
+client.js                 右侧栏面板 + DSH 设置页「文件完整性检查」（产物目录 + 自动清理）+ 会话行未读紫点 + 清除前影响预览确认条（纯 JS，无 JSX / 无平台包依赖）
+engine/integrity.ps1      Env / Scan / Repair / Preview 引擎（PS 5.1 兼容；quick、Repair 与 Preview 用内嵌 C#）
 locale/                   插件管理器展示文案
 test/                     Node 单测与引擎夹具验收
 ```

@@ -26,8 +26,9 @@
  *                                                     dataDir 传 '' 恢复默认；retentionDays 为 1..3650 的整数；
  *                                                     两个字段都可选、至少一个；失败码见 KNOWN_ERROR_CODES
  *   POST /workspace { sessionId }                  → { ok, workspace, sessionCount, liveAgentCount, warnings }
- *   POST /jobs { action: 'scan'|'repair', sessionId } → { ok, jobId }
- *   GET  /jobs/:id                                 → { ok, job }
+ *   POST /jobs { action: 'scan'|'repair'|'preview', sessionId } → { ok, jobId }
+ *   GET  /jobs/:id                                 → { ok, job }；preview 任务的
+ *                                                    job.preview = snapshot.preview
  *   GET  /jobs/:id/items?offset=&limit=            → { ok, jobId, offset, limit, total, items }
  *   POST /jobs/:id/cancel | /export                → { ok } / { ok, path }
  * 所有请求都相对于「文档挂载前缀 + ROUTE_SEGMENT」；ROUTE_SEGMENT 必须与宿主
@@ -237,6 +238,17 @@
     'repair.failuresMore': '另有 {count} 条失败未显示',
     'repair.startFailed': '无法启动清除：{message}',
 
+    'repair.preview.running': '正在评估影响…',
+    'repair.preview.cancel': '取消评估',
+    'repair.preview.fixCount': '直接修复 {count} 项',
+    'repair.preview.candidates': '另有 {count} 项可能因目录继承被一并改为 Medium（跳过目录 {skippedDirs} / 产物目录 {dataDir} / 其他 {other}）。',
+    'repair.preview.noRollback': '这些对象不在快照中，无法用恢复脚本回滚。',
+    'repair.preview.truncated': '结果被截断，可能还有未列出的对象。',
+    'repair.preview.uncertain': '{count} 个对象无法判定，结果可能不完整。',
+    'repair.preview.failed': '未能评估影响：{message}',
+    'repair.preview.failedUnknown': '未获取到评估结果',
+    'repair.preview.fallbackHint': '仍可继续清除，但无法预知继承传播范围。',
+
     'artifact.export': '清单文件',
     'artifact.report': '引擎报告',
     'artifact.copy': '复制路径',
@@ -434,6 +446,17 @@
     'repair.failures': 'Failures',
     'repair.failuresMore': '{count} more failures not shown',
     'repair.startFailed': 'Cannot start clear: {message}',
+
+    'repair.preview.running': 'Assessing impact…',
+    'repair.preview.cancel': 'Cancel assessment',
+    'repair.preview.fixCount': 'Repairs {count} items directly',
+    'repair.preview.candidates': '{count} more items may be changed to Medium through directory inheritance (skipped dirs {skippedDirs} / artifact dir {dataDir} / other {other}).',
+    'repair.preview.noRollback': 'These objects are not in the snapshot and cannot be rolled back by the restore script.',
+    'repair.preview.truncated': 'The result was truncated; some objects may be missing.',
+    'repair.preview.uncertain': '{count} objects could not be determined; the result may be incomplete.',
+    'repair.preview.failed': 'Could not assess impact: {message}',
+    'repair.preview.failedUnknown': 'no assessment result was returned',
+    'repair.preview.fallbackHint': 'You can still continue, but the inheritance scope is unknown.',
 
     'artifact.export': 'List file',
     'artifact.report': 'Engine report',
@@ -1118,6 +1141,33 @@
   }
 
   /**
+   * 归一化 preview 任务的影响评估（Host snapshot.preview）；首次轮询前可能不存在。
+   *
+   * 契约形状：{ hits, explicitCount, inheritedCount, scanMs, candidates, descendants,
+   * skippedDirs, dataDir, other, uncertain, truncated, items, errors }。面板只用到计数与
+   * truncated，其余字段保持可选、缺失时按 0/false 展示，坏值不抛错。
+   *
+   * @param raw - 任意值。
+   * @returns 稳定的预览形状或 null（不可用）。
+   */
+  function normalizePreview(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    return {
+      hits: asNumber(raw.hits),
+      explicitCount: asNumber(raw.explicitCount),
+      inheritedCount: asNumber(raw.inheritedCount),
+      scanMs: asNumber(raw.scanMs),
+      candidates: asNumber(raw.candidates),
+      descendants: asNumber(raw.descendants),
+      skippedDirs: asNumber(raw.skippedDirs),
+      dataDir: asNumber(raw.dataDir),
+      other: asNumber(raw.other),
+      uncertain: asNumber(raw.uncertain),
+      truncated: raw.truncated === true,
+    };
+  }
+
+  /**
    * 归一化 job 对象；缺 id 视为不可用。
    *
    * @param raw - 响应 JSON 里的 job。
@@ -1131,7 +1181,7 @@
     if (status !== 'running' && status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') {
       status = 'failed';
     }
-    var action = raw.action === 'repair' ? 'repair' : 'scan';
+    var action = raw.action === 'repair' ? 'repair' : raw.action === 'preview' ? 'preview' : 'scan';
     return {
       id: id,
       action: action,
@@ -1156,6 +1206,8 @@
       remainingCount: typeof raw.remainingCount === 'number' && isFinite(raw.remainingCount) ? raw.remainingCount : -1,
       errors: normalizeErrors(raw.errors),
       failed: normalizeFailedItems(raw.failed),
+      // 仅 preview 任务带该字段；旧任务/扫描/清除任务为 null。
+      preview: normalizePreview(raw.preview),
       items: normalizeItems(raw.items),
       truncated: raw.truncated === true,
       snapshotPath: asString(raw.snapshotPath),
@@ -1237,9 +1289,9 @@
   /**
    * 造一个刚提交、尚未取到真实状态的 running job（让轮询立刻有目标）。
    *
-   * @param action - 'scan' | 'repair'。
+   * @param action - 'scan' | 'repair' | 'preview'。
    * @param id - 宿主返回的 jobId。
-   * @param depth - 扫描请求的深度（'quick' | 'deep'，仅 scan 有效；repair 传 ''）。
+   * @param depth - 扫描请求的深度（'quick' | 'deep'，仅 scan 有效；repair/preview 传 ''）。
    * @returns 稳定的 job 形状。
    */
   function provisionalJob(action, id, depth) {
@@ -1265,6 +1317,7 @@
       remainingCount: -1,
       errors: [],
       failed: [],
+      preview: null,
       items: [],
       truncated: false,
       snapshotPath: '',
@@ -1305,6 +1358,23 @@
         patch.itemsJobId = job.id;
         patch.itemsLoaded = true;
         patch.itemsError = null;
+      }
+    } else if (job.action === 'preview') {
+      // 预览只驱动确认条，不碰扫描结果/命中清单：终态成功后打开确认条，
+      // 失败/缺 preview 字段时打开「未能评估影响」降级确认条，取消时收起。
+      patch.previewStarting = false;
+      if (job.status === 'running') {
+        patch.confirmOpen = false;
+        patch.previewError = null;
+      } else if (job.status === 'succeeded' && job.preview !== null) {
+        patch.confirmOpen = true;
+        patch.previewError = null;
+      } else if (job.status === 'cancelled') {
+        patch.confirmOpen = false;
+        patch.previewError = null;
+      } else {
+        patch.confirmOpen = true;
+        patch.previewError = null;
       }
     } else if (job.action === 'repair' && job.status !== 'running') {
       if (job.status === 'succeeded') {
@@ -1856,6 +1926,37 @@
   }
 
   /**
+   * 影响评估失败时的可读消息：已知错误码走统一本地化，其余用宿主原文/兜底。
+   *
+   * @param t - locale 绑定函数。
+   * @param error - { code, message } 或 null。
+   * @returns 可展示文案。
+   */
+  function previewErrorText(t, error) {
+    if (error === null || typeof error !== 'object') return t('repair.preview.failedUnknown');
+    var code = asString(error.code);
+    var message = asString(error.message);
+    if (code !== '' && KNOWN_ERROR_CODES[code] === true) return describeError(t, error);
+    if (message === '') return t('repair.preview.failedUnknown');
+    return message.length > 400 ? message.slice(0, 400) + '…' : message;
+  }
+
+  /**
+   * 预览里的「直接修复」数量：优先 hits，其次显式+继承聚合，最后回落到扫描口径。
+   *
+   * @param preview - 归一化后的 preview 结果（可为 null）。
+   * @param fallbackCount - 兜底数量（扫描结果的 hits / 清单总数）。
+   * @returns 非负整数。
+   */
+  function previewFixCount(preview, fallbackCount) {
+    if (preview === null || typeof preview !== 'object') return fallbackCount;
+    if (preview.hits > 0) return preview.hits;
+    var sum = preview.explicitCount + preview.inheritedCount;
+    if (sum > 0) return sum;
+    return fallbackCount;
+  }
+
+  /**
    * 一行「标签 + 路径 + 复制」；可选「打开文件夹」按钮。
    *
    * @param h - React.createElement。
@@ -2141,18 +2242,18 @@
     if (flags.showRepair) {
       buttons.push(
         actionButton(h, {
-          label: t('action.repair'),
+          label: flags.previewBusy ? t('repair.preview.running') : t('action.repair'),
           variant: 'danger',
           disabled: !flags.canRepair,
-          onClick: actions.openConfirm,
+          onClick: actions.startPreview,
           key: 'repair',
         }),
       );
     }
-    if (flags.running) {
+    if (flags.running || flags.previewStarting) {
       buttons.push(
         actionButton(h, {
-          label: state.cancelling ? t('action.cancelling') : t('action.cancel'),
+          label: state.cancelling ? t('action.cancelling') : flags.previewBusy ? t('repair.preview.cancel') : t('action.cancel'),
           variant: 'danger',
           disabled: state.cancelling,
           onClick: actions.cancelJob,
@@ -2164,7 +2265,7 @@
   }
 
   /**
-   * 破坏性确认条：预计修复数 + 快照/恢复文件提示 + workspace-write 风险。
+   * 破坏性确认条：优先展示只读影响评估结果；评估失败时降级为旧确认条 + 警告。
    *
    * @param view - { h, t, state, actions, flags }。
    * @returns 确认条或 null。
@@ -2177,12 +2278,64 @@
     var flags = view.flags;
     if (!state.confirmOpen) return null;
     var liveCount = state.workspaceMeta !== null ? state.workspaceMeta.liveAgentCount : 0;
-    var children = [
-      h('div', { className: 'fi-banner-title', key: 'title' }, t('repair.confirm.title')),
-      h('div', { className: 'fi-banner-text', key: 'count' }, t('repair.confirm.count', { count: flags.confirmHits })),
-      h('div', { className: 'fi-banner-text', key: 'backup' }, t('repair.confirm.backup')),
-      h('div', { className: 'fi-banner-text', key: 'risk' }, t('repair.confirm.risk', { count: liveCount })),
-      flags.engineRestricted ? h('div', { className: 'fi-banner-text', key: 'engine' }, t('repair.confirm.engineLimited')) : null,
+    var preview = flags.previewResult;
+    var children = [h('div', { className: 'fi-banner-title', key: 'title' }, t('repair.confirm.title'))];
+    if (flags.previewReady && preview !== null) {
+      children.push(
+        h(
+          'div',
+          { className: 'fi-banner-text', key: 'fixCount' },
+          t('repair.preview.fixCount', { count: previewFixCount(preview, flags.confirmHits) }),
+        ),
+      );
+      if (preview.candidates > 0) {
+        children.push(
+          h(
+            'div',
+            { className: 'fi-warn-text', key: 'candidates' },
+            t('repair.preview.candidates', {
+              count: preview.candidates,
+              skippedDirs: preview.skippedDirs,
+              dataDir: preview.dataDir,
+              other: preview.other,
+            }),
+          ),
+        );
+        children.push(h('div', { className: 'fi-warn-text', key: 'noRollback' }, t('repair.preview.noRollback')));
+      }
+      if (preview.truncated) {
+        children.push(h('div', { className: 'fi-warn-text', key: 'truncated' }, t('repair.preview.truncated')));
+      }
+      if (preview.uncertain > 0) {
+        children.push(
+          h('div', { className: 'fi-warn-text', key: 'uncertain' }, t('repair.preview.uncertain', { count: preview.uncertain })),
+        );
+      }
+    } else if (flags.previewFallback) {
+      var failure = flags.previewError;
+      var failureText = failure !== null ? previewErrorText(t, failure) : t('repair.preview.failedUnknown');
+      children.push(
+        banner(h, {
+          tone: 'warn',
+          title: t('repair.preview.failed', { message: failureText }),
+          key: 'previewFailed',
+        }),
+      );
+      children.push(h('div', { className: 'fi-banner-text', key: 'fallbackHint' }, t('repair.preview.fallbackHint')));
+      children.push(
+        h('div', { className: 'fi-banner-text', key: 'count' }, t('repair.confirm.count', { count: flags.confirmHits })),
+      );
+    } else {
+      children.push(
+        h('div', { className: 'fi-banner-text', key: 'count' }, t('repair.confirm.count', { count: flags.confirmHits })),
+      );
+    }
+    children.push(h('div', { className: 'fi-banner-text', key: 'backup' }, t('repair.confirm.backup')));
+    children.push(h('div', { className: 'fi-banner-text', key: 'risk' }, t('repair.confirm.risk', { count: liveCount })));
+    if (flags.engineRestricted) {
+      children.push(h('div', { className: 'fi-banner-text', key: 'engine' }, t('repair.confirm.engineLimited')));
+    }
+    children.push(
       h(
         'div',
         { className: 'fi-row', key: 'buttons' },
@@ -2198,7 +2351,7 @@
           onClick: actions.startRepair,
         }),
       ),
-    ];
+    );
     return h('div', { className: 'fi-card fi-card-danger' }, children);
   }
 
@@ -2266,6 +2419,8 @@
     var flags = view.flags;
     if (!flags.running || state.job === null) return null;
     var job = state.job;
+    // 预览任务没有扫描/修复进度，改用「正在评估影响…」状态卡片。
+    if (job.action === 'preview') return null;
     var actionLabel = job.action === 'repair' ? t('action.label.repair') : t('action.label.scan');
     var done = job.action === 'repair' ? job.fixed + job.failedCount : job.scanned;
     var hasTotal = job.total > 0;
@@ -2712,6 +2867,19 @@
   }
 
   /**
+   * 只读影响评估进行中（preview 启动/运行）的提示卡片。
+   *
+   * @param view - { h, t, state, actions, flags }。
+   * @returns 状态卡片或 null。
+   */
+  function renderPreviewStatus(view) {
+    var h = view.h;
+    var t = view.t;
+    if (!view.flags.previewBusy) return null;
+    return h('div', { className: 'fi-card' }, h('div', { className: 'fi-muted' }, t('repair.preview.running')));
+  }
+
+  /**
    * 面板根元素（纯渲染，不含状态）。
    *
    * @param view - { h, t, state, actions, flags }。
@@ -2728,6 +2896,7 @@
       renderIntro(view),
       renderScanOptions(view),
       renderActions(view),
+      renderPreviewStatus(view),
       renderConfirm(view),
       renderJobLoading(view),
       renderRunning(view),
@@ -2808,6 +2977,8 @@
       var mountedRef = React.useRef(true);
       var sessionIdRef = React.useRef(sessionId);
       sessionIdRef.current = sessionId;
+      /** 预览 POST 尚未返回 jobId 时点了取消：拿到 jobId 后立即发取消请求。 */
+      var pendingCancelRef = React.useRef(false);
 
       /**
        * 运行中进度采样：给速率/ETA 用。
@@ -2894,18 +3065,62 @@
         });
       }
 
-      /** 发一次任务请求（扫描/清除共用）：成功后写入任务并交给轮询。 */
+      /**
+       * 请求取消一个任务（扫描/清除/预览共用）；预览与普通任务走同一个 Host 端点。
+       *
+       * @param jobId - 宿主任务 id。
+       * @param mySession - 发起时的会话 id。
+       */
+      function requestCancelJob(jobId, mySession) {
+        setState(function (prev) {
+          return Object.assign({}, prev, { cancelling: true, actionError: null });
+        });
+        requestJson({ path: '/jobs/' + encodeURIComponent(jobId) + '/cancel', method: 'POST', body: {} }).then(function (res) {
+          if (!isCurrent(mySession)) return;
+          if (!res.ok) {
+            setState(function (prev) {
+              var patch = { cancelling: false, actionError: { code: res.code, message: res.message } };
+              if (res.code === 'job-not-found' || res.status === 404) {
+                // 只清掉确实指向这个任务的映射（preview 任务本身不写映射）。
+                if (readStoredJob(mySession) === jobId) removeStoredJob(mySession);
+                patch.job = null;
+                patch.jobId = '';
+                patch.previewStarting = false;
+                patch.previewError = null;
+              }
+              return Object.assign({}, prev, patch);
+            });
+            return;
+          }
+          setState(function (prev) {
+            return Object.assign({}, prev, { cancelling: false, notice: t('job.cancelled') });
+          });
+        });
+      }
+
+      /**
+       * 发一次任务请求（扫描/清除/清除前影响评估共用）：成功后写入任务并交给 800ms 轮询。
+       *
+       * @param action - 'scan' | 'repair' | 'preview'。
+       */
       function startJob(action) {
         if (sessionId === '' || state.starting) return;
         if (state.job !== null && state.job.status === 'running') return;
         var mySession = sessionId;
+        var isPreview = action === 'preview';
         var scanDepth = state.deepScan === true ? 'deep' : 'quick';
-        var requestBody = action === 'scan' ? { action: 'scan', sessionId: mySession, depth: scanDepth } : { action: 'repair', sessionId: mySession };
+        var requestBody;
+        if (action === 'scan') requestBody = { action: 'scan', sessionId: mySession, depth: scanDepth };
+        else if (isPreview) requestBody = { action: 'preview', sessionId: mySession };
+        else requestBody = { action: 'repair', sessionId: mySession };
+        pendingCancelRef.current = false;
         resetProgress('');
         setState(function (prev) {
           return Object.assign({}, prev, {
             starting: true,
             confirmOpen: false,
+            previewStarting: isPreview,
+            previewError: null,
             actionError: null,
             pollError: null,
             notice: '',
@@ -2915,6 +3130,30 @@
         requestJson({ path: '/jobs', method: 'POST', body: requestBody }).then(function (res) {
           if (!isCurrent(mySession)) return;
           if (!res.ok) {
+            if (isPreview) {
+              // 预览失败只降级到旧确认条 + 警告，绝不让面板卡住。
+              if (pendingCancelRef.current) {
+                pendingCancelRef.current = false;
+                setState(function (prev) {
+                  return Object.assign({}, prev, {
+                    starting: false,
+                    previewStarting: false,
+                    cancelling: false,
+                    previewError: null,
+                  });
+                });
+                return;
+              }
+              setState(function (prev) {
+                return Object.assign({}, prev, {
+                  starting: false,
+                  previewStarting: false,
+                  confirmOpen: true,
+                  previewError: { code: res.code, message: res.message },
+                });
+              });
+              return;
+            }
             setState(function (prev) {
               return Object.assign({}, prev, {
                 starting: false,
@@ -2925,15 +3164,29 @@
           }
           var jobId = res.data !== null && typeof res.data === 'object' ? asString(res.data.jobId) : '';
           if (jobId === '') {
+            if (isPreview) {
+              setState(function (prev) {
+                return Object.assign({}, prev, {
+                  starting: false,
+                  previewStarting: false,
+                  confirmOpen: true,
+                  previewError: { code: 'bad-response', message: '' },
+                });
+              });
+              return;
+            }
             setState(function (prev) {
               return Object.assign({}, prev, { starting: false, actionError: { code: 'bad-response', message: '' } });
             });
             return;
           }
-          writeStoredJob(mySession, jobId);
+          // 预览任务不写入会话任务映射：刷新/重开面板仍恢复上一次扫描或清除任务。
+          if (!isPreview) writeStoredJob(mySession, jobId);
           setState(function (prev) {
             var patch = {
               starting: false,
+              previewStarting: false,
+              previewError: null,
               jobId: jobId,
               job: provisionalJob(action, jobId, scanDepth),
               pollError: null,
@@ -2952,35 +3205,25 @@
             }
             return Object.assign({}, prev, patch);
           });
+          if (isPreview && pendingCancelRef.current) {
+            pendingCancelRef.current = false;
+            requestCancelJob(jobId, mySession);
+          }
         });
       }
 
-      /** 取消运行中的任务。 */
+      /** 取消运行中的任务；预览启动途中点取消时等拿到 jobId 再取消。 */
       function cancelJob() {
+        if (state.previewStarting === true) {
+          pendingCancelRef.current = true;
+          setState(function (prev) {
+            return Object.assign({}, prev, { cancelling: true, actionError: null });
+          });
+          return;
+        }
         var target = state.job;
         if (target === null || target.status !== 'running' || state.cancelling) return;
-        var mySession = sessionId;
-        setState(function (prev) {
-          return Object.assign({}, prev, { cancelling: true, actionError: null });
-        });
-        requestJson({ path: '/jobs/' + encodeURIComponent(target.id) + '/cancel', method: 'POST', body: {} }).then(function (res) {
-          if (!isCurrent(mySession)) return;
-          if (!res.ok) {
-            setState(function (prev) {
-              var patch = { cancelling: false, actionError: { code: res.code, message: res.message } };
-              if (res.code === 'job-not-found' || res.status === 404) {
-                removeStoredJob(mySession);
-                patch.job = null;
-                patch.jobId = '';
-              }
-              return Object.assign({}, prev, patch);
-            });
-            return;
-          }
-          setState(function (prev) {
-            return Object.assign({}, prev, { cancelling: false, notice: t('job.cancelled') });
-          });
-        });
+        requestCancelJob(target.id, sessionId);
       }
 
       /** 导出当前扫描清单，展示宿主返回的路径。 */
@@ -3091,17 +3334,15 @@
         });
       }
 
-      /** 打开破坏性确认条。 */
-      function openConfirm() {
-        setState(function (prev) {
-          return Object.assign({}, prev, { confirmOpen: true, actionError: null });
-        });
+      /** 打开破坏性确认条：先向宿主请求只读的影响评估（preview 任务）。 */
+      function startPreview() {
+        startJob('preview');
       }
 
-      /** 收起确认条。 */
+      /** 收起确认条并丢弃本次影响评估结果。 */
       function closeConfirm() {
         setState(function (prev) {
-          return Object.assign({}, prev, { confirmOpen: false });
+          return Object.assign({}, prev, { confirmOpen: false, previewError: null });
         });
       }
 
@@ -3227,6 +3468,7 @@
           if (state.jobId === '' || pollStatus !== 'running') return undefined;
           var jobId = state.jobId;
           var mySession = sessionId;
+          var isPreviewJob = state.job !== null && state.job.action === 'preview';
           var disposed = false;
           var busy = false;
           var controller = null;
@@ -3240,6 +3482,24 @@
               .then(function (res) {
                 if (disposed) return;
                 if (!res.ok) {
+                  if (res.aborted === true) return;
+                  if (isPreviewJob) {
+                    // 预览轮询出错（含 404/网络错误）→ 降级到旧确认条，不再重试。
+                    setState(function (prev) {
+                      return Object.assign({}, prev, {
+                        jobId: '',
+                        job: null,
+                        jobLoading: false,
+                        pollError: null,
+                        cancelling: false,
+                        previewStarting: false,
+                        previewError: { code: res.code, message: res.message },
+                        confirmOpen: true,
+                        now: Date.now(),
+                      });
+                    });
+                    return;
+                  }
                   if (res.code === 'job-not-found' || res.status === 404) {
                     removeStoredJob(mySession);
                     setState(function (prev) {
@@ -3261,6 +3521,22 @@
                 }
                 var job = normalizeJob(res.data !== null && typeof res.data === 'object' ? res.data.job : null);
                 if (job === null) {
+                  if (isPreviewJob) {
+                    setState(function (prev) {
+                      return Object.assign({}, prev, {
+                        jobId: '',
+                        job: null,
+                        jobLoading: false,
+                        pollError: null,
+                        cancelling: false,
+                        previewStarting: false,
+                        previewError: { code: 'bad-response', message: '' },
+                        confirmOpen: true,
+                        now: Date.now(),
+                      });
+                    });
+                    return;
+                  }
                   setState(function (prev) {
                     return Object.assign({}, prev, { pollError: { code: 'bad-response', message: '' }, now: Date.now() });
                   });
@@ -3320,6 +3596,24 @@
       var scanJob = state.scanJob !== null && state.scanJob.status !== 'running' ? state.scanJob : null;
       var repairJob = job !== null && job.action === 'repair' ? job : null;
       var repairTerminal = repairJob !== null && repairJob.status !== 'running';
+      // 清除前影响评估（preview 任务）：运行中只显示评估状态，终态驱动确认条。
+      var previewJob = job !== null && job.action === 'preview' ? job : null;
+      var previewRunning = previewJob !== null && previewJob.status === 'running';
+      var previewStarting = state.previewStarting === true;
+      var previewBusy = previewStarting || previewRunning;
+      var previewResult = previewJob !== null && previewJob.status === 'succeeded' ? previewJob.preview : null;
+      var previewError = state.previewError;
+      if (
+        previewError === null &&
+        previewJob !== null &&
+        previewJob.status !== 'running' &&
+        previewJob.status !== 'succeeded'
+      ) {
+        previewError = { code: '', message: previewJob.message };
+      }
+      var previewReady = state.confirmOpen === true && previewResult !== null;
+      var previewFallback =
+        state.confirmOpen === true && !previewReady && (previewError !== null || (previewJob !== null && previewJob.status !== 'running'));
       var workspace = state.workspace;
       var liveAgentCount = state.workspaceMeta !== null ? state.workspaceMeta.liveAgentCount : 0;
       var canScan = workspace !== null && sessionId !== '' && writable && !running && !state.starting;
@@ -3350,6 +3644,12 @@
         scanJob: scanJob,
         repairJob: repairJob,
         repairTerminal: repairTerminal,
+        previewStarting: previewStarting,
+        previewBusy: previewBusy,
+        previewResult: previewResult,
+        previewReady: previewReady,
+        previewFallback: previewFallback,
+        previewError: previewError,
         liveAgentCount: liveAgentCount,
         canScan: canScan,
         showExport: showExport,
@@ -3376,7 +3676,7 @@
         startRepair: function () {
           startJob('repair');
         },
-        openConfirm: openConfirm,
+        startPreview: startPreview,
         closeConfirm: closeConfirm,
         cancelJob: cancelJob,
         exportList: exportList,
@@ -3427,6 +3727,8 @@
       exportError: null,
       openingFolder: false,
       confirmOpen: false,
+      previewStarting: false,
+      previewError: null,
       starting: false,
       cancelling: false,
       actionError: null,

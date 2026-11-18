@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { JobManager } from '../lib/jobs.js'
+import { JobManager, LIMITS } from '../lib/jobs.js'
 import { pathKey } from '../lib/paths.js'
 
 const WORKSPACE = { id: 'ws-1', path: 'C:\\fake\\workspace', title: 'workspace' }
@@ -75,6 +75,35 @@ function recordingEngine(recorded, events) {
     })
     return handle
   }
+}
+
+/** Engine `result` event of a read-only preview run (contract shape). */
+const PREVIEW_RESULT = {
+  type: 'result',
+  mode: 'preview',
+  root: 'C:\\fake\\workspace',
+  rootLabel: 'Low',
+  scanned: 42,
+  hits: 3,
+  explicitCount: 2,
+  inheritedCount: 1,
+  scanMs: 17,
+  propagation: {
+    candidates: 2,
+    descendants: 7,
+    skippedDirs: 3,
+    dataDir: 0,
+    other: 1,
+    uncertain: 4,
+    truncated: false,
+    items: [
+      { path: 'C:\\fake\\workspace\\sub', kind: 'dir', reason: 'explicit-low' },
+      { path: 'C:\\fake\\workspace\\a.txt', kind: 'file', reason: 'inherited-low' },
+    ],
+    errors: [{ path: 'C:\\fake\\workspace\\locked', message: 'access denied' }],
+  },
+  engineVersion: '0.1.0',
+  durationMs: 25,
 }
 
 test('scan job accumulates hits, counts and errors', async () => {
@@ -643,4 +672,164 @@ test('protectedArtifactPaths collects every in-memory job artifact path', async 
 
   manager.dispose()
   assert.equal(manager.protectedArtifactPaths().size, 0)
+})
+
+test('preview job runs the read-only engine mode and flattens result into snapshot.preview', async () => {
+  const recorded = []
+  const manager = makeManager(
+    recordingEngine(recorded, [
+      { type: 'env', user: 'tester', integrity: 'Medium', canWriteLabel: true },
+      { type: 'progress', phase: 'scan', scanned: 42, hits: 3 },
+      PREVIEW_RESULT,
+    ]),
+  )
+  const started = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1', depth: 'deep' })
+  assert.equal(started.ok, true)
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'succeeded')
+  // Preview is depth-independent: neither a depth nor an items scope is pinned.
+  assert.equal(job.depth, null)
+  assert.equal(job.itemsScope, null)
+  assert.equal(job.items.length, 0)
+  assert.equal(job.hits, 3)
+  assert.equal(job.truncated, false)
+
+  const snapshot = manager.snapshot(job)
+  assert.equal(snapshot.action, 'preview')
+  assert.deepEqual(snapshot.preview, {
+    hits: 3,
+    explicitCount: 2,
+    inheritedCount: 1,
+    scanMs: 17,
+    candidates: 2,
+    descendants: 7,
+    skippedDirs: 3,
+    dataDir: 0,
+    other: 1,
+    uncertain: 4,
+    truncated: false,
+    items: [
+      { path: 'C:\\fake\\workspace\\sub', kind: 'dir', reason: 'explicit-low' },
+      { path: 'C:\\fake\\workspace\\a.txt', kind: 'file', reason: 'inherited-low' },
+    ],
+    errors: [{ path: 'C:\\fake\\workspace\\locked', message: 'access denied' }],
+  })
+
+  // The engine is started in Preview mode, never with a scan depth.
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].mode, 'Preview')
+  assert.equal(recorded[0].root, WORKSPACE.path)
+  assert.equal(recorded[0].dataDir, 'C:\\fake\\data')
+  assert.equal(recorded[0].skipDirs, 'node_modules,.git,.pnpm-store')
+  assert.equal(recorded[0].scanDepth, undefined)
+
+  // Scan snapshots keep their historical shape (no preview field at all).
+  const scanStart = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  const scanJob = await waitTerminal(manager, scanStart.jobId)
+  assert.equal('preview' in manager.snapshot(scanJob), false)
+  manager.dispose()
+})
+
+test('preview snapshot caps propagation items and errors at the Host limits', async () => {
+  const items = Array.from({ length: LIMITS.PREVIEW_ITEMS + 7 }, (_, index) => ({
+    path: 'C:\\fake\\workspace\\dir' + String(index),
+    kind: 'dir',
+    reason: 'explicit-low',
+  }))
+  const errors = Array.from({ length: LIMITS.PREVIEW_ERRORS + 5 }, (_, index) => ({
+    path: 'C:\\fake\\workspace\\e' + String(index),
+    message: 'access denied',
+  }))
+  const manager = makeManager(
+    fakeEngine([{ ...PREVIEW_RESULT, propagation: { ...PREVIEW_RESULT.propagation, truncated: false, items, errors } }]),
+  )
+  const started = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  const snapshot = manager.snapshot(job)
+  assert.equal(snapshot.preview.items.length, LIMITS.PREVIEW_ITEMS)
+  assert.equal(snapshot.preview.errors.length, LIMITS.PREVIEW_ERRORS)
+  assert.equal(snapshot.preview.items[0].path, 'C:\\fake\\workspace\\dir0')
+  assert.equal(snapshot.preview.items[LIMITS.PREVIEW_ITEMS - 1].path, 'C:\\fake\\workspace\\dir49')
+  // The engine did not truncate its own list ...
+  assert.equal(snapshot.preview.truncated, false)
+  // ... but the Host dropped entries, which the job-level flag reports (K12).
+  assert.equal(snapshot.truncated, true)
+  manager.dispose()
+})
+
+test('preview snapshot mirrors the engine propagation truncated flag', async () => {
+  const manager = makeManager(
+    fakeEngine([{ ...PREVIEW_RESULT, propagation: { ...PREVIEW_RESULT.propagation, truncated: true, items: [], errors: [] } }]),
+  )
+  const started = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  const snapshot = manager.snapshot(job)
+  assert.equal(snapshot.preview.truncated, true)
+  assert.deepEqual(snapshot.preview.items, [])
+  assert.deepEqual(snapshot.preview.errors, [])
+  // No Host-side drop happened, so the job-level flag stays false.
+  assert.equal(snapshot.truncated, false)
+  manager.dispose()
+})
+
+test('preview jobs cannot be exported', async () => {
+  const manager = makeManager(fakeEngine([PREVIEW_RESULT]))
+  const started = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1' })
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'succeeded')
+  const result = await manager.exportScan(job)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'invalid-request')
+  assert.equal(result.message, '只有检查任务可以导出清单')
+  manager.dispose()
+})
+
+test('preview shares the one-job-per-workspace mutex with scan and repair', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const preview = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1', depth: 'deep' })
+  assert.equal(preview.ok, true)
+  assert.equal(manager.get(preview.jobId).depth, null)
+  assert.equal(manager.get(preview.jobId).itemsScope, null)
+  const blockedScan = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(blockedScan.ok, false)
+  assert.equal(blockedScan.code, 'busy')
+  assert.match(blockedScan.message, /预览/)
+  manager.requestCancel(preview.jobId, 'user')
+  assert.equal((await waitTerminal(manager, preview.jobId)).status, 'cancelled')
+
+  const scan = manager.start({ action: 'scan', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(scan.ok, true)
+  const blockedPreview = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(blockedPreview.ok, false)
+  assert.equal(blockedPreview.code, 'busy')
+  assert.match(blockedPreview.message, /检查/)
+  manager.requestCancel(scan.jobId, 'user')
+  assert.equal((await waitTerminal(manager, scan.jobId)).status, 'cancelled')
+  manager.dispose()
+})
+
+test('a running preview job can be cancelled before it reports a result', async () => {
+  const engine = controllableEngine()
+  const manager = makeManager(engine.run)
+  const started = manager.start({ action: 'preview', workspace: WORKSPACE, sessionId: 's1' })
+  assert.equal(manager.requestCancel(started.jobId, 'user').ok, true)
+  const job = await waitTerminal(manager, started.jobId)
+  assert.equal(job.status, 'cancelled')
+  assert.match(job.message, /已取消/)
+  assert.equal('preview' in manager.snapshot(job), false)
+  manager.dispose()
+})
+
+test('unknown job kinds are still rejected by the manager', () => {
+  const manager = makeManager(fakeEngine([]))
+  for (const action of ['purge', 'Preview', '']) {
+    const rejected = manager.start({ action, workspace: WORKSPACE, sessionId: 's1' })
+    assert.equal(rejected.ok, false, action)
+    assert.equal(rejected.code, 'invalid-request')
+    assert.match(rejected.message, /未知任务类型/)
+  }
+  assert.equal(manager.jobs.size, 0)
+  assert.equal(manager.running.size, 0)
+  manager.dispose()
 })
