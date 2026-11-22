@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-integrity-check",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Scan and clear Low integrity labels left on DSH workspace directories (Windows).",
   "type": "module",
